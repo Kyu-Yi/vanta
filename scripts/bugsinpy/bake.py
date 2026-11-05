@@ -168,6 +168,15 @@ PLUGIN_SOURCES = {
 }
 """What is recorded as having asked for a plugin pin — nothing *declared* it."""
 
+PYTEST_PROTECTED_SOURCE = "the test runner itself (every bug)"
+"""Why §8.6's R2 safeguard never drops ``pytest``.
+
+``PLUGIN_SOURCES`` covers the two packages that ride *on* pytest; this covers pytest
+itself, which is not in that mapping because nothing about it is plugin-specific: a
+layer without it has no runner, and a bug whose ``requirements.txt`` pins a pytest
+release nothing can install here is a bug to fix, never one to run without pytest.
+"""
+
 DEPS_DIRNAME = "deps"
 """Where ``bake`` leaves each per-bug layer's dependency provenance.
 
@@ -433,6 +442,29 @@ removed on lines nobody can grep, and the one thing a reader needs next to an em
 
 class BakeError(RuntimeError):
     """A layer could not be baked or did not verify."""
+
+
+class UndatableRef(BakeError):
+    """One declaration the date rule refuses: no release on or before its cutoff.
+
+    [VANTA-WHY] A distinct type, because two refusals a reader would otherwise read as
+    one are answered differently by §8.6's R2. "This constraint has no release the tree
+    could have been built with" (§3.2's date rule) is droppable when nothing the failing
+    tests' closure reaches imports the module it names and §8.6's R2's safeguard does not
+    protect it — the scope is the **module**, whatever file declared it; every *other* way
+    a ref is refused — a harness range the interpreter layer cannot accept, a reference
+    pin whose release does not exist, two of the layer's own pins that cannot both hold —
+    is not. Only the first is raised as this, so a caller that catches it is deciding
+    about one refusal and not the others.
+
+    Carries the refused :class:`DepRef` so the caller can ask the auditor about the
+    distribution it named and remove exactly it from the pass. It still *is* a
+    :class:`BakeError`, so every existing ``except BakeError`` reads it as before.
+    """
+
+    def __init__(self, message: str, *, ref: "DepRef") -> None:
+        super().__init__(message)
+        self.ref = ref
 
 
 @dataclass(frozen=True)
@@ -3505,6 +3537,17 @@ def tree_provided_modules(repo: Path, commit: str) -> set[str]:
     return _tree_local_modules(tree_mod.list_files_at(repo, commit))
 
 
+CLOSURE_SOURCE_PREFIX = "import closure: "
+"""What :func:`test_import_closure` writes in front of the site a ref was read from.
+
+[VANTA-WHY] One literal rather than a second copy of it in §8.6's R2. The drop rule
+asks whether a refused ref came from *this* source and no other (§8.6's R2: a
+declaration a project's own file wrote is a different finding), and the answer is
+this prefix on :attr:`DepRef.source`; a reader that spelled it out again would be a
+second place the format could drift from.
+"""
+
+
 def test_import_closure(
     *,
     files: Sequence[str],
@@ -3570,12 +3613,12 @@ def test_import_closure(
                 continue
             if not _can_name_a_distribution(top):
                 notes.append(
-                    f"import closure: {path} line {site.line}: {top!r} cannot name a "
-                    "distribution, so it is the interpreter's own module and nothing "
+                    f"{CLOSURE_SOURCE_PREFIX}{path} line {site.line}: {top!r} cannot name "
+                    "a distribution, so it is the interpreter's own module and nothing "
                     "is installed for it"
                 )
                 continue
-            source = f"import closure: {path} line {site.line}"
+            source = f"{CLOSURE_SOURCE_PREFIX}{path} line {site.line}"
             # ``type-checking only`` and ``lazy: inside <qualname>`` are the audit's
             # reasons, not this walk's: §3.2 consults them to decide whether a pin
             # nothing here can install may be dropped (:func:`decide_unresolvable`), and
@@ -4050,6 +4093,30 @@ def setup_sh_for(bugsinpy_root: Path, project: str, bug_id: int) -> str:
     return read_metadata_text(path)
 
 
+def run_test_sh_for(bugsinpy_root: Path, project: str, bug_id: int) -> str:
+    path = bugsinpy_root / "projects" / project / "bugs" / str(bug_id) / "run_test.sh"
+    if not path.is_file():
+        return ""
+    return read_metadata_text(path)
+
+
+def test_command_of(run_test_sh: str) -> Optional[str]:
+    """The one command line ``run_test.sh`` invokes, or ``None`` when it carries none.
+
+    The same reading BugsInPy's own record gets
+    (:meth:`bugsinpy_meta.BugInfo.run_test_command`): the first line that is neither
+    blank nor a comment. It is read here rather than only there because §8.6's R2
+    safeguard needs it for a layer whose ``BugInfo`` was never loaded, and a second
+    spelling of "the command" would be a second answer to ``-p`` questions.
+    """
+    for raw in run_test_sh.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        return line
+    return None
+
+
 # ---------------------------------------------------------------------------
 # every dependency source, unioned, then pinned by date (§3.2, §3.3)
 # ---------------------------------------------------------------------------
@@ -4105,6 +4172,14 @@ class DepSources:
     tree's modules against PyPI, and §3.2's closure walk, which must not pin the tree's
     own distribution (:data:`TREE_SATISFIED_RULE`). Carrying it also means this record's
     consumers — the walk included — never touch the filesystem for it.
+    """
+
+    test_command: Optional[str] = None
+    """The command BugsInPy's own ``run_test.sh`` runs for this bug (:func:`test_command_of`).
+
+    Not an executor — the harness runs the suite itself — but §8.6's R2 safeguard reads
+    its ``-p`` options, because a plugin the bug's own command loads is imported by
+    pytest and by no line in the tree (:func:`plugin_options`).
     """
 
 
@@ -4911,11 +4986,17 @@ def _pin_each_ref(
             dated = [item for item in matching if item[1][:10] <= cutoff]
             if not dated:
                 newest = _newest_release(available)
-                raise BakeError(
+                # An ``UndatableRef`` and not a plain ``BakeError``: this is the one
+                # refusal §8.6's R2 may drop (when the ref came from the test side's own
+                # import closure and nothing the failing tests reach imports it), and the
+                # type is what tells the drop pass it is looking at that refusal rather
+                # than at the harness-range or reference-pin ones below and above.
+                raise UndatableRef(
                     f"{ref.source}: {ref.spec} has no release on or before {cutoff} "
                     f"(newest {ref.name} is {newest[0]}, released {newest[1][:10]}). "
                     "The tree this requirement was declared in could not have been "
-                    "built with it."
+                    "built with it.",
+                    ref=ref,
                 )
             if claims:
                 wanted = [
@@ -5844,6 +5925,12 @@ REQUIRES_DIST_HEADER = "requires-dist"
 WHEEL_METADATA_MEMBER = ".dist-info/METADATA"
 """Where a wheel keeps the document the sidecar would have published."""
 
+WHEEL_ENTRY_POINTS_MEMBER = ".dist-info/entry_points.txt"
+"""Where a wheel keeps the entry points the project declares (Core Metadata's sibling)."""
+
+PYTEST_ENTRY_POINT_GROUP = "pytest11"
+"""The entry-point group pytest loads plugins from."""
+
 
 def _requires_dist_fields(text: str) -> tuple[str, ...]:
     """The ``Requires-Dist`` fields of a Core Metadata document.
@@ -5869,19 +5956,42 @@ def _requires_dist_fields(text: str) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _metadata_member(data: bytes) -> Optional[str]:
-    """The ``METADATA`` document inside a wheel, or ``None`` when it holds none."""
+def _wheel_member(
+    data: bytes, suffix: str, *, missing: Optional[str] = None
+) -> Optional[str]:
+    """One member of a wheel in memory, found by the suffix that ends its name.
+
+    [VANTA-WHY] One reader for two members rather than two readers: ``METADATA`` and
+    ``entry_points.txt`` are both ``<distribution>.dist-info/<name>`` inside the same
+    zip, and the second is read by §8.6's R2 safeguard — "never drop a package that is
+    a pytest plugin" is a question only the wheel can answer, because PyPI's JSON
+    publishes no entry points (:func:`declares_pytest_plugin`).
+
+    ``missing`` is what a wheel that **opened** and simply does not carry the member
+    answers, and it exists for the safeguard: ``None`` would say "could not tell", but a
+    wheel whose zip lists no ``entry_points.txt`` has told us — the distribution
+    registers no entry point at all — and §8.6's R2 must not read that as a refusal to
+    drop. Measured on ``h5py==2.10.0``, whose 28 wheels carry no ``entry_points.txt``:
+    with ``None`` for both, its entry-point question was "unknown" and the pin the
+    retry was to drop was protected instead. ``None`` is still the answer — whatever
+    ``missing`` says — for a wheel that will not open, which is the one case that really
+    is unknown.
+    """
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             names = [
-                name for name in archive.namelist()
-                if name.endswith(WHEEL_METADATA_MEMBER)
+                name for name in archive.namelist() if name.endswith(suffix)
             ]
             if not names:
-                return None
+                return missing
             return archive.read(names[0]).decode("utf-8", errors="replace")
     except (zipfile.BadZipFile, OSError, KeyError):
         return None
+
+
+def _metadata_member(data: bytes) -> Optional[str]:
+    """The ``METADATA`` document inside a wheel, or ``None`` when it holds none."""
+    return _wheel_member(data, WHEEL_METADATA_MEMBER)
 
 
 @dataclass(frozen=True)
@@ -5998,22 +6108,51 @@ def pypi_sidecar_text(file: PyPIFile) -> Optional[str]:
         raise BakeError(f"cannot read the metadata beside {file.filename}: {exc}") from exc
 
 
-def wheel_metadata_text(file: PyPIFile) -> Optional[str]:
-    """The ``METADATA`` document inside one wheel, or ``None`` when it holds none.
+def wheel_member_text(
+    file: PyPIFile, member: str, *, missing: Optional[str] = None
+) -> Optional[str]:
+    """One member of one wheel, downloaded and read, or ``None`` when it holds none.
 
-    The last resort for a release whose declarations the JSON does not carry and whose
-    sidecar PyPI did not publish, and it downloads the wheel to read them — the same
-    document the sidecar would have served without the download, which is why it is
-    second and not first. A wheel past :data:`SDIST_MAX_BYTES` is not read: it is the
-    same fuse the sdist listing uses, and a release past it is reported as unknown
-    rather than guessed at.
+    The download both readers share: :func:`wheel_metadata_text` asks for the
+    declarations, :func:`declares_pytest_plugin` for the entry points, and a wheel past
+    :data:`SDIST_MAX_BYTES` is not read either way — it is the same fuse the sdist
+    listing uses, and a release past it is reported as unknown rather than guessed at.
+
+    ``missing`` is forwarded to the reader (:func:`_wheel_member`), and it is what lets
+    the entry-point question distinguish a wheel that registers nothing from one that
+    could not be read.
     """
     try:
         with urllib.request.urlopen(file.url, timeout=PYPI_TIMEOUT_SECS) as response:
             data, _ = _read_capped(response, SDIST_MAX_BYTES)
     except (urllib.error.URLError, OSError) as exc:
         raise BakeError(f"cannot download {file.filename}: {exc}") from exc
-    return _metadata_member(data)
+    return _wheel_member(data, member, missing=missing)
+
+
+def wheel_entry_points_text(file: PyPIFile) -> Optional[str]:
+    """One wheel's ``entry_points.txt``: ``""`` when it holds none, ``None`` unreadable.
+
+    §8.6's R2 safeguard's only witness for "is this release a pytest plugin", and the
+    whole reason it is a reader of its own rather than a call to
+    :func:`wheel_metadata_text`: the third answer is load-bearing. ``None`` means the
+    wheel could not be read, so the safeguard reads it as "cannot tell, do not drop";
+    ``""`` means the wheel **was** read and registers nothing, so the safeguard has
+    nothing to say and the drop may proceed. One answer for both would protect every pin
+    whose wheel simply has no entry points — measured on ``h5py==2.10.0``.
+    """
+    return wheel_member_text(file, WHEEL_ENTRY_POINTS_MEMBER, missing="")
+
+
+def wheel_metadata_text(file: PyPIFile) -> Optional[str]:
+    """The ``METADATA`` document inside one wheel, or ``None`` when it holds none.
+
+    The last resort for a release whose declarations the JSON does not carry and whose
+    sidecar PyPI did not publish, and it downloads the wheel to read them — the same
+    document the sidecar would have served without the download, which is why it is
+    second and not first.
+    """
+    return wheel_member_text(file, WHEEL_METADATA_MEMBER)
 
 
 def declared_requires(
@@ -6471,6 +6610,68 @@ could make work on this image (:data:`UNBUILDABLE_ON_PLATFORM`).
 The pin *is* sdist-only, so its class letter stays (b) — that is what pip will try — and
 this is the separate word for the fact that the attempt cannot succeed. It is a recorded
 outcome like :data:`NO_DISTRIBUTION`, not a class of its own.
+"""
+
+DATE_RULE_REFUSAL = "no-release-before-date"
+"""A §3.2 finding that is not one of the three classes: a declaration the date rule refuses.
+
+[VANTA-WHY] The date rule's refusal has two readings and §8.6's R2 separates them. A
+requirement a project's own file declared and that has no release on or before that
+file's date is a bug the benchmark graded on an environment that never existed — that
+is a *flag*. A requirement that nothing the failing tests reach imports is the harness
+trying to install something the bug's own tests were never written against: the module
+is outside the failing tests' closure, and R2 drops it with this outcome instead of
+flagging the bug for it.
+
+The scope is the **module**, not the declaring file (§8.6's R2, batch 3): a refusal is
+dropped whenever the module it names is outside the failing tests' import closure,
+whatever file declared it, and the safeguard (:func:`pin_safeguard`) is asked first.
+
+It is a recorded outcome like :data:`NO_DISTRIBUTION`, not a class of its own: what it
+says is *why* nothing installs the pin, not what pip would have tried.
+"""
+
+UNBUILDABLE_AT_BAKE = "sdist-failed-to-build-at-bake"
+"""§8.6's R2's other half: a pin whose own sdist **failed to build in this image**.
+
+[VANTA-WHY] Not the same finding as :data:`UNBUILDABLE`, which is the *preflight's*
+prediction from the reviewed table: this one is observed, and it is only ever observed
+in the failing layer's own build log — ``pip`` writes ``Failed to build h5py scikit
+-learn`` and the trace above it names the library. Measured on ``pandas/7``: ``h5py``
+is a BugsInPy pin whose sdist dies on ``libhdf5.so`` and ``scikit-learn`` is a
+closure-sourced pick whose sdist dies on a missing ``scipy``, and neither is refused by
+any preflight, because both are installable in principle and only fail here. It is
+recorded like the others, and it reaches the rule from the **retry**
+(:func:`retry_drops`) rather than from resolution, because resolution never ran the
+build.
+"""
+
+FAILED_BUILD_PREFIX = "Failed to build "
+"""How the layer's ``pip`` opens the one line that names what it could not build.
+
+Measured on ``pandas/7``: the merged output of the failed layer holds ``Failed to build
+h5py scikit-learn`` — the distribution names, space-separated, on a line of their own
+and nothing else on it. It is R2(ii)'s trigger (:func:`failed_builds`) because it is the
+one line of a four-hundred-line log that says *which* pins failed rather than *why*, and
+it is the reason the rule is a retry and not a preflight: the failure it reports only
+exists once the build has been run.
+"""
+
+FAILED_WHEEL_PREFIX = "ERROR: Failed building wheel for "
+"""How the same ``pip`` opens its per-name line, ``ERROR: Failed building wheel for h5py``.
+
+Measured on the same log, twice (``h5py`` and ``scikit-learn``), and it is preferred as
+the *evidence* a drop records because it names exactly one distribution: the summary line
+is what says "the retry applies at all", this is what says which log line says why.
+"""
+
+RETRY_KEY = "retry"
+"""The provenance key saying a layer's first build failed and its one retry what did.
+
+[VANTA-WHY] Written *after* the bake, like :data:`PIP_CHECK_KEY` and for a related
+reason: what the retry learned exists only once a build has been attempted, and a
+provenance that could not say "this layer needed its second attempt" would describe the
+first-pass resolution as though it had built.
 """
 
 PREFLIGHT_CLASS_LETTERS: Mapping[str, str] = {
@@ -8596,7 +8797,8 @@ class DroppedPin:
     version: Optional[str]
     """The version the pin names, when it names one."""
     outcome: str
-    """Which finding: :data:`NO_DISTRIBUTION` or :data:`UNBUILDABLE`."""
+    """Which finding: :data:`NO_DISTRIBUTION`, :data:`UNBUILDABLE`, or
+    :data:`DATE_RULE_REFUSAL`."""
     reason: str
     audit: Optional[ImportAudit] = None
     """What the bug's own trees say about the module this distribution provides.
@@ -8628,6 +8830,220 @@ class DroppedPin:
         return data
 
 
+PLUGIN_OPTION = "-p"
+"""The pytest option that loads a plugin by name — one of §8.6's R2 safeguard's arms."""
+
+PLUGIN_DISABLE_PREFIX = "no:"
+"""``-p no:name`` **disables** a plugin, so what follows it is not a plugin to protect."""
+
+
+def plugin_options(command: str) -> frozenset[str]:
+    """The plugin names a test command's ``-p`` options **load**, canonicalized.
+
+    [VANTA-WHY] ``-p no:cacheprovider`` is in the harness's own native test command and
+    means *off*, not *on*: reading every ``-p`` as "this plugin matters" would protect
+    the one name every layer is known not to need. Only a positive option counts, and
+    the name is canonicalized because that is the key the safeguard looks pins up by.
+    """
+    tokens = shlex.split(command) if command.strip() else []
+    names: set[str] = set()
+    for position, token in enumerate(tokens):
+        if token == PLUGIN_OPTION:
+            following = tokens[position + 1] if position + 1 < len(tokens) else ""
+        elif token.startswith(PLUGIN_OPTION) and len(token) > len(PLUGIN_OPTION):
+            # ``-pno:x`` and ``-pplugin`` are the joined spellings pytest accepts.
+            following = token[len(PLUGIN_OPTION):]
+        else:
+            continue
+        if following and not following.startswith(PLUGIN_DISABLE_PREFIX):
+            names.add(canonicalize_name(following))
+    return frozenset(names)
+
+
+def entry_point_group(text: str, group: str) -> tuple[str, ...]:
+    """The names one ``entry_points.txt`` registers under ``group``.
+
+    INI, which is what a wheel's ``.dist-info/entry_points.txt`` is: each group is a
+    ``[section]`` header and each entry point is one ``name = target`` line. Read as
+    text and never executed, like every other reading of a release (design C3).
+    """
+    names: list[str] = []
+    section = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            continue
+        if section == group and "=" in line:
+            names.append(line.partition("=")[0].strip())
+    return tuple(names)
+
+
+def declares_pytest_plugin(
+    name: str,
+    version: str,
+    *,
+    files_of: Callable[
+        [str, str], Optional[tuple[PyPIFile, ...]]
+    ] = pypi_release_files,
+    entry_points_of: Callable[[PyPIFile], Optional[str]] = wheel_entry_points_text,
+) -> Optional[bool]:
+    """Whether one release registers a ``pytest11`` entry point, or ``None`` for unknown.
+
+    [VANTA-WHY] ``None`` is a third answer and it is the **safe** one: a release that
+    publishes only an sdist is one whose entry points this reader cannot see — PyPI's
+    JSON carries none, and the sdist's ``setup.cfg``/``setup.py`` are not among the
+    readers — so §8.6's R2 safeguard reads "cannot tell" as "must not drop" rather than
+    as "not a plugin". A release whose wheel cannot be read is the same answer for the
+    same reason: a drop is a decision, and an unreadable release is not evidence for one.
+
+    Two answers are *not* "cannot tell", and both were measured rather than reasoned:
+
+    * PyPI lists **no such release** — ``files_of`` returns ``None`` for a 404, which is
+      an answer and not a failed fetch — so the release does not exist and cannot
+      register anything. ``False``. Reading it as unknown would make §3.2's rule refuse
+      to drop the very pins it exists for, since those are by definition releases nothing
+      can install (``luigi/1``'s ``requests-async==0.5.0``).
+    * a wheel that **opens and holds no** ``entry_points.txt`` registers no entry point
+      at all. ``False``, and :func:`wheel_entry_points_text` is what says ``""`` rather
+      than ``None`` for it. Measured: ``h5py==2.10.0``'s 28 wheels carry none, so with
+      one answer for both the pin §8.6's R2 retry was to drop was protected instead and
+      ``pandas/7`` flagged rather than retried.
+
+    The first wheel decides it: every wheel of one release carries the same
+    ``entry_points.txt``, and reading more than one would download the release twice to
+    answer the same question. It is called only for a pin about to be dropped, which is
+    the only moment the answer changes anything.
+    """
+    try:
+        files = files_of(name, version)
+    except BakeError:
+        return None
+    if files is None:
+        return False
+    for file in files:
+        if not file.is_wheel:
+            continue
+        text = entry_points_of(file)
+        if text is None:
+            return None
+        return bool(entry_point_group(text, PYTEST_ENTRY_POINT_GROUP))
+    return None
+
+
+# ``ImportAudit`` is declared further down with the rest of the audit machinery; the
+# forward reference is quoted because this alias is *evaluated* at import, unlike the
+# annotations elsewhere in this module (``from __future__ import annotations``).
+Safeguard = Callable[[str, Optional[str], "ImportAudit"], Optional[str]]
+"""``(distribution, the version it would be pinned to, its audit) -> why not to drop it``.
+
+``None`` from one means the drop rule may proceed; anything else is the reason §8.6's R2
+refuses, and it becomes the bug's flag (:func:`decide_unresolvable`).
+"""
+
+
+def pin_safeguard(
+    *,
+    protected_names: Mapping[str, str],
+    plugin_names: Container[str] = (),
+    plugin_of: Optional[Callable[[str, str], Optional[bool]]] = None,
+) -> Safeguard:
+    """§8.6's R2 safeguard: the pins the drop rule may **never** drop, and why.
+
+    [VANTA-WHY] The drop rule's evidence is a *static* import closure, and a closure
+    cannot see three things a pytest run can. A plugin loaded from an entry point is
+    imported by pytest and by nobody in the tree, so no site names it. A plugin the
+    bug's own test command asks for with ``-p`` is the command line's business, not the
+    tree's. And a ``conftest.py`` on the test path is loaded before any test runs, so a
+    module one of its *lazy or guarded* imports names still runs whenever that directory
+    is collected — the walk reads conftest files, but it reads them as ordinary files,
+    and their sites are exactly as optional-looking as any other. Two more are not
+    imports at all: pytest itself, and the project under test. Dropping any of the five
+    is a layer that looks right and cannot be measured, so the safeguard answers first
+    and the closure is consulted only after it.
+
+    The answers arrive as data rather than being recomputed here: ``protected_names`` is
+    the caller's own ``{canonical name: why}`` — the build toolchain, pytest, the report
+    plugin's packages, the distribution that provides the project under test — and
+    ``plugin_names`` is :func:`plugin_options` read from the bug's own test command.
+    ``plugin_of`` answers the entry-point question for one release, and it is asked only
+    when a version is known: a ref the **date rule** refused has no release to read, and
+    it needs none — that refusal only ever removes a module the closure does not reach,
+    and the native gate still measures the layer afterwards (§11 step 2).
+    """
+
+    def check(
+        distribution: str, version: Optional[str], audit: ImportAudit
+    ) -> Optional[str]:
+        canonical = canonicalize_name(distribution)
+        declared = protected_names.get(canonical)
+        if declared is not None:
+            return declared
+        if canonical in plugin_names:
+            return "the bug's own test command loads it with -p"
+        for site in audit.sites:
+            if site.path.rsplit("/", 1)[-1] == "conftest.py":
+                return (
+                    f"{site.path} line {site.line} names it, and a conftest.py on the "
+                    "test path is imported before any test runs"
+                )
+        if plugin_of is not None and version is not None:
+            plugin = plugin_of(distribution, version)
+            if plugin is None:
+                return (
+                    f"whether {distribution}=={version} registers a pytest11 entry "
+                    "point could not be read, so §8.6's R2 will not drop it on a guess"
+                )
+            if plugin:
+                return (
+                    f"{distribution}=={version} registers a pytest11 entry point, so "
+                    "pytest loads it and no site in the tree has to import it"
+                )
+        return None
+
+    return check
+
+
+def protected_pin_names(project: str, sources: DepSources) -> dict[str, str]:
+    """§8.6's R2 safeguard's ``{canonical distribution: why}`` for one bug.
+
+    Four answers, and each is a pin the layer cannot be *measured* without rather than
+    one the tree happens to import: the harness's build toolchain and the legacy
+    resolver's pip; pytest and the two report-plugin packages; the project's **own**
+    declared build requirements — fastapi's ``flit``, pandas' ``numpy``/``cython``,
+    read from ``[build-system] requires`` or ``setup_requires``, so "the build backend"
+    rather than a fixed name list; and the project under test itself, under both
+    spellings the harness knows it by, the BugsInPy project name and the import name the
+    project's own metadata gives.
+
+    [VANTA-WHY] The order is fixed and shadows are deliberate: a name two answers could
+    claim keeps the *harness's* reason, because that reason is the one that holds for
+    every bug and the more specific label would read as a finding about this tree.
+    Protecting a name can only ever turn a drop into a flag, never the reverse, so an
+    entry that does not match anything costs nothing.
+    """
+    protected: dict[str, str] = {
+        canonicalize_name(name): BUILD_TOOL_SOURCE for name in BUILD_TOOLS
+    }
+    protected[canonicalize_name(PIP_TOOL)] = PIP_TOOL_SOURCE
+    protected[canonicalize_name("pytest")] = PYTEST_PROTECTED_SOURCE
+    for name, source in PLUGIN_SOURCES.items():
+        protected[canonicalize_name(name)] = source
+    for ref in sources.build_refs:
+        protected.setdefault(
+            canonicalize_name(ref.name), "the project's own declared build requirement"
+        )
+    for name in (project, sources.import_name):
+        if name:
+            protected.setdefault(
+                canonicalize_name(name),
+                "the distribution that provides the project under test",
+            )
+    return protected
+
+
 def decide_unresolvable(
     name: str,
     *,
@@ -8637,22 +9053,33 @@ def decide_unresolvable(
     outcome: str,
     reason: str,
     audit: ImportAudit,
+    safeguard: Optional[Safeguard] = None,
 ) -> DroppedPin:
     """§3.2's one rule, for every pin nothing on this image can install.
 
-    Two findings reach here and they are one rule rather than two:
+    Four findings reach here and they are one rule rather than four:
 
     * a class (c) pin — ``luigi/1``'s ``requests-async==0.5.0``, a release PyPI never
       uploaded, and ``sanic/1``'s ``pywin32==227``, whose files are all foreign wheels
       and which ships no sdist;
     * a class (b) pin preflight marks :data:`UNBUILDABLE` — an sdist whose build no
       entry in the reviewed table could make work here (``pyarrow``'s Arrow C++,
-      ``llvmlite``'s LLVM).
+      ``llvmlite``'s LLVM);
+    * §8.6's R2 — a declaration the **date rule** refuses (:data:`DATE_RULE_REFUSAL`),
+      whatever file declared it, which :func:`resolve_deps` caught rather than letting it
+      flag the bug. ``luigi/7``'s ``mysql`` is the measured case: the closure reads
+      ``import mysql`` out of ``test/_mysqldb_test.py``, no release of
+      ``mysql-connector-python`` predates the buggy commit, and the failing tests never
+      reach the module — so the layer is built without it and the drop is recorded;
+    * §8.6's R2's other half — a pin whose sdist **failed to build in this image**
+      (:data:`UNBUILDABLE_AT_BAKE`), which is only ever known from the failing layer's
+      own build log, so it reaches here from the retry and not from a preflight
+      (:func:`retry_drops`).
 
-    Both are settled by the same question, asked of the bug itself: **does anything the
-    graded tests reach import the module this distribution provides?** ``audit`` is that
-    answer, and it is three answers rather than one, because "somewhere in the tree" is
-    not the same claim as "somewhere in this bug's tests":
+    All four are settled by the same question, asked of the bug itself: **does anything
+    the graded tests reach import the module this distribution provides?** ``audit`` is
+    that answer, and it is three answers rather than one, because "somewhere in the tree"
+    is not the same claim as "somewhere in this bug's tests":
 
     * nothing imports it at all → dropped;
     * every site is behind a guard (:data:`_OPTIONAL_CALLS`, an ``except ImportError``, a
@@ -8664,6 +9091,13 @@ def decide_unresolvable(
       import cannot run the suite, so baking it anyway would trade a named flag now for
       an unreadable failure later.
 
+    ``safeguard`` is asked **before** any of them, and it is §8.6's R2 safeguard: the
+    pins the closure is not allowed to be the only witness for — a pytest plugin, a
+    module a ``conftest.py`` on the test path names, the project under test, pytest and
+    the build backend (:func:`pin_safeguard`). It answers ``None`` for a pin the gate
+    has nothing to say about, and a reason for one it refuses; a refusal is a flag, not a
+    drop.
+
     [VANTA-WHY] The last answer is the whole point of the change from "does any file
     import it": measured on pandas/1, ``import pyarrow`` appears in 18 files, and every
     one of them is optional or lazy — pandas works without pyarrow, and the failing test
@@ -8672,6 +9106,13 @@ def decide_unresolvable(
     the *prepare* gate, which measures the buggy/fixed flip for real: if a dropped pin
     is what breaks the bug, the gate catches it and names the drops (§11 step 2).
     """
+    if safeguard is not None:
+        refusal = safeguard(name, version, audit)
+        if refusal is not None:
+            raise BakeError(
+                f"{name} cannot be installed on this image ({reason}), and §8.6's R2 "
+                f"safeguard will not drop it: {refusal}. Amend the split or flag the bug."
+            )
     if audit.required_by is not None:
         raise BakeError(
             f"{name} cannot be installed on this image ({reason}), and "
@@ -8688,6 +9129,220 @@ def decide_unresolvable(
         outcome=outcome,
         reason=reason,
         audit=audit,
+    )
+
+
+def failed_builds(output: str) -> tuple[str, ...]:
+    """The canonical names ``pip`` says it failed to build, from its own summary line.
+
+    Empty when the failure is not that shape at all, and that is the load-bearing case:
+    ``luigi/30`` died at a build *requirement*'s ``setup.py egg_info`` and pip wrote no
+    such line, so a failure that names no distribution is not a list of pins to drop —
+    it is R1's case (:func:`requirements_recipe`), and the two rules must not read one
+    another's logs. Searched from the end, so a log that holds more than one attempt
+    answers with the last.
+    """
+    for raw in reversed(output.replace("\r", "\n").splitlines()):
+        line = raw.strip()
+        if line.startswith(FAILED_BUILD_PREFIX):
+            names = line[len(FAILED_BUILD_PREFIX) :].split()
+            return tuple(
+                dict.fromkeys(canonicalize_name(name) for name in names if name)
+            )
+    return ()
+
+
+def failed_build_line(output: str, name: str) -> str:
+    """Where the failing layer's log names ``name`` as an unbuildable wheel, or ``""``.
+
+    The per-name line (:data:`FAILED_WHEEL_PREFIX`) is preferred over the summary line
+    because it names one distribution rather than a list, so the evidence a drop records
+    is a line a reader can open. Line numbers are 1-based over the same normalisation
+    :func:`last_error_line` uses — ``\\r`` as a break — so pip's in-place progress output
+    does not count as several lines.
+    """
+    summary = ""
+    for index, raw in enumerate(output.replace("\r", "\n").splitlines(), start=1):
+        line = raw.strip()
+        if line.startswith(FAILED_WHEEL_PREFIX):
+            spoken = line[len(FAILED_WHEEL_PREFIX) :].strip()
+            if canonicalize_name(spoken) == name:
+                return f"build log line {index}: {line}"
+        elif line.startswith(FAILED_BUILD_PREFIX) and not summary:
+            summary = f"build log line {index}: {line}"
+    return summary
+
+
+def retry_drops(
+    output: str,
+    *,
+    installs: Sequence[str],
+    declared: Optional[Mapping[str, Sequence[str]]] = None,
+    audit: Callable[[str], ImportAudit],
+    safeguard: Optional[Safeguard] = None,
+) -> Optional[tuple[DroppedPin, ...]]:
+    """§8.6 R2(ii)'s one answer, from the failing layer's own log.
+
+    ``Some pins`` when the log names pins the rule may drop, ``None`` when the retry must
+    not run at all — and ``None`` is the answer for four different situations, all of
+    them "this is not the case this rule covers":
+
+    * the failure names no distribution (:func:`failed_builds` is empty): ``luigi/30``'s
+      build *requirement* died in its own ``setup.py egg_info``, which is R1's case;
+    * a name pip failed on is not a pin of this layer, so the log and the pin list
+      disagree and nothing here is safe to conclude;
+    * a pin is one §8.6's R2 safeguard refuses (:func:`pin_safeguard`): a pytest plugin,
+      a module a ``conftest.py`` on the test path names, the project under test, pytest
+      or the build backend. The safeguard is asked first, so a protected pin is never
+      dropped by this half either;
+    * a pin is one the failing tests *do* reach (:attr:`ImportAudit.required_by`): a
+      layer missing it cannot run the suite, so it is a flag and not a drop — exactly
+      the answer :func:`decide_unresolvable` gives the preflight halves.
+
+    Every drop records what a reader needs and nothing they have to go and find: the pin
+    and its version, the sources its *declaration* came from, the line of the failing
+    layer's own log that names it (:func:`failed_build_line`), and the closure evidence
+    the audit returned. ``installs`` is the layer's own pin list, which is what makes
+    "every name is a pin of this layer" checkable rather than assumed.
+    """
+    names = failed_builds(output)
+    if not names:
+        return None
+    specs: dict[str, str] = {}
+    for spec in installs:
+        parts = _pinned_parts(spec)
+        if parts is not None:
+            specs.setdefault(canonicalize_name(parts[0]), spec)
+    sources_of = declared or {}
+    records: list[DroppedPin] = []
+    for name in names:
+        spec = specs.get(name)
+        if spec is None:
+            return None
+        version = _pinned_parts(spec)[1]
+        finding = audit(name)
+        if safeguard is not None and safeguard(name, version, finding) is not None:
+            return None
+        if finding.required_by is not None:
+            return None
+        evidence = failed_build_line(output, name)
+        records.append(
+            DroppedPin(
+                name=name,
+                spec=spec,
+                sources=(
+                    *sources_of.get(name, ()),
+                    *((evidence,) if evidence else ()),
+                ),
+                version=version,
+                outcome=UNBUILDABLE_AT_BAKE,
+                reason=(
+                    "its sdist failed to build in this image during the first pass"
+                    + (f" ({evidence})" if evidence else "")
+                ),
+                audit=finding,
+            )
+        )
+    return tuple(records)
+
+
+@dataclass(frozen=True)
+class RetryMaterial:
+    """Everything one per-bug layer's retry needs, kept beside the layer (§8.6 R2(ii)).
+
+    Carried rather than recomputed when the build fails, because the two things that
+    decide the drop are per-bug and expensive: the import auditor reads both trees, and
+    the safeguard is bound to this bug's own test command and declared build
+    requirements. A retry that rebuilt them would be a second answer to a question
+    resolution had already answered, which is the one thing the layer's record exists to
+    prevent.
+    """
+
+    audit: Callable[[str], ImportAudit]
+    safeguard: Safeguard
+    minor: str
+
+
+@dataclass(frozen=True)
+class RetryPlan:
+    """One per-bug layer's single second attempt (§8.6 R2(ii)).
+
+    ``script`` is the first-pass recipe with the pins the retry dropped removed — from
+    the main pass, from the early pass or from the ``--no-deps`` pass, whichever held
+    them — and nothing else changed: the first pass is byte-identical to what it was
+    before this rule existed, and only a build that has already failed reaches here.
+    ``drops`` is what it removed and why, and it is what reaches both the layer's
+    provenance and the run's own summary.
+    """
+
+    script: str
+    drops: tuple[DroppedPin, ...]
+
+    def describe(self) -> list[str]:
+        """One line per drop, in the shape the bake's log and summary both print."""
+        return [
+            f"dropping {drop.pin} — {drop.reason}; "
+            + (drop.import_note or "nothing in either tree imports it")
+            for drop in self.drops
+        ]
+
+
+def _declared_sources(deps: "BugDeps") -> dict[str, tuple[str, ...]]:
+    """``{canonical name: the sources its declaration came from}`` from a layer's record."""
+    out: dict[str, tuple[str, ...]] = {}
+    records = deps.provenance.get("dependencies")
+    if not isinstance(records, list):
+        return out
+    for record in records:
+        if not isinstance(record, Mapping) or not record.get("name"):
+            continue
+        out[canonicalize_name(str(record["name"]))] = tuple(record.get("sources") or ())
+    return out
+
+
+def retry_plan(deps: "BugDeps", output: str) -> Optional[RetryPlan]:
+    """The one retry a per-bug layer whose build *failed* is allowed (§8.6 R2(ii)).
+
+    ``None`` for every layer the rule does not reach: one with no material (an
+    interpreter layer, or a caller that did not attach it), one whose log names nothing
+    pip failed to build, one whose failed names the safeguard protects or the graded
+    tests reach. Otherwise the recipe is re-rendered from the layer's own pin lists with
+    the dropped pins removed, so the second attempt is the first one minus exactly what
+    the rule dropped — the same ``BugDeps`` fields :func:`layer_recipes` renders from,
+    and not a re-resolution.
+    """
+    material = deps.retry
+    if material is None:
+        return None
+    drops = retry_drops(
+        output,
+        installs=deps.installs,
+        declared=_declared_sources(deps),
+        audit=material.audit,
+        safeguard=material.safeguard,
+    )
+    if not drops:
+        return None
+    gone = {drop.name for drop in drops}
+
+    def kept(specs: Sequence[str]) -> tuple[str, ...]:
+        out = []
+        for spec in specs:
+            parts = _pinned_parts(spec)
+            if parts is None or canonicalize_name(parts[0]) not in gone:
+                out.append(spec)
+        return tuple(out)
+
+    return RetryPlan(
+        script=requirements_recipe(
+            kept(deps.installs),
+            build_pins=kept(deps.build_pins),
+            early_pins=kept(deps.early_pins),
+            no_deps_pins=kept(deps.no_deps_pins),
+            orphans=deps.orphans,
+            minor=material.minor,
+        ),
+        drops=drops,
     )
 
 
@@ -9122,6 +9777,7 @@ def _unresolvable_pin(
     sources: Sequence[str],
     reason_of: Callable[[str, str], Optional[tuple[str, str]]],
     audit: Callable[[str], ImportAudit],
+    safeguard: Optional[Safeguard] = None,
 ) -> Optional[DroppedPin]:
     """The record for one pin, or ``None`` when it is ordinary.
 
@@ -9143,6 +9799,7 @@ def _unresolvable_pin(
         outcome=outcome,
         reason=reason,
         audit=audit(name),
+        safeguard=safeguard,
     )
 
 
@@ -9151,6 +9808,7 @@ def drop_unresolvable_refs(
     *,
     reason_of: Callable[[str, str], Optional[tuple[str, str]]],
     audit: Callable[[str], ImportAudit],
+    safeguard: Optional[Safeguard] = None,
 ) -> tuple[tuple[DepRef, ...], list[DroppedPin]]:
     """Drop every declared pin whose own version nothing can install here.
 
@@ -9175,6 +9833,7 @@ def drop_unresolvable_refs(
                 sources=(ref.source,),
                 reason_of=reason_of,
                 audit=audit,
+                safeguard=safeguard,
             )
         )
         if record is not None:
@@ -9189,6 +9848,7 @@ def drop_unresolvable_deps(
     *,
     reason_of: Callable[[str, str], Optional[tuple[str, str]]],
     audit: Callable[[str], ImportAudit],
+    safeguard: Optional[Safeguard] = None,
 ) -> tuple[list[ResolvedDep], list[DroppedPin]]:
     """The same rule over what the date rule picked.
 
@@ -9230,6 +9890,7 @@ def drop_unresolvable_deps(
                 sources=dep.sources or dep.required_by,
                 reason_of=reason_of,
                 audit=audit,
+                safeguard=safeguard,
             )
         )
         if record is not None:
@@ -9448,6 +10109,7 @@ def resolve_deps(
     reason_of: Optional[Callable[[str, str], Optional[tuple[str, str]]]] = None,
     audit: Optional[Callable[[str], ImportAudit]] = None,
     dropped: Optional[list[DroppedPin]] = None,
+    safeguard: Optional[Safeguard] = None,
 ) -> list[ResolvedDep]:
     """Union → conflict check → date pin → the report plugin, for one bug.
 
@@ -9469,6 +10131,16 @@ def resolve_deps(
     the pins the declarations and the dates decide, with nothing dropped and nothing
     raised.
 
+    §8.6's R2 adds a third answer to the same rule, and it is the reason the date pass
+    here is a loop: a ref the date rule refuses, that nothing the failing tests reach
+    imports, and that §8.6's R2 safeguard does not protect, is dropped with a
+    :data:`DATE_RULE_REFUSAL` record rather than flagging the bug. The scope is the
+    **module**, not the declaring file — a project's own file and the test side's import
+    closure are the same finding once the question is "do the graded tests reach it" —
+    and that is what ``safeguard`` is for (:func:`pin_safeguard`). It is *not* a third
+    pass alongside the other two: it runs where the date rule runs, because the refusal
+    is the date rule's own and there is no way to ask the question before it.
+
     ``metadata_of`` does double duty: it is the plugin step's "what does this release
     declare about pytest", and it is the *date rule's* case-(a) narrowing — what this
     layer's exact pins declare about each other (:func:`_narrowing_requirements`). One
@@ -9485,18 +10157,45 @@ def resolve_deps(
         )
     if dropped is not None:
         merged, dropped_refs = drop_unresolvable_refs(
-            merged, reason_of=reason_of, audit=audit
+            merged, reason_of=reason_of, audit=audit, safeguard=safeguard
         )
         dropped.extend(dropped_refs)
-    resolved = resolve_pins(
-        merged,
-        releases=releases,
-        commit_date=sources.commit_date,
-        harness_pins=harness_pins,
-        python_minor=python_minor or "",
-        buggy_commit=sources.buggy_commit,
-        metadata_of=metadata_of,
-    )
+    # §8.6's R2, the date-rule half, and the reason it is a *loop* rather than one
+    # retry: :func:`resolve_pins` refuses the whole bug at the first undatable ref, so
+    # the pass has to be re-run after each one is removed. What decides a refusal is the
+    # *module*, not the file that declared it: a ref nothing the failing tests reach
+    # imports is dropped, whatever source wrote it, and a ref the closure does reach —
+    # or one §8.6's R2 safeguard protects — is re-raised and flags the bug exactly as
+    # before (:func:`decide_unresolvable` is what asks both questions).
+    pool = merged
+    while True:
+        try:
+            resolved = resolve_pins(
+                pool,
+                releases=releases,
+                commit_date=sources.commit_date,
+                harness_pins=harness_pins,
+                python_minor=python_minor or "",
+                buggy_commit=sources.buggy_commit,
+                metadata_of=metadata_of,
+            )
+            break
+        except UndatableRef as exc:
+            if dropped is None or audit is None:
+                raise
+            dropped.append(
+                decide_unresolvable(
+                    exc.ref.name,
+                    version=None,
+                    spec=exc.ref.spec,
+                    sources=(exc.ref.source,),
+                    outcome=DATE_RULE_REFUSAL,
+                    reason=str(exc),
+                    audit=audit(exc.ref.name),
+                    safeguard=safeguard,
+                )
+            )
+            pool = [ref for ref in pool if ref.name != exc.ref.name]
     own = own_pytest_pin(sources.refs, harness_pytest=harness_pins.get("pytest"))
     if own is not None:
         resolved = resolved + plugin_pins(
@@ -9508,7 +10207,7 @@ def resolve_deps(
         )
     if dropped is not None:
         resolved, dropped_deps = drop_unresolvable_deps(
-            resolved, reason_of=reason_of, audit=audit
+            resolved, reason_of=reason_of, audit=audit, safeguard=safeguard
         )
         dropped.extend(dropped_deps)
     return resolved
@@ -10020,6 +10719,11 @@ def bug_sources(
     if not setup_sh.strip():
         notes.append("setup.sh (BugsInPy): empty for this bug")
 
+    # BugsInPy's own runner, read for one field of its own: the ``-p`` options §8.6's R2
+    # safeguard protects. Nothing here installs from it and it is not a source of
+    # declarations — the line is evidence about the *suite*, not about the environment.
+    test_command = test_command_of(run_test_sh_for(bugsinpy_root, project, bug_id))
+
     # The import name comes from the *buggy* commit's own metadata — ``setup.py``
     # or ``pyproject.toml``, whichever it carries: that is the package under test,
     # and the closure needs it to exclude the project's own modules. A commit with
@@ -10139,6 +10843,7 @@ def bug_sources(
         notes=tuple(notes),
         build_refs=tuple(build_declared),
         tree_modules=tuple(tree_modules),
+        test_command=test_command,
     )
 
 
@@ -10439,6 +11144,16 @@ class BugDeps:
     check``, and the freeze gate exempts none of them. Empty for every layer that does not
     re-pin a harness package, which is most of them.
     """
+    retry: Optional[RetryMaterial] = None
+    """What §8.6 R2(ii)'s one retry needs, or ``None`` for a layer the rule cannot reach.
+
+    ``None`` for every layer that is not a per-bug layer built from resolved pins — the
+    interpreter layers are built by :func:`python_recipe` and have no pins of their own to
+    drop — and for a caller that resolved dependencies without an audit to consult.
+    Attached by :func:`resolve_bug_deps` from the two callables it bound for this bug, so
+    the retry reads the *same* closure and the *same* safeguard both halves of the layer
+    were resolved with (:func:`retry_plan`).
+    """
 
 
 @dataclass(frozen=True)
@@ -10473,6 +11188,7 @@ def resolve_bug_deps(
         [str, str], Sequence[DepRef]
     ] = pypi_build_requirements,
     classify: Optional[Callable[[str, str, str], PreflightPin]] = None,
+    plugin_of: Optional[Callable[[str, str], Optional[bool]]] = None,
     build_vm: Optional[Mapping[str, int]] = None,
 ) -> tuple[list[BugDeps], list[FlaggedBug]]:
     """Resolve every selected bug's layer, pinning by date from PyPI.
@@ -10508,6 +11224,13 @@ def resolve_bug_deps(
     (:func:`early_install_pins`), so the layer's ``early_pins`` can say so. It is read
     from the release's sdist and never executed; ``bake`` passes the run's
     :func:`cached_build_requirements`, so a pin two bugs hold is downloaded once.
+
+    ``plugin_of`` answers §8.6's R2's last question — "does this release register a
+    ``pytest11`` entry point" (:func:`declares_pytest_plugin`) — and it is injected for
+    the same reason as the rest: it downloads a wheel, and a test that exercises a drop
+    must not. The safeguard it feeds is built here, per bug, from the harness's own
+    names, this bug's declared build requirements and the ``-p`` options its own
+    ``run_test.sh`` carries (:func:`pin_safeguard`, :func:`protected_pin_names`).
 
     ``build_vm`` is the VM every layer of this call is baked in, written into each
     provenance (:data:`BUILD_VM_KEY`). It is a property of the *run* and not of a bug, so
@@ -10611,6 +11334,15 @@ def resolve_bug_deps(
                 distributions=distributions,
                 test_files=test_files,
             )
+            # §8.6's R2 safeguard, built once for this bug and handed to both halves of
+            # the layer — the declared pins inside ``resolve_deps`` and the closure
+            # walk's picks below — for the same reason ``reason_of`` and ``audit`` are:
+            # a pin the safeguard protects must be a flag whichever pass reaches it.
+            safeguard = pin_safeguard(
+                protected_names=protected_pin_names(str(entry["project"]), sources),
+                plugin_names=plugin_options(sources.test_command or ""),
+                plugin_of=plugin_of or declares_pytest_plugin,
+            )
             resolved = resolve_deps(
                 sources,
                 releases=releases,
@@ -10620,6 +11352,7 @@ def resolve_bug_deps(
                 reason_of=reason_of,
                 audit=audit,
                 dropped=dropped,
+                safeguard=safeguard,
             )
             built = resolve_build_pins(
                 sources.build_refs,
@@ -10719,7 +11452,7 @@ def resolve_bug_deps(
             # ``dropped`` list, so the provenance and the preflight's drop report read
             # the two halves as one answer.
             transitive, dropped_transitive = drop_unresolvable_deps(
-                transitive, reason_of=reason_of, audit=audit
+                transitive, reason_of=reason_of, audit=audit, safeguard=safeguard
             )
             dropped.extend(dropped_transitive)
             # The transitive picks are installed, recorded and gated exactly as the
@@ -10819,6 +11552,11 @@ def resolve_bug_deps(
                 early_pins=tuple(dict.fromkeys(item.satisfied_by for item in early)),
                 no_deps_pins=no_deps,
                 orphans=tuple(pin.name for pin in orphaned),
+                # §8.6 R2(ii)'s retry reads the *same* closure and the *same* safeguard
+                # this layer was resolved with, carried rather than rebuilt when a build
+                # fails: the auditor reads both trees, and a second one built at retry
+                # time would be a second answer to a question already answered here.
+                retry=RetryMaterial(audit=audit, safeguard=safeguard, minor=minor),
             )
         )
     return out, flagged
@@ -10985,6 +11723,50 @@ def record_pip_check(
     path = deps_path(deps_dir, checkpoint)
     path.write_text(
         json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return path
+
+
+def record_retry(deps_dir: Path, checkpoint: str, plan: RetryPlan) -> Path:
+    """Write a retried layer's drops and the fact of the retry into its provenance.
+
+    [VANTA-WHY] Back into the file, like :func:`record_pip_check`, and for a related
+    reason: what the retry learned exists only once a build has been attempted, and
+    ``prepare`` reads one provenance per bug. The drops go into ``dropped`` — the key the
+    rest of the harness already reads — so their second reader is automatic: ``prepare``
+    names every dropped pin in a gate failure's reason
+    (``prepare.dropped_pin_note``), and the gate is the measurement that refutes a drop
+    that was wrong. ``retry`` is written beside them as the record of the *path*: that
+    this layer's first build failed, on what, and what the second attempt left out. Both
+    keys together are "every drop, with its source, its failure reason and its closure
+    evidence, in the layer metadata".
+
+    The identity is **re-stamped**, unlike :func:`record_pip_check`, and the difference is
+    the point: ``pip_check`` is a verdict *about* a layer and :func:`provenance_digest`
+    excludes it, whereas these drops change which pins the layer holds — ``dropped`` is
+    decisive material. Leaving the first pass's ``checkpoint_id`` in place would be a file
+    whose identity does not describe it, and two layers that resolved the same first-pass
+    pins would share a key while holding different environments.
+    """
+
+    data = load_deps(deps_dir, checkpoint)
+    records = data.get("dropped")
+    dropped = list(records) if isinstance(records, list) else []
+    dropped.extend(drop.as_dict() for drop in plan.drops)
+    data["dropped"] = dropped
+    data[RETRY_KEY] = {
+        "used": True,
+        "reason": (
+            "the first-pass build failed on "
+            + ", ".join(drop.pin for drop in plan.drops)
+            + " (§8.6 R2(ii)); the layer was rebuilt once without them"
+        ),
+        "dropped": [drop.as_dict() for drop in plan.drops],
+    }
+    path = deps_path(deps_dir, checkpoint)
+    path.write_text(
+        json.dumps(stamp_provenance(data), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
     )
     return path
 
@@ -12090,6 +12872,8 @@ def run_bake_actions(
     provided: Optional[Mapping[str, Container[str]]] = None,
     dropped: Optional[Mapping[str, Container[str]]] = None,
     tree_provided: Optional[Mapping[str, Container[str]]] = None,
+    retry: Optional[Callable[[str, ExecResult], Optional[RetryPlan]]] = None,
+    record_drops: Optional[Callable[[str, RetryPlan], None]] = None,
 ) -> str:
     """Delete, then build every layer the plan asks for, and report what happened.
 
@@ -12186,11 +12970,31 @@ def run_bake_actions(
     still case (a) and still fails the layer. The freeze gate needs no such parameter — a
     name from either rule is in neither the pin list nor the provision, so a release of it
     that pip did resolve is failed there already.
+
+    ``retry`` and ``record_drops`` are §8.6 R2(ii), and they are the only thing in this
+    function that runs *after* a failure rather than instead of one. ``retry`` is asked
+    once about a per-bug layer whose build failed, with that layer's own merged output; it
+    answers ``None`` for every failure the rule does not cover — the interpreter layers
+    are not asked at all — and a :class:`RetryPlan` for the one case it does. The plan's
+    ``script`` is built with the failed pins removed and **nothing else changed**, so the
+    first pass is byte-identical to what it was before the rule existed and a layer that
+    builds the first time never reaches any of this. Only when the plan's own second build
+    *succeeds* does the run carry on: a layer whose retry also fails takes the same failure
+    path it would have taken without the rule, so it fails **closed** and is classified as
+    before.
+
+    The dropped names join this layer's :data:`CASE_DROPPED_DEPENDENCY` and
+    :data:`CASE_TREE_PROVIDED` set before the gates run, because the layer that will now
+    be judged is the one *without* them: the own-pin gate has to tolerate the ``pip check``
+    reading they cause, and the freeze gate has to fail on a release of one that pip
+    resolved anyway exactly as it would for a preflight drop. ``record_drops`` is handed
+    the plan it may write into the layer's provenance (:func:`record_retry`), and each
+    drop is logged line by line, which is the run's own record of what the retry did.
     """
     own = own_pins or {}
     pin_lists = pins or {}
     supplied = provided or {}
-    dropped_names = dropped or {}
+    dropped_names = dict(dropped or {})
     tree_names = tree_provided or {}
     logs: dict[str, Path] = {}
     if logs_dir is not None:
@@ -12209,6 +13013,35 @@ def run_bake_actions(
         log(f"[{action.name}] building from {action.base} — {action.reason}")
         attempted.append(action.name)
         built = build(action.name, action.script, action.base)
+        if not built.ok and action.base != DEFAULT_BASE and retry is not None:
+            # §8.6 R2(ii): the one second attempt, and only for a per-bug layer whose
+            # first build failed. ``retry`` is authoritative about whether this failure
+            # is the rule's case at all — a log that names no unbuildable pin (R1's
+            # ``egg_info`` crash), a pin the safeguard protects and a pin the graded
+            # tests reach all answer ``None`` and leave the ordinary failure path below
+            # untouched.
+            plan = retry(action.name, built)
+            if plan is not None:
+                for line in plan.describe():
+                    log(f"[{action.name}] retry: {line}")
+                retried = build(action.name, plan.script, action.base)
+                if retried.ok:
+                    dropped_names[action.name] = (
+                        *dropped_names.get(action.name, ()),
+                        *(drop.name for drop in plan.drops),
+                    )
+                    if record_drops is not None:
+                        record_drops(action.name, plan)
+                    built = retried
+                else:
+                    # ``built`` stays the *first* attempt's result, and deliberately:
+                    # that is the log whose summary line names the pins the retry
+                    # dropped, so the failure report keeps the diagnosis rather than
+                    # replacing it with the second failure. The layer fails closed.
+                    log(
+                        f"[{action.name}] retry failed — the layer fails closed and is "
+                        "classified exactly as a first-pass failure is"
+                    )
         result = built
         verdict: Optional[ExecResult] = None
         if built.ok:

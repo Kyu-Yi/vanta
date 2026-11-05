@@ -858,6 +858,22 @@ def cmd_bake(args: argparse.Namespace) -> int:
         )
         for item in bug_deps
     }
+    # §8.6 R2(ii)'s two callables. The retry is asked once about a per-bug layer whose
+    # build *failed*, with that layer's own merged output, and answers a second recipe
+    # only when the failure names pins this rule may drop — a log that names none (R1's
+    # ``setup.py egg_info`` crash), a pin §8.6's safeguard protects and a pin the graded
+    # tests reach all answer None and leave the ordinary failure path alone. The material
+    # it needs came through resolve_bug_deps on each BugDeps, so the closure and the
+    # safeguard are the same two this layer was resolved with and not a second opinion.
+    # record_drops writes what it dropped, and why, into that layer's own provenance.
+    deps_by_checkpoint = {item.checkpoint: item for item in bug_deps}
+
+    def retry_layers(name: str, built: bake_mod.ExecResult) -> Optional[bake_mod.RetryPlan]:
+        item = deps_by_checkpoint.get(name)
+        if item is None:
+            return None
+        return bake_mod.retry_plan(item, built.stdout + built.stderr)
+
     try:
         summary = bake_mod.run_bake_actions(
             actions,
@@ -879,6 +895,8 @@ def cmd_bake(args: argparse.Namespace) -> int:
             provided=provided,
             dropped=dropped,
             tree_provided=tree_provided,
+            retry=retry_layers,
+            record_drops=lambda name, plan: bake_mod.record_retry(deps_dir, name, plan),
         )
     except BaseException:
         report_flagged()

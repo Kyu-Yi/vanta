@@ -17056,6 +17056,230 @@ class TestUnresolvablePins:
         )
 
 
+class TestTheNarrowDateRuleDrop:
+    """§8.6's R2(i), the refused half: a date-rule refusal nothing the tests reach.
+
+    ``luigi/7`` is the measured case. ``test/_mysqldb_test.py`` imports ``mysql`` at
+    module scope at the fixed commit, no release of ``mysql-connector-python`` predates
+    the buggy commit, and nothing the failing tests reach imports the module — so the
+    ref is dropped with a :data:`DATE_RULE_REFUSAL` record instead of flagging the bug.
+
+    The scope is the **module**, not the file that declared it (batch-3's symmetry
+    answer, matching R2(ii)): a project's own file and the test side's import closure
+    are the same finding once the question is "do the graded tests reach it". What
+    makes a refusal droppable is the audit's answer and the safeguard's, and this class
+    tests them apart because either alone is not enough: nothing the graded tests reach
+    imports the module (:func:`decide_unresolvable`), and §8.6's R2 safeguard does not
+    protect it (:func:`pin_safeguard`). A refusal the failing tests *do* reach still
+    flags the bug, a refused pin the safeguard protects still flags it, and both are
+    tested here so the narrowness is the claim, not just the drop.
+    """
+
+    def _sources(self, *refs, commit_date: str = "2019-04-22") -> bake_mod.DepSources:
+        return bake_mod.DepSources(
+            project="Demo",
+            bug_id=7,
+            checkpoint="vanta-bi-Demo-7",
+            buggy_commit="b" * 40,
+            commit_date=commit_date,
+            fixed_commit="f" * 40,
+            fixed_commit_date="2019-07-30",
+            import_name="demo",
+            refs=tuple(refs),
+        )
+
+    def _audit(self, *, required_by=None) -> "callable":
+        """An ``audit`` for a distribution nothing the graded tests reach imports."""
+        def audit(distribution):
+            if required_by is None:
+                return bake_mod.ImportAudit(
+                    (), None, "nothing in either tree imports it"
+                )
+            site = bake_mod.ImportSite(required_by, 20, distribution, None, "f" * 40)
+            return bake_mod.ImportAudit(
+                (site,),
+                site.spelling,
+                f"{site.spelling} imports it unconditionally, inside the failing tests' "
+                "import closure",
+            )
+
+        return audit
+
+    def _ordinary(self, name, version):
+        """``reason_of`` that finds nothing wrong: the drop here comes from the dates."""
+        return None
+
+    # ---- the source prefix is still what the walk writes -----------------
+    def test_the_walk_writes_the_one_source_prefix_the_rule_reads(self):
+        """``test_import_closure``'s refs carry the closure's own prefix, and nothing else."""
+        files = {"tests/test_demo.py": "import mysql\n"}
+        refs, _, _ = bake_mod.test_import_closure(
+            files=["tests/test_demo.py"],
+            read_file=lambda path: files.get(path),
+            import_name="demo",
+        )
+        assert [ref.source for ref in refs] == [
+            f"{bake_mod.CLOSURE_SOURCE_PREFIX}tests/test_demo.py line 1"
+        ]
+
+    def test_an_undatable_ref_is_a_bake_error_that_carries_its_ref(self):
+        """The type the drop pass catches is still a ``BakeError``: every ``except`` holds."""
+        ref = bake_mod.dep_ref("mysql", "import closure: test/_mysqldb_test.py line 20")
+        exc = bake_mod.UndatableRef(
+            "no release on or before 2019-04-22", ref=ref
+        )
+        assert isinstance(exc, bake_mod.BakeError)
+        assert exc.ref is ref
+
+    # ---- resolve_deps: the drop, the loop, and every re-raise -------------
+    def test_resolve_deps_drops_a_closure_sourced_ref_the_date_rule_refuses(self):
+        """The measured case, at the layer it is dropped in."""
+        refs = (
+            bake_mod.dep_ref("decorator>=4.3.0", "install_requires (setup.py) line 1"),
+            bake_mod.dep_ref("mysql", "import closure: test/_mysqldb_test.py line 20"),
+        )
+        dropped: list[bake_mod.DroppedPin] = []
+        resolved = bake_mod.resolve_deps(
+            self._sources(*refs),
+            releases={
+                "decorator": {"4.4.0": "2019-01-15"},
+                "mysql": {"8.0.20": "2020-04-01"},
+            },
+            harness_pins={},
+            reason_of=self._ordinary,
+            audit=self._audit(),
+            dropped=dropped,
+        )
+        assert [dep.pin for dep in resolved] == ["decorator==4.4.0"]
+        assert [record.pin for record in dropped] == ["mysql"]
+        record = dropped[0]
+        assert record.outcome == bake_mod.DATE_RULE_REFUSAL
+        assert record.version is None, "the rule named a version, the drop has none"
+        assert record.sources == (
+            "import closure: test/_mysqldb_test.py line 20",
+        )
+        assert "no release on or before 2019-04-22" in record.reason
+
+    def test_every_undatable_ref_is_dropped_in_turn(self):
+        """A loop, not one retry: ``resolve_pins`` refuses the whole layer at the first."""
+        refs = (
+            bake_mod.dep_ref("mysql", "import closure: test/_mysqldb_test.py line 20"),
+            bake_mod.dep_ref("mysqlclient", "import closure: test/_mysql_test.py line 3"),
+            bake_mod.dep_ref("decorator>=4.3.0", "install_requires (setup.py) line 1"),
+        )
+        dropped: list[bake_mod.DroppedPin] = []
+        resolved = bake_mod.resolve_deps(
+            self._sources(*refs),
+            releases={
+                "decorator": {"4.4.0": "2019-01-15"},
+                "mysql": {"8.0.20": "2020-04-01"},
+                "mysqlclient": {"2.0.1": "2020-04-01"},
+            },
+            harness_pins={},
+            reason_of=self._ordinary,
+            audit=self._audit(),
+            dropped=dropped,
+        )
+        assert [dep.pin for dep in resolved] == ["decorator==4.4.0"]
+        assert [record.pin for record in dropped] == ["mysql", "mysqlclient"]
+        assert {record.outcome for record in dropped} == {bake_mod.DATE_RULE_REFUSAL}
+
+    def test_a_project_sourced_undatable_ref_outside_the_closure_is_dropped(self):
+        """The scope is the module: a file the project wrote declares a droppable ref too.
+
+        Batch-3's symmetry answer. ``luigi/30``'s ``mysql-connector-python==8.0.20`` is
+        declared in ``requirements.txt``, and that its module is one nothing the graded
+        tests reach is the whole finding — not which file named it.
+        """
+        refs = (bake_mod.dep_ref("mysql", "requirements.txt line 90"),)
+        dropped: list[bake_mod.DroppedPin] = []
+        resolved = bake_mod.resolve_deps(
+            self._sources(*refs),
+            releases={"mysql": {"8.0.20": "2020-04-01"}},
+            harness_pins={},
+            reason_of=self._ordinary,
+            audit=self._audit(),
+            dropped=dropped,
+        )
+        assert resolved == []
+        assert [record.pin for record in dropped] == ["mysql"]
+        assert dropped[0].sources == ("requirements.txt line 90",)
+
+    def test_a_refusal_the_graded_tests_reach_still_flags_the_bug(self):
+        """The other half, whatever file declared it: the closure's reach decides."""
+        refs = (bake_mod.dep_ref("mysql", "import closure: test/_mysqldb_test.py line 20"),)
+        with pytest.raises(bake_mod.BakeError, match="imports it"):
+            bake_mod.resolve_deps(
+                self._sources(*refs),
+                releases={"mysql": {"8.0.20": "2020-04-01"}},
+                harness_pins={},
+                reason_of=self._ordinary,
+                audit=self._audit(required_by="test/_mysqldb_test.py"),
+                dropped=[],
+            )
+
+    def test_a_refusal_the_safeguard_protects_still_flags_the_bug(self):
+        """A protected pin is a flag even when nothing the graded tests import names it."""
+        refs = (bake_mod.dep_ref("pytest-xdist", "requirements.txt line 4"),)
+        safeguard = bake_mod.pin_safeguard(
+            protected_names={bake_mod.canonicalize_name("pytest-xdist"): "a pytest plugin"}
+        )
+        with pytest.raises(bake_mod.BakeError, match="will not drop it"):
+            bake_mod.resolve_deps(
+                self._sources(*refs),
+                releases={"pytest-xdist": {"2.0.0": "2020-04-01"}},
+                harness_pins={},
+                reason_of=self._ordinary,
+                audit=self._audit(),
+                dropped=[],
+                safeguard=safeguard,
+            )
+
+    def test_without_the_rule_the_refusal_is_left_alone(self):
+        """A caller that wants no drop — every test about the date rule — passes no triple."""
+        refs = (bake_mod.dep_ref("mysql", "import closure: test/_mysqldb_test.py line 20"),)
+        releases = {"mysql": {"8.0.20": "2020-04-01"}}
+        with pytest.raises(bake_mod.UndatableRef):
+            bake_mod.resolve_deps(
+                self._sources(*refs), releases=releases, harness_pins={}
+            )
+        with pytest.raises(bake_mod.UndatableRef):
+            bake_mod.resolve_deps(
+                self._sources(*refs),
+                releases=releases,
+                harness_pins={},
+                reason_of=self._ordinary,
+                dropped=[],
+            )
+
+    # ---- and the record reaches the layer's provenance -------------------
+    def test_the_date_rule_drop_reaches_the_layer_provenance(self, monkeypatch):
+        """Wired end to end: the drop is in the deps JSON, not only in a returned list."""
+        monkeypatch.setattr(
+            bake_mod,
+            "import_auditor",
+            lambda repo, commits, **kwargs: lambda name: bake_mod.ImportAudit(
+                (), None, "nothing in either tree imports it"
+            ),
+        )
+        releases = dict(_fixture_releases())
+        releases["mysql"] = {"8.0.20": "2020-04-01"}
+        _, layers, flagged = _resolve_with_drops(
+            monkeypatch,
+            refs=(
+                bake_mod.dep_ref("decorator>=4.3.0", "install_requires (setup.py) line 1"),
+                bake_mod.dep_ref("mysql", "import closure: test/_mysqldb_test.py line 20"),
+            ),
+            releases=releases,
+        )
+        assert flagged == []
+        record = layers[0].provenance["dropped"][0]
+        assert record["pin"] == "mysql"
+        assert record["outcome"] == bake_mod.DATE_RULE_REFUSAL
+        assert record["sources"] == ["import closure: test/_mysqldb_test.py line 20"]
+        assert "no release on or before 2019-04-22" in record["reason"]
+
+
 def _fixture_releases() -> dict:
     """The release tables the resolution tests share: the date-rule fixture plus the
     plugin pair.
@@ -17070,6 +17294,19 @@ def _fixture_releases() -> dict:
     return releases
 
 
+def _no_release_is_a_pytest_plugin(name: str, version: str) -> bool:
+    """The stand-in for §8.6's R2 entry-point question in the resolution tests.
+
+    ``False`` — "this release registers no ``pytest11`` entry point" — is the answer that
+    leaves the drop rule alone, which is what these tests are about; a test that wants
+    the safeguard to fire passes its own ``plugin_of``. The default is a stub rather than
+    :func:`bake.declares_pytest_plugin` for the reason the whole helper exists: the real
+    one reads PyPI, and a drop rule that can only be tested by reaching the network is a
+    drop rule nobody tests. The arm itself is covered directly, over a stubbed release.
+    """
+    return False
+
+
 def _resolve_with_drops(
     monkeypatch,
     *,
@@ -17079,6 +17316,7 @@ def _resolve_with_drops(
     releases=None,
     tree_modules=(),
     build_requires_of=None,
+    plugin_of=_no_release_is_a_pytest_plugin,
 ):
     """``resolve_bug_deps`` over one fake source set, with the network taken out.
 
@@ -17097,6 +17335,7 @@ def _resolve_with_drops(
     build-requirement passes read (:func:`bake.early_install_pins`,
     :func:`bake.uncovered_build_requirements`): with the wheel stub nothing is a source
     build and neither pass asks anything, so the default is "nothing declared".
+    ``plugin_of`` is §8.6's R2's last question, and its default is the stub above.
     """
     fetched: list[str] = []
     table = _fixture_releases() if releases is None else releases
@@ -17135,8 +17374,596 @@ def _resolve_with_drops(
         metadata_of=reader,
         classify=classify or _wheel_classifier(),
         build_requires_of=build_requires_of or (lambda name, version: ()),
+        plugin_of=plugin_of,
     )
     return fetched, layers, flagged
+
+
+_PANDAS_7_BUILD_LOG = (
+    "Collecting h5py==2.10.0\n"
+    "  Building wheel for h5py (setup.py) ... error\n"
+    "  ERROR: Failed building wheel for h5py\n"
+    "Collecting scikit-learn==0.22.1\n"
+    "  ERROR: Failed building wheel for scikit-learn\n"
+    "Failed to build h5py scikit-learn\n"
+    "ERROR: Could not build wheels for h5py, scikit-learn, which is required to\n"
+    "install pyproject.toml-based projects\n"
+)
+"""The measured shape of ``pandas/7``'s first-pass build failure.
+
+Both pins the layer holds fail inside the image (``h5py`` wants ``libhdf5.so``,
+``scikit-learn`` wants a ``scipy`` pip never got), so pip's own summary line names
+both and its per-name lines name each. Reproduced from the run's log, not invented.
+"""
+
+_LUIGI_30_BUILD_LOG = (
+    "  ERROR: Command errored out with exit status 1: python setup.py egg_info\n"
+    "      ImportError: cannot import name 'sic' from 'setuptools'\n"
+    "shuru: checkpoint 'vanta-bi-luigi-30' saved\n"
+)
+"""``luigi/30``'s failure: a build *requirement*'s ``egg_info``, and pip names no pin.
+
+The load-bearing negative for §8.6's R2(ii): :func:`bake.failed_builds` finds no
+``Failed to build …`` line, so the retry answers ``None`` and the ordinary failure
+path is left alone — this is R1's case and not this rule's.
+"""
+
+
+def _carrier_wheel(*, entry_points: str | None = None) -> bytes:
+    """One wheel in memory: a ``METADATA``, and an ``entry_points.txt`` when asked for.
+
+    A real zip rather than a mock, because what is being tested is precisely the
+    difference between "the archive opened and lists no such member" and "the archive
+    did not open" — a mock would answer whichever of the two the test asserted.
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("carrier-1.0.dist-info/METADATA", "Name: carrier\nVersion: 1.0\n")
+        if entry_points is not None:
+            archive.writestr("carrier-1.0.dist-info/entry_points.txt", entry_points)
+    return buffer.getvalue()
+
+
+class TestTheSafeguardsEntryPointQuestion:
+    """§8.6's R2's last arm: is this release a pytest plugin, and can we tell at all?
+
+    Three answers and not two, and the third is what the arm turns on. ``True`` protects
+    the pin (pytest loads a ``pytest11`` plugin itself, so no site in the tree names it);
+    ``None`` protects it too (an unreadable release is not evidence for a drop); and
+    ``False`` — **read, and it registers nothing** — lets the drop proceed. Reading the
+    last two as one answer is the failure this class exists against: measured on
+    ``h5py==2.10.0``, whose 28 wheels carry no ``entry_points.txt`` at all, it protected
+    the very pin ``pandas/7``'s retry was to drop and turned the retry into a flag.
+    """
+
+    def test_a_release_pypi_does_not_list_registers_nothing(self):
+        """A 404 is an answer, not a failed fetch: the release cannot be a plugin."""
+        assert (
+            bake_mod.declares_pytest_plugin("six", "9.9.9", files_of=lambda n, v: None)
+            is False
+        )
+
+    def test_a_wheel_that_opens_without_entry_points_registers_nothing(self):
+        assert (
+            bake_mod.declares_pytest_plugin(
+                "h5py",
+                "2.10.0",
+                files_of=lambda n, v: (_wheel("h5py-2.10.0-cp38-cp38-manylinux1_x86_64.whl"),),
+                entry_points_of=lambda file: "",
+            )
+            is False
+        )
+
+    def test_a_wheel_it_cannot_read_is_unknown(self):
+        assert (
+            bake_mod.declares_pytest_plugin(
+                "h5py",
+                "2.10.0",
+                files_of=lambda n, v: (_wheel("h5py-2.10.0-cp38-cp38-manylinux1_x86_64.whl"),),
+                entry_points_of=lambda file: None,
+            )
+            is None
+        )
+
+    def test_a_fetch_that_fails_is_unknown(self):
+        def files_of(name, version):
+            raise bake_mod.BakeError("cannot read the files from PyPI")
+
+        assert bake_mod.declares_pytest_plugin("six", "1.13.0", files_of=files_of) is None
+
+    def test_a_release_with_no_wheel_is_unknown(self):
+        """Nothing to read: the sdist's own metadata is not among these readers."""
+        assert (
+            bake_mod.declares_pytest_plugin(
+                "demo",
+                "1.0",
+                files_of=lambda n, v: (_sdist("demo-1.0.tar.gz"),),
+            )
+            is None
+        )
+
+    def test_a_wheel_that_registers_the_group_is_a_plugin(self):
+        assert (
+            bake_mod.declares_pytest_plugin(
+                "pytest-xdist",
+                "1.31.0",
+                files_of=lambda n, v: (_wheel("pytest_xdist-1.31.0-py2.py3-none-any.whl"),),
+                entry_points_of=lambda file: "[pytest11]\nxdist = xdist.plugin\n",
+            )
+            is True
+        )
+
+    def test_a_wheel_that_registers_somewhere_else_is_not_a_plugin(self):
+        assert (
+            bake_mod.declares_pytest_plugin(
+                "demo",
+                "1.0",
+                files_of=lambda n, v: (_wheel("demo-1.0-py3-none-any.whl"),),
+                entry_points_of=lambda file: "[console_scripts]\ndemo = demo.cli:main\n",
+            )
+            is False
+        )
+
+    # ---- the reader, which is where the third answer is produced -----------
+    def test_the_reader_says_empty_for_a_wheel_without_entry_points(self):
+        assert (
+            bake_mod._wheel_member(
+                _carrier_wheel(), bake_mod.WHEEL_ENTRY_POINTS_MEMBER, missing=""
+            )
+            == ""
+        )
+
+    def test_the_reader_returns_the_member_when_the_wheel_holds_one(self):
+        text = bake_mod._wheel_member(
+            _carrier_wheel(entry_points="[pytest11]\ncarrier = carrier.plugin\n"),
+            bake_mod.WHEEL_ENTRY_POINTS_MEMBER,
+            missing="",
+        )
+        assert bake_mod.entry_point_group(text, bake_mod.PYTEST_ENTRY_POINT_GROUP) == (
+            "carrier",
+        )
+
+    def test_the_reader_still_says_none_for_a_wheel_it_cannot_open(self):
+        """``missing`` is for the archive that opened; an unreadable one is unknown."""
+        assert (
+            bake_mod._wheel_member(
+                b"not a zip at all", bake_mod.WHEEL_ENTRY_POINTS_MEMBER, missing=""
+            )
+            is None
+        )
+
+    def test_the_default_reader_is_unchanged_for_the_metadata_member(self):
+        assert (
+            bake_mod._wheel_member(_carrier_wheel(), bake_mod.WHEEL_METADATA_MEMBER)
+            is not None
+        )
+        assert (
+            bake_mod._wheel_member(
+                _carrier_wheel(), bake_mod.WHEEL_ENTRY_POINTS_MEMBER
+            )
+            is None
+        )
+
+    # ---- and what the safeguard does with the three answers ----------------
+    def _audit(self):
+        return bake_mod.ImportAudit((), None, "nothing in either tree imports it")
+
+    def test_the_safeguard_protects_a_release_that_registers_the_group(self):
+        safeguard = bake_mod.pin_safeguard(
+            protected_names={}, plugin_of=lambda name, version: True
+        )
+        reason = safeguard("pytest-xdist", "1.31.0", self._audit())
+        assert reason is not None and "pytest11" in reason
+
+    def test_the_safeguard_protects_a_release_it_cannot_read(self):
+        safeguard = bake_mod.pin_safeguard(
+            protected_names={}, plugin_of=lambda name, version: None
+        )
+        reason = safeguard("h5py", "2.10.0", self._audit())
+        assert reason is not None and "could not be read" in reason
+
+    def test_the_safeguard_lets_a_release_that_registers_nothing_be_dropped(self):
+        safeguard = bake_mod.pin_safeguard(
+            protected_names={}, plugin_of=lambda name, version: False
+        )
+        assert safeguard("h5py", "2.10.0", self._audit()) is None
+
+    def test_the_safeguard_does_not_ask_without_a_version(self):
+        """A ref the *date rule* refused has no release to read, and needs none."""
+        asked: list[tuple[str, str]] = []
+
+        def plugin_of(name, version):
+            asked.append((name, version))
+            return True
+
+        safeguard = bake_mod.pin_safeguard(protected_names={}, plugin_of=plugin_of)
+        assert safeguard("mysql-connector-python", None, self._audit()) is None
+        assert asked == []
+
+    # ---- and wired into the bake's own resolution --------------------------
+    def test_a_plugin_pin_flags_the_bug_rather_than_being_dropped(self, monkeypatch):
+        monkeypatch.setattr(
+            bake_mod,
+            "import_auditor",
+            lambda repo, commits, **kwargs: lambda name: bake_mod.ImportAudit(
+                (), None, "nothing in either tree imports it"
+            ),
+        )
+        _, layers, flagged = _resolve_with_drops(
+            monkeypatch,
+            refs=(bake_mod.dep_ref("six==9.9.9", "requirements.txt line 4"),),
+            plugin_of=lambda name, version: True,
+        )
+        assert layers == []
+        assert [flag.key for flag in flagged] == ["Demo/1"]
+        assert "pytest11" in flagged[0].reason
+
+    def test_a_release_that_registers_nothing_is_still_dropped(self, monkeypatch):
+        """The negative the arm must not over-reach on: ``False`` leaves the rule alone."""
+        monkeypatch.setattr(
+            bake_mod,
+            "import_auditor",
+            lambda repo, commits, **kwargs: lambda name: bake_mod.ImportAudit(
+                (), None, "nothing in either tree imports it"
+            ),
+        )
+        _, layers, flagged = _resolve_with_drops(
+            monkeypatch,
+            refs=(bake_mod.dep_ref("six==9.9.9", "requirements.txt line 4"),),
+            plugin_of=lambda name, version: False,
+        )
+        assert flagged == []
+        assert layers[0].provenance["dropped"][0]["pin"] == "six==9.9.9"
+
+
+class TestTheRetryOnAnUnbuildablePin:
+    """§8.6's R2(ii): a per-bug layer rebuilt once without the pins that failed here.
+
+    The trigger is an **observed** build failure, never a static prediction, which is
+    what leaves every already-baked layer untouched by construction: a retry runs only
+    after a build has already failed, and the first-pass recipe is byte-identical. The
+    rule answers ``None`` for every failure it does not cover (rows 11–12, luigi's
+    ``egg_info`` crash), drops only pins **outside the failing tests' closure** that the
+    safeguard does not protect, records each drop in the layer metadata, and fails
+    **closed** if the retry also fails.
+    """
+
+    INSTALLS = (
+        "numpy==1.18.1",
+        "h5py==2.10.0",
+        "scikit-learn==0.22.1",
+        "python-dateutil==2.8.1",
+    )
+    DECLARED = {
+        "h5py": ("requirements.txt line 12",),
+        "scikit-learn": ("import closure: pandas/tests/test_downstream.py line 77",),
+    }
+
+    def _audit(self, *, required_by=None):
+        def audit(distribution):
+            if required_by is None:
+                return bake_mod.ImportAudit(
+                    (), None, "nothing in either tree imports it"
+                )
+            site = bake_mod.ImportSite(required_by, 77, distribution, None, "f" * 40)
+            return bake_mod.ImportAudit(
+                (site,), site.spelling, f"{site.spelling} imports it unconditionally"
+            )
+
+        return audit
+
+    def _drop_plan(self, script: str = "retry recipe") -> bake_mod.RetryPlan:
+        drop = bake_mod.DroppedPin(
+            name="h5py",
+            spec="h5py==2.10.0",
+            sources=("requirements.txt line 12",),
+            version="2.10.0",
+            outcome=bake_mod.UNBUILDABLE_AT_BAKE,
+            reason="its sdist failed to build in this image during the first pass",
+        )
+        return bake_mod.RetryPlan(script=script, drops=(drop,))
+
+    def _deps(self, *, retry=True, provenance=None, **kwargs) -> bake_mod.BugDeps:
+        material = (
+            bake_mod.RetryMaterial(
+                audit=self._audit(),
+                safeguard=bake_mod.pin_safeguard(protected_names={}),
+                minor="3.8",
+            )
+            if retry
+            else None
+        )
+        return bake_mod.BugDeps(
+            entry={"project": "pandas", "bug_id": 7},
+            checkpoint="vanta-bi-pandas-7",
+            installs=self.INSTALLS,
+            provenance=(
+                provenance
+                if provenance is not None
+                else {
+                    "installs": list(self.INSTALLS),
+                    "dependencies": [
+                        {"name": name, "sources": list(sources)}
+                        for name, sources in self.DECLARED.items()
+                    ],
+                }
+            ),
+            retry=material,
+            **kwargs,
+        )
+
+    # ---- reading the failing layer's own log -----------------------------
+    def test_the_summary_line_names_the_pins_pip_failed_to_build(self):
+        assert bake_mod.failed_builds(_PANDAS_7_BUILD_LOG) == (
+            "h5py",
+            "scikit-learn",
+        )
+
+    def test_the_names_are_canonicalised(self):
+        assert bake_mod.failed_builds("Failed to build Scikit_Learn\n") == (
+            "scikit-learn",
+        )
+
+    def test_a_log_that_names_no_distribution_is_not_this_rule(self):
+        """luigi/30's shape: a build *requirement*'s ``egg_info`` crash, no summary line."""
+        assert bake_mod.failed_builds(_LUIGI_30_BUILD_LOG) == ()
+
+    def test_the_evidence_is_the_line_that_names_the_pin(self):
+        line = bake_mod.failed_build_line(_PANDAS_7_BUILD_LOG, "h5py")
+        assert line.startswith("build log line ")
+        assert line.endswith("ERROR: Failed building wheel for h5py")
+
+    def test_without_a_per_name_line_the_summary_is_the_evidence(self):
+        line = bake_mod.failed_build_line("Failed to build h5py\n", "h5py")
+        assert line.endswith("Failed to build h5py")
+
+    # ---- retry_drops: the drop, and every ``None`` ------------------------
+    def test_an_unbuildable_pin_outside_the_closure_is_dropped(self):
+        drops = bake_mod.retry_drops(
+            _PANDAS_7_BUILD_LOG,
+            installs=self.INSTALLS,
+            declared=self.DECLARED,
+            audit=self._audit(),
+        )
+        assert drops is not None
+        assert [drop.pin for drop in drops] == ["h5py==2.10.0", "scikit-learn==0.22.1"]
+        first = drops[0]
+        assert first.outcome == bake_mod.UNBUILDABLE_AT_BAKE
+        assert first.version == "2.10.0"
+        # The declaration's source *and* the failing layer's own log line, both.
+        assert first.sources[0] == "requirements.txt line 12"
+        assert first.sources[-1].endswith(
+            "ERROR: Failed building wheel for h5py"
+        )
+        assert "its sdist failed to build in this image" in first.reason
+        assert first.audit is not None
+
+    def test_a_log_that_names_no_distribution_asks_for_no_retry(self):
+        assert (
+            bake_mod.retry_drops(
+                _LUIGI_30_BUILD_LOG,
+                installs=self.INSTALLS,
+                declared=self.DECLARED,
+                audit=self._audit(),
+            )
+            is None
+        )
+
+    def test_a_failed_name_that_is_not_a_pin_of_this_layer_asks_for_no_retry(self):
+        output = "Failed to build something-else\n"
+        assert (
+            bake_mod.retry_drops(
+                output, installs=self.INSTALLS, declared={}, audit=self._audit()
+            )
+            is None
+        )
+
+    def test_a_safeguarded_pin_asks_for_no_retry(self):
+        """A pytest plugin pip failed to build is a flag, not a drop, even here."""
+        safeguard = bake_mod.pin_safeguard(
+            protected_names={
+                bake_mod.canonicalize_name("pytest-xdist"): "a pytest plugin"
+            }
+        )
+        assert (
+            bake_mod.retry_drops(
+                "Failed to build pytest-xdist\n",
+                installs=("pytest-xdist==2.0.0",),
+                declared={},
+                audit=self._audit(),
+                safeguard=safeguard,
+            )
+            is None
+        )
+
+    def test_a_pin_the_graded_tests_reach_asks_for_no_retry(self):
+        """A layer missing a module the graded tests import cannot be graded: a flag."""
+        assert (
+            bake_mod.retry_drops(
+                "Failed to build h5py\n",
+                installs=self.INSTALLS,
+                declared=self.DECLARED,
+                audit=self._audit(
+                    required_by="pandas/tests/frame/indexing/test_indexing.py"
+                ),
+            )
+            is None
+        )
+
+    # ---- retry_plan: the recipe the second attempt runs ------------------
+    def test_a_layer_without_retry_material_is_never_retried(self):
+        assert bake_mod.retry_plan(self._deps(retry=False), _PANDAS_7_BUILD_LOG) is None
+
+    def test_the_retry_recipe_is_the_first_pass_minus_exactly_the_dropped_pins(self):
+        deps = self._deps(
+            build_pins=("numpy==1.18.1",), early_pins=("numpy==1.18.1",)
+        )
+        plan = bake_mod.retry_plan(deps, _PANDAS_7_BUILD_LOG)
+        assert plan is not None
+        assert [drop.pin for drop in plan.drops] == ["h5py==2.10.0", "scikit-learn==0.22.1"]
+        assert plan.script == bake_mod.requirements_recipe(
+            ("numpy==1.18.1", "python-dateutil==2.8.1"),
+            build_pins=("numpy==1.18.1",),
+            early_pins=("numpy==1.18.1",),
+            minor="3.8",
+        )
+        # The first pass, under the same inputs, still installs the dropped pair: the
+        # retry is what removes them, not a change to how the first pass is built.
+        first_pass = bake_mod.requirements_recipe(
+            self.INSTALLS, build_pins=("numpy==1.18.1",), minor="3.8"
+        )
+        assert "h5py==2.10.0" in first_pass
+        assert "h5py==2.10.0" not in plan.script
+
+    # ---- record_retry: the drop reaches the layer's provenance -----------
+    def test_record_retry_writes_the_drops_and_the_retry_into_the_layer(self, tmp_path):
+        deps = self._deps()
+        bake_mod.write_deps(tmp_path, deps)
+        before = bake_mod.load_deps(tmp_path, deps.checkpoint)
+        plan = bake_mod.retry_plan(deps, _PANDAS_7_BUILD_LOG)
+        bake_mod.record_retry(tmp_path, deps.checkpoint, plan)
+        after = bake_mod.load_deps(tmp_path, deps.checkpoint)
+        assert [record["pin"] for record in after["dropped"]] == [
+            "h5py==2.10.0",
+            "scikit-learn==0.22.1",
+        ]
+        assert after["dropped"][0]["outcome"] == bake_mod.UNBUILDABLE_AT_BAKE
+        assert after["retry"]["used"] is True
+        assert "h5py==2.10.0" in after["retry"]["reason"]
+        assert len(after["retry"]["dropped"]) == 2
+        # The identity moves with the drops: this file now describes a different layer.
+        assert after["checkpoint_id"] != before["checkpoint_id"]
+
+    # ---- run_bake_actions: the retry, and failing closed -----------------
+    CHILDREN = {"vanta-bi-Demo-1": PY38}
+
+    def _retry_run(
+        self, *, retry, record_drops=None, first_error, second_ok, projects=None, **kwargs
+    ):
+        existing = {PY38}
+        projects = [] if projects is None else projects
+        logged: list[str] = []
+
+        def exists(name):
+            return name in existing
+
+        def remove(name):
+            existing.discard(name)
+
+        def build(name, script, base):
+            projects.append((name, script))
+            existing.add(name)
+            if name == "vanta-bi-Demo-1" and script == "recipe for vanta-bi-Demo-1":
+                return bake_mod.ExecResult(
+                    stdout=first_error, stderr="", exit_code=1, timed_out=False
+                )
+            if name == "vanta-bi-Demo-1" and not second_ok:
+                return bake_mod.ExecResult(
+                    stdout="ERROR: retry blew up\n", stderr="", exit_code=1, timed_out=False
+                )
+            return bake_mod.ExecResult(
+                stdout="ok", stderr="", exit_code=0, timed_out=False
+            )
+
+        return (
+            bake_mod.run_bake_actions(
+                bake_mod.plan_layers(
+                    _layers(PY38, "vanta-bi-Demo-1"),
+                    force=True,
+                    children=self.CHILDREN,
+                    exists=exists,
+                ),
+                children=self.CHILDREN,
+                exists=exists,
+                remove=remove,
+                build=build,
+                log=logged.append,
+                retry=retry,
+                record_drops=record_drops,
+                **kwargs,
+            ),
+            projects,
+            logged,
+        )
+
+    def test_a_failed_layer_is_rebuilt_once_with_the_dropped_pins_removed(self):
+        recorded: list[tuple[str, object]] = []
+        plan = self._drop_plan()
+
+        def retry(name, built):
+            return plan if name == "vanta-bi-Demo-1" else None
+
+        summary, projects, logged = self._retry_run(
+            retry=retry,
+            record_drops=lambda name, value: recorded.append((name, value)),
+            first_error=_PANDAS_7_BUILD_LOG,
+            second_ok=True,
+        )
+        attempts = [script for name, script in projects if name == "vanta-bi-Demo-1"]
+        assert attempts == ["recipe for vanta-bi-Demo-1", "retry recipe"]
+        assert recorded == [("vanta-bi-Demo-1", plan)]
+        assert any("retry: dropping h5py==2.10.0" in line for line in logged)
+        assert "[done] vanta-bi-Demo-1" in summary
+
+    def test_a_failed_retry_leaves_the_layer_failed_as_before(self):
+        """Fail closed: the first attempt's diagnosis is the report, and nothing is recorded."""
+        recorded: list[tuple[str, object]] = []
+
+        def retry(name, built):
+            return self._drop_plan() if name == "vanta-bi-Demo-1" else None
+
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._retry_run(
+                retry=retry,
+                record_drops=lambda name, value: recorded.append((name, value)),
+                first_error=_PANDAS_7_BUILD_LOG,
+                second_ok=False,
+            )
+        assert recorded == [], "a layer whose retry failed has no drop to record"
+        message = str(excinfo.value)
+        assert "ERROR: Could not build wheels for h5py, scikit-learn" in message
+        assert "retry blew up" not in message, "the first attempt's log is the diagnosis"
+        assert "[FAILED] vanta-bi-Demo-1" in message
+
+    def test_without_a_retry_callable_a_failed_layer_is_not_retried(self):
+        """A caller that attaches no retry — every run before this rule — builds once."""
+        projects: list[tuple[str, str]] = []
+        with pytest.raises(bake_mod.BakeError):
+            self._retry_run(
+                retry=None,
+                first_error=_PANDAS_7_BUILD_LOG,
+                second_ok=True,
+                projects=projects,
+            )
+        attempts = [script for name, script in projects if name == "vanta-bi-Demo-1"]
+        assert attempts == ["recipe for vanta-bi-Demo-1"]
+
+    def test_the_interpreter_layer_is_never_retried(self):
+        asked: list[str] = []
+        existing = {PY38}
+
+        def build(name, script, base):
+            existing.add(name)
+            return bake_mod.ExecResult(
+                stdout="Failed to build h5py\n", stderr="", exit_code=1, timed_out=False
+            )
+
+        with pytest.raises(bake_mod.BakeError):
+            bake_mod.run_bake_actions(
+                bake_mod.plan_layers(
+                    _layers(PY38, "vanta-bi-Demo-1"),
+                    force=True,
+                    children=self.CHILDREN,
+                    exists=lambda name: name in existing,
+                ),
+                children=self.CHILDREN,
+                exists=lambda name: name in existing,
+                remove=lambda name: existing.discard(name),
+                build=build,
+                log=lambda line: None,
+                retry=lambda name, built: asked.append(name) or None,
+            )
+        assert asked == [], "the base layer is built from DEFAULT_BASE and never retried"
 
 
 def _transitive_unbuildable_fixture():

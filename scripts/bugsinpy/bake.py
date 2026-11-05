@@ -2113,6 +2113,88 @@ def _dict_literal_items(node: ast.expr) -> Optional[dict[str, ast.expr]]:
     return out
 
 
+def _module_string_constants(tree: ast.Module) -> dict[str, str]:
+    """Module-level ``NAME = "literal"`` bindings, for resolving f-strings.
+
+    [VANTA-WHY] ``pandas``' ``setup.py`` writes ``min_numpy_ver = "1.13.3"`` at module
+    level and spells the requirement ``f"numpy >= {min_numpy_ver}"``. The AST sees a
+    ``JoinedStr`` whose only literal part is ``"numpy >= "``, so the reader used to
+    hand ``"numpy >= "`` to :class:`Requirement` and fail the bug with a message about
+    a requirement nobody wrote (§8.6 row 1). Resolving the interpolation is what turns
+    the declaration back into the string it will be at runtime.
+
+    Only names bound at **module level** to a plain string constant are collected: a
+    name bound inside a function, or to anything computed, is not a fact this reader
+    can read without running the file, and the reader never runs it (design C3).
+    """
+
+    out: dict[str, str] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                out[target.id] = node.value.value
+    return out
+
+
+def _joined_str_value(node: ast.JoinedStr, constants: Mapping[str, str]) -> Optional[str]:
+    """The string an f-string builds, or ``None`` when it is not statically read.
+
+    Every part must be a literal, or an interpolation of a module-level string
+    constant with no conversion and no format spec (``f"{x!r}"`` and ``f"{x:>3}"``
+    build a string this reader would have to guess at, so it refuses).
+    """
+
+    parts: list[str] = []
+    for value in node.values:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            parts.append(value.value)
+            continue
+        if (
+            isinstance(value, ast.FormattedValue)
+            and value.conversion == -1
+            and value.format_spec is None
+            and isinstance(value.value, ast.Name)
+            and value.value.id in constants
+        ):
+            parts.append(constants[value.value.id])
+            continue
+        return None
+    return "".join(parts)
+
+
+def _fold_string_constants(node: ast.expr, constants: Mapping[str, str]) -> ast.expr:
+    """``node`` with every *resolvable* f-string replaced by the string it builds.
+
+    An f-string whose interpolation cannot be resolved is left as a ``JoinedStr``, so
+    the readers that run after this see it for what it is: a declaration whose only
+    literal part would be a truncation of it. :func:`_entry_refs` refuses one of those
+    by name rather than reading the truncation as a requirement (§8.6).
+    """
+
+    if isinstance(node, ast.JoinedStr):
+        resolved = _joined_str_value(node, constants)
+        if resolved is not None:
+            return ast.copy_location(ast.Constant(value=resolved), node)
+        return node
+    for field, value in ast.iter_fields(node):
+        if isinstance(value, list):
+            setattr(
+                node,
+                field,
+                [
+                    _fold_string_constants(item, constants) if isinstance(item, ast.AST) else item
+                    for item in value
+                ],
+            )
+        elif isinstance(value, ast.AST):
+            setattr(node, field, _fold_string_constants(value, constants))
+    return node
+
+
 def _setup_kwargs(setup_py: str) -> dict[str, ast.expr]:
     """``setup(...)``'s keyword arguments, as AST nodes.
 
@@ -2185,7 +2267,10 @@ def _setup_kwargs(setup_py: str) -> dict[str, ast.expr]:
                     kwargs.update(splat_items(keyword.value.id))
                 continue
             kwargs[keyword.arg] = deref(keyword.value)
-    return kwargs
+    # Every declaration is folded once, here, so the literal readers below see the
+    # string the file would have built rather than an f-string's literal parts.
+    constants = _module_string_constants(tree)
+    return {key: _fold_string_constants(value, constants) for key, value in kwargs.items()}
 
 
 def _literal_nodes(node: ast.expr) -> list[ast.Constant]:
@@ -2247,6 +2332,26 @@ def _extras_tests_node(extras: Optional[ast.expr]) -> Optional[ast.expr]:
     return None
 
 
+def _refuse_unresolved_fstrings(node: ast.expr, *, source: str) -> None:
+    """Fail closed on a declaration carrying an f-string this reader could not fold.
+
+    [VANTA-WHY] §8.6: the pandas template is resolved statically, and a declaration
+    that does not resolve to a literal is **flagged**, never truncated. Left alone, a
+    ``JoinedStr`` shows the literal readers only its fixed parts — ``f"numpy >= {v}"``
+    reads as ``"numpy >= "`` — and a requirement built from a truncation is a
+    requirement nobody wrote. Refusing here turns that into a flag with the line
+    number, which is the honest answer, instead of a silently wrong pin.
+    """
+
+    for item in ast.walk(node):
+        if isinstance(item, ast.JoinedStr):
+            raise BakeError(
+                f"{source} line {item.lineno}: an f-string this harness cannot resolve "
+                "to a literal (its interpolation is not a module-level string constant), "
+                "so the requirement it spells cannot be read; flag this bug (design §3.2)"
+            )
+
+
 def _entry_refs(
     node: Optional[ast.expr],
     *,
@@ -2260,6 +2365,7 @@ def _entry_refs(
     if node is None:
         notes.append(f"{source}: not declared in setup.py")
         return [], []
+    _refuse_unresolved_fstrings(node, source=source)
     refs: list[DepRef] = []
     skipped: list[SkippedLine] = []
     files = _file_literals(node)

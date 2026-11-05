@@ -17331,6 +17331,83 @@ class TestSetupPyStaticReader:
             bake_mod.setup_py_refs("setup(name=\n", {}, [])
 
 
+class TestSetupPyFStrings:
+    """The pandas template: an f-string over a module-level string constant (§8.6).
+
+    Six held-out pandas bugs (78, 121, 85, 138, 144, 104) declare ``install_requires``
+    as ``[..., f"numpy >= {min_numpy_ver}"]`` with ``min_numpy_ver = "1.13.3"`` at
+    module level. ``ast`` sees the ``JoinedStr``, and its only literal part is
+    ``"numpy >= "`` — a requirement nobody wrote, which is what the reader used to
+    hand to ``Requirement``. The declaration is resolved statically; one that cannot
+    be resolved is flagged rather than truncated.
+    """
+
+    def test_an_fstring_over_a_module_level_string_constant_is_resolved(self):
+        setup = (
+            "min_numpy_ver = '1.13.3'\n"
+            "setuptools_kwargs = {\n"
+            "    'install_requires': [\n"
+            "        'python-dateutil >= 2.6.1',\n"
+            "        'pytz >= 2017.2',\n"
+            "        f'numpy >= {min_numpy_ver}',\n"
+            "    ],\n"
+            "}\n"
+            "setup(name='pandas', **setuptools_kwargs)\n"
+        )
+        refs, _ = setup_py_refs(setup, {}, [])
+        assert [ref.spec for ref in refs] == [
+            "python-dateutil >= 2.6.1",
+            "pytz >= 2017.2",
+            "numpy >= 1.13.3",
+        ]
+        assert refs[-1].name == "numpy"
+        assert refs[-1].source == "install_requires (setup.py) line 6"
+
+    def test_an_fstring_interpolating_two_constants_is_resolved(self):
+        setup = (
+            "lo = '1.13'\n"
+            "hi = '2'\n"
+            "setup(name='X', install_requires=[f'numpy >={lo}.3,<{hi}'])\n"
+        )
+        refs, _ = setup_py_refs(setup, {}, [])
+        assert [ref.spec for ref in refs] == ["numpy >=1.13.3,<2"]
+
+    def test_an_fstring_over_a_name_bound_at_module_level_to_a_call_is_flagged(self):
+        """§8.6: a declaration that does not resolve to a literal fails closed."""
+        setup = (
+            "def vers():\n"
+            "    return '1.13.3'\n"
+            "min_numpy_ver = vers()\n"
+            "setup(name='X', install_requires=[f'numpy >= {min_numpy_ver}'])\n"
+        )
+        with pytest.raises(bake_mod.BakeError, match="cannot resolve"):
+            setup_py_refs(setup, {}, [])
+
+    def test_an_fstring_with_a_conversion_or_a_format_spec_is_flagged(self):
+        for template in ("f'numpy >= {min_numpy_ver!r}'", "f'numpy >= {min_numpy_ver:>8}'"):
+            setup = f"min_numpy_ver = '1.13.3'\nsetup(name='X', install_requires=[{template}])\n"
+            with pytest.raises(bake_mod.BakeError, match="cannot resolve"):
+                setup_py_refs(setup, {}, [])
+
+    def test_a_dict_bound_inside_a_function_is_left_unresolved_as_before(self):
+        """pandas 1, 51, 7 and 66 bind ``setuptools_kwargs`` inside ``setup_package()``.
+
+        [VANTA-WHY] Those layers are already baked, and the module-level f-string fix
+        must not reach into a function body to change them: the reader sees no
+        ``install_requires`` here, exactly as it did when they were baked.
+        """
+        setup = (
+            "min_numpy_ver = '1.13.3'\n"
+            "def setup_package():\n"
+            "    setuptools_kwargs = {'install_requires': [f'numpy >= {min_numpy_ver}']}\n"
+            "    setup(name='pandas', **setuptools_kwargs)\n"
+        )
+        notes: list[str] = []
+        refs, _ = setup_py_refs(setup, {}, notes)
+        assert refs == []
+        assert "install_requires: not declared in setup.py" in notes
+
+
 def setup_py_refs(setup_py: str, files: dict, notes: list) -> tuple:
     """``bake_mod.setup_py_refs`` with a dict standing in for the buggy commit."""
     return bake_mod.setup_py_refs(setup_py, files.get, notes)

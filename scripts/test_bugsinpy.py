@@ -13450,6 +13450,68 @@ class TestBuildRequirementPins:
             "declared_by": "ujson==2.0.3",
         }
 
+    def test_the_declarer_cutoff_reads_the_declaring_releases_own_date(self):
+        """The date the fallback widens to, and the three answers it can give.
+
+        [VANTA-WHY] Named in its own right because the widening turns on *which* answer
+        comes back: a date widens the window (§3.2's :func:`pin_cutoff` reasoning, read
+        on the build half), while ``None`` leaves it at the bug's own date. The name is
+        canonicalized first, so the declaring pin's spelling in a ``setup_requires`` need
+        not match PyPI's.
+        """
+        releases = {"ujson": {"3.0.0": "2020-06-03"}}
+        assert bake_mod._declarer_pin_cutoff("ujson==3.0.0", releases) == "2020-06-03"
+        assert bake_mod._declarer_pin_cutoff("UJSON==3.0.0", releases) == "2020-06-03"
+        assert bake_mod._declarer_pin_cutoff("ujson==3.0.0", {}) is None
+        assert bake_mod._declarer_pin_cutoff("ujson>=3", releases) is None
+        assert bake_mod._declarer_pin_cutoff("ujson==9.9.9", releases) is None
+
+    def test_the_declarers_own_release_date_widens_a_window_that_found_nothing(self):
+        """``fastapi/11``: the declaring pin landed after the bug, and its own date admits
+        the release its ``setup_requires`` asks for.
+
+        [VANTA-WHY] ``ujson==3.0.0`` is a BugsInPy reference pin installed *as written*
+        (:func:`reference_pin`), so it is admitted on a layer whose commit date precedes
+        it — and its ``setup_requires`` names ``setuptools_scm>=3.4``, a release that did
+        not exist at the bug's own date. Read only against the bug's date this is a
+        refusal for a pin the reference environment itself carried; the declaring
+        release's own date is the window the date rule already uses for such a pin
+        (:func:`pin_cutoff`).
+        """
+        releases = {
+            "setuptools-scm": {
+                "3.3.3": "2019-03-01",
+                "3.4.1": "2019-09-05",
+                "3.5.0": "2020-01-01",
+            },
+            "ujson": {"3.0.0": "2020-06-03"},
+        }
+        pins = self._pins(
+            [self._requirement("ujson==3.0.0", "setuptools_scm>=3.4")],
+            releases=releases,
+        )
+        assert [pin.pin for pin in pins] == ["setuptools-scm==3.5.0"]
+        assert pins[0].released_at == "2020-01-01"
+        assert pins[0].build_requirement_of == "ujson==3.0.0"
+
+    def test_a_window_the_bug_date_already_resolves_is_left_alone(self):
+        """The fallback is reached **only** when the bug's date finds nothing.
+
+        [VANTA-WHY] This is what keeps the rule byte-identical for every already-baked
+        layer: an empty window raised :class:`BakeError`, so a layer that baked by
+        construction never had one, and the declarer's later date cannot move a pin the
+        bug's own date already placed.
+        """
+        releases = {
+            "setuptools-scm": {"3.3.3": "2019-03-01", "3.5.0": "2020-01-01"},
+            "ujson": {"3.0.0": "2020-06-03"},
+        }
+        pins = self._pins(
+            [self._requirement("ujson==3.0.0", "setuptools_scm")],
+            releases=releases,
+        )
+        assert [pin.pin for pin in pins] == ["setuptools-scm==3.3.3"]
+
 
 class TestABuildRequirementNoPinCoversReachesTheLayer:
     """The wiring, end to end: the reading and the date rule into a real layer (§3.2).
@@ -13581,6 +13643,70 @@ class TestABuildRequirementNoPinCoversReachesTheLayer:
         assert record["source"] == "ujson==2.0.3 setup_requires (setup.py) line 86"
         assert record["pin_rule"] == bake_mod.BUILD_REQUIREMENT_PIN_RULE
         assert layers[0].early_pins == ("setuptools-scm==3.3.3",), (
+            "the build finds it only if it is installed first"
+        )
+
+    def test_a_build_requirement_only_the_declarers_own_date_can_place(
+        self, monkeypatch
+    ):
+        """The ``fastapi/11`` shape end to end: the bug's date finds nothing and the
+        declaring pin's own release date admits the release its build asked for.
+
+        [VANTA-WHY] ``ujson==3.0.0`` is a reference pin — admitted though it landed after
+        the bug (:func:`reference_pin`) — and its ``setup_requires`` names
+        ``setuptools_scm>=3.4``, which nothing at the bug's 2019-04-22 date satisfies.
+        Read against the bug's date alone this layer *flags*; read also against the
+        declaring release's own date (2020-06-03) the pin resolves to the newest release
+        inside that window and the layer bakes. The reference pin's own admission is
+        asserted too, because the fallback is meaningless if the declarer never lands.
+        """
+        releases = dict(_fixture_releases())
+        releases["ujson"] = {"3.0.0": "2020-06-03"}
+        releases["setuptools-scm"] = {
+            "3.3.3": "2019-05-12",
+            "3.4.0": "2020-01-17",
+            "3.5.0": "2020-02-13",
+        }
+
+        def classify(name, version, minor):
+            kind = (
+                bake_mod.SDIST_ONLY if name == "ujson" else bake_mod.INSTALLABLE_WHEEL
+            )
+            return bake_mod.PreflightPin(name, version, kind, "this test's own stub")
+
+        def build_requires_of(name, version):
+            if (name, version) == ("ujson", "3.0.0"):
+                return (
+                    bake_mod.DepRef(
+                        "setuptools_scm",
+                        "setuptools_scm>=3.4",
+                        "setup_requires (setup.py) line 85",
+                    ),
+                )
+            return ()
+
+        fetched, layers, flagged = _resolve_with_drops(
+            monkeypatch,
+            refs=(bake_mod.dep_ref("ujson==3.0.0", "requirements.txt line 1"),),
+            classify=classify,
+            build_requires_of=build_requires_of,
+            releases=releases,
+        )
+        assert flagged == []
+        assert layers[0].installs == ("ujson==3.0.0",), (
+            "a reference pin is installed as written, after the bug though it landed"
+        )
+        assert "setuptools-scm" in fetched, "fetched because it has to be dated"
+        record = next(
+            dep
+            for dep in layers[0].provenance["build_pins"]
+            if dep["name"] == "setuptools-scm"
+        )
+        assert record["pin"] == "setuptools-scm==3.5.0"
+        assert record["released_at"] == "2020-02-13"
+        assert record["declared_by"] == "ujson==3.0.0"
+        assert record["source"] == "ujson==3.0.0 setup_requires (setup.py) line 85"
+        assert layers[0].early_pins == ("setuptools-scm==3.5.0",), (
             "the build finds it only if it is installed first"
         )
 

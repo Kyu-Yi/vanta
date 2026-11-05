@@ -7963,6 +7963,34 @@ def uncovered_build_requirements(
     return out
 
 
+def _declarer_pin_cutoff(
+    declarer: str, releases: Mapping[str, Mapping[str, str]]
+) -> Optional[str]:
+    """The date a build requirement's declaring pin is held to (§3.2).
+
+    [VANTA-WHY] :func:`pin_cutoff`'s reasoning, read on the **build** half: a pin's own
+    requirements cannot pre-date the release that declares them. ``ujson==3.0.0`` is a
+    BugsInPy reference pin installed *as written*, and it landed 2020-06-03 — after
+    every fastapi bug it appears in — so its ``setup_requires`` naming
+    ``setuptools_scm>=3.4`` asks for a release that did not exist at ``fastapi/11``'s
+    own date (2019-08-06). Held to the bug's date alone, that declaration is a refusal
+    for a pin the reference environment itself carried.
+
+    ``None`` when the declaring release's own date is not in ``releases`` — the answer
+    for a declarer nothing fetched, and the conservative one: the window then stays the
+    bug's own date, exactly as it was before this fallback existed.
+    """
+    parts = _pinned_parts(declarer)
+    if parts is None:
+        return None
+    name, version = parts
+    available = releases.get(canonicalize_name(name))
+    if not available:
+        return None
+    date = available.get(version)
+    return date[:10] if date else None
+
+
 def build_requirement_pins(
     requirements: Sequence[BuildRequirement],
     *,
@@ -7990,6 +8018,18 @@ def build_requirement_pins(
     before ``commit_date`` inside the declared range is a ``BakeError`` and flags the bug,
     like every other date-rule refusal: a declaration nothing at the bug's date satisfies
     is exactly the layer that would fall back on ``easy_install``.
+
+    The one thing that can rescue such a refusal is the declaring pin's **own** date
+    (:func:`_declarer_pin_cutoff`), and it is reached **only** when the bug's date finds
+    nothing — that is the whole point of reading it second. A layer the date rule already
+    resolves keeps the release it has, bit for bit, so no already-baked layer can be moved
+    by this rule; the fallback only ever turns a refusal into a resolution. Measured on
+    ``fastapi/11``: ``ujson==3.0.0`` (released 2020-06-03) declares
+    ``setuptools_scm>=3.4``, nothing at the bug's 2019-08-06 date satisfies it, and the
+    declaring release's window admits ``setuptools-scm==4.1.2`` (2020-05-31). The fastapi
+    layers with later commit dates never reach the fallback at all: ``fastapi/1``, ``/2``
+    and ``/3`` pick ``setuptools-scm==3.5.0`` and ``fastapi/5`` and ``/6`` pick ``==3.4.1``
+    from the bug's own date, which is what keeps them byte-identical.
 
     ``releases`` is the caller's — it has to include these names, which the caller learns
     from :func:`uncovered_build_requirements` — so the whole decision is exercised by a
@@ -8029,10 +8069,38 @@ def build_requirement_pins(
             and _date_rule_candidate(version, specifier)
             and _specifier_accepts(specifier, version)
         ]
+        cutoff = commit_date
+        if not matching:
+            # §3.2's fallback, reached **only** here: the bug's date found nothing, so
+            # the window widens to the declaring pin's own date and no further
+            # (:func:`_declarer_pin_cutoff`, :func:`pin_cutoff`). A layer that already
+            # resolves never gets here, which is what makes the rule byte-identical for
+            # every baked layer.
+            cutoff = max(
+                [
+                    commit_date,
+                    *(
+                        date
+                        for claim in claims
+                        if (
+                            date := _declarer_pin_cutoff(claim.declarer, releases)
+                        )
+                        is not None
+                    ),
+                ]
+            )
+            matching = [
+                (version, date)
+                for version, date in available.items()
+                if _parseable(version)
+                and date[:10] <= cutoff
+                and _date_rule_candidate(version, specifier)
+                and _specifier_accepts(specifier, version)
+            ]
         if not matching:
             newest = _newest_release(available)
             raise BakeError(
-                f"{claims[0].source}: {name!r} has no release on or before {commit_date} "
+                f"{claims[0].source}: {name!r} has no release on or before {cutoff} "
                 f"that satisfies {specifier or 'the declaration'}, and a layer cannot be "
                 f"built without it (newest is {newest[0]}, released {newest[1][:10]})"
             )

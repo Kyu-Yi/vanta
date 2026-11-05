@@ -35,6 +35,7 @@ use crate::core::TestResult;
 use crate::pipeline::candidate::TestCommand;
 use crate::pipeline::harness::{self, NativeSuiteReport, StaticDiagnostic, StaticRun, TestExecutionDetails};
 use crate::pipeline::patch::patch_deleted_paths;
+use crate::pipeline::safe_path::confined_join;
 use crate::sandbox::{SandboxKind, backend_kind_label};
 use crate::session::SessionRecord;
 
@@ -1050,8 +1051,13 @@ fn resolve_bad_tree(
     let guard = tempfile::TempDir::new()?;
     let tree = guard.path().to_path_buf();
     copy_tree_recursive(&patched, &tree)?;
+    // [VANTA-WHY] T1 — these lists are read back from the session's evidence
+    // file, so they are DATA naming paths, not the walk that produced them. A
+    // path that would leave the tree is refused rather than joined: rebuilding
+    // a sanitized tree from an escaping entry is exactly the write this item
+    // exists to stop.
     for rel in &added {
-        let target = tree.join(rel);
+        let target = confined_join(&tree, rel)?;
         if target.is_file() {
             fs::remove_file(&target)?;
         }
@@ -1065,7 +1071,7 @@ fn resolve_bad_tree(
                 modified.join(", ")
             )
         })?;
-        let src = base.join(rel);
+        let src = confined_join(base, rel)?;
         let contents = fs::read_to_string(&src).map_err(|e| {
             format!(
                 "the original of the patch-modified test {rel} is not readable at {} ({e}) — \
@@ -1073,7 +1079,7 @@ fn resolve_bad_tree(
                 src.display()
             )
         })?;
-        let dst = tree.join(rel);
+        let dst = confined_join(&tree, rel)?;
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1151,7 +1157,10 @@ fn sanitize_good_tree(
     }
     let guard = tempfile::TempDir::new()?;
     for (path, contents) in &tree.files {
-        let out = guard.path().join(path);
+        // [VANTA-WHY] T1 — the keys came from a tree MAP built from disk (the
+        // walk), but they are re-joined here; confine them the same way so no
+        // rebuild step can write outside its own temp tree.
+        let out = confined_join(guard.path(), path)?;
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent)?;
         }

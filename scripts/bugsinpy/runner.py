@@ -60,15 +60,22 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    wait,
+)
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence
+from urllib.parse import unquote
 
 from . import bake as bake_mod
 from . import compact as compact_mod
 from . import arms as arms_mod
+from . import budget as budget_mod
 from . import context as ctx_mod
 from . import issue_source
 from . import manifest as manifest_mod
@@ -77,6 +84,7 @@ from . import prepare as prepare_mod
 from . import records as records_mod
 from . import redact as redact_mod
 from . import suite as suite_mod
+from . import suite_cache
 from . import trees as tree_mod
 from .manifest import DONE, FAILED, RUNNING, Manifest, job_key
 from .shuru import ShuruError
@@ -109,6 +117,13 @@ RUN_TIMEOUT_SECS = 3 * 60 * 60
 DEADLINE_MARGIN_SECS = 10 * 60
 PROBE_TIMEOUT_SECS = 120
 ORACLE_TIMEOUT_SECS = 1800
+
+# §3.4 — the row's per-project VM memory. ``src/sandbox/shuru.rs`` boots the VM to
+# this size and ``src/pipeline/suite_cache.rs`` folds it into the cache key, so the
+# same key decides both what runs and how it is cached. Named once because §3.4, X2
+# and X5 all reason about this one variable and a literal repeated three ways is a
+# place for the three to drift.
+SHURU_MEMORY_ENV = "VANTA_SHURU_MEMORY_MB"
 
 # The harness's two modes. Defined in the arm registry, which is keyed by them, and
 # re-exported here because this module and the split's vocabulary share them.
@@ -561,6 +576,7 @@ def vanta_env(
     memory_mb: Optional[int] = None,
     base: Optional[dict[str, str]] = None,
     frozen: Optional[Mapping[str, str]] = None,
+    deps: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, str]:
     """The controlled environment for one ``vanta_m3`` invocation (§7.4).
 
@@ -584,10 +600,24 @@ def vanta_env(
     timeout arithmetic the file names, and the value differs only for a caller the
     freeze should have refused.
 
+    [VANTA-WHY] M3 item X5 — the VM-memory key is the exception to "the harness's value
+    wins": it is not a caller-side guard but the row's own recorded fact, and a frozen
+    value the row cannot match exactly (a different size, or no size at all) is REFUSED
+    rather than overwritten, so the record can never name a memory the VM did not have.
+
     [VANTA-WHY] Every switch, the attempt budget's owner and the arm name come from
     ONE ``arms.py`` entry, so a run cannot be configured as one arm and recorded as
     another. That is the whole of "the harness refuses before launching": there is no
     combination here for it to get wrong.
+
+    ``deps`` is the bug's own dependency provenance (``prepare``'s ``load_deps``
+    result), and it is here for the same reason ``memory_mb`` is: the layer's
+    IDENTITY is in that file, and the in-session cache keys on it (M3 item U3).
+    ``VANTA_SHURU_CHECKPOINT_ID`` is set from it ALWAYS — to the empty string when
+    the layer has no stamp — because leaving it unset would let a caller's stale
+    value name an identity this run is not measuring. See
+    ``suite_cache.CHECKPOINT_ID_KEY``. The run log's ``# env:`` header carries the
+    value it set.
     """
     try:
         entry = arms_mod.arm(arm)
@@ -607,8 +637,53 @@ def vanta_env(
     # gates ran in. ``VANTA_SHURU_MEMORY_MB`` unset (the normal case, and every bug that
     # records no size) leaves ``src/sandbox/shuru.rs`` at shuru's own default, so the
     # binary's argv is what it was before this key existed.
+    #
+    # [VANTA-WHY] M3 item X5 — a FROZEN ``VANTA_SHURU_MEMORY_MB`` is honoured exactly or
+    # refused, never silently ignored. ``frozen`` was applied above, so both branches
+    # below would otherwise defeat it: the assignment would boot a VM of a different
+    # size than the file froze, and the pop would boot shuru's default while the file
+    # still claimed a size. In either case the record would name a memory the VM never
+    # had — the same class of drift X2 refuses for the inherited case. The one case
+    # that is not drift is a row whose own size EQUALS the frozen value: the assignment
+    # then writes the frozen value back, so nothing is ignored and the run proceeds. A
+    # frozen value the row cannot honour exactly (a row with no size, or a disagreeing
+    # size) is a refusal, because there is no correct size for the harness to pick on
+    # its own.
+    frozen_memory = frozen.get(SHURU_MEMORY_ENV) if frozen else None
+    if frozen_memory is not None and (
+        memory_mb is None or str(memory_mb) != frozen_memory
+    ):
+        raise RunnerError(
+            f"configs freeze {SHURU_MEMORY_ENV}={frozen_memory} but this row "
+            f"{'records no vm_memory_mb' if memory_mb is None else f'records {memory_mb}'}"
+            " — refusing to boot a VM at a size the frozen config did not name"
+        )
     if memory_mb is not None:
-        env["VANTA_SHURU_MEMORY_MB"] = str(memory_mb)
+        env[SHURU_MEMORY_ENV] = str(memory_mb)
+    else:
+        # [VANTA-WHY] M3 item X2 — a row that records no ``vm_memory_mb`` is charged
+        # the default VM (``budget.DEFAULT_VM_MEMORY_MB``), and the VM it boots must
+        # be that same size. Leaving an inherited ``VANTA_SHURU_MEMORY_MB`` in place
+        # would let ``src/sandbox/shuru.rs`` boot a bigger VM than the row was
+        # charged, so the child environment must not carry one. Removing it is safe
+        # because ``configs/v1-m3.toml`` does NOT freeze it — the key is [recorded],
+        # "set by runner.vanta_env ... absent = shuru's default" — and item X5 above
+        # has already refused the case where it ever did: a frozen value with no row
+        # size to honour it never reaches this pop.
+        env.pop(SHURU_MEMORY_ENV, None)
+    # [VANTA-WHY] M3 item U3 — WHICH layer this is, not merely which name it is
+    # under. The name a re-bake reuses, so a key carrying only the name can serve a
+    # measurement of a layer that no longer exists; the identity is the digest
+    # `bake` stamped into the layer's provenance. Always set, empty when the layer
+    # has no stamp: an inherited value would name an identity this run is not
+    # measuring, and the binary reads an empty one as "unknown", which disables the
+    # cache for the run rather than guessing.
+    identity = ""
+    if deps is not None:
+        stamped = deps.get(suite_cache.CHECKPOINT_ID_KEY)
+        if isinstance(stamped, str):
+            identity = stamped
+    env[suite_cache.CHECKPOINT_ID_ENV] = identity
     # See the module docstring: the self-heal needs network the VM does not have.
     env["VANTA_SHURU_AUTO_DEPS"] = "0"
     env["VANTA_ATTACKER"] = "on" if entry.attacker else "off"
@@ -639,6 +714,14 @@ def vanta_env(
     # the row is the `no run.summary` shape the overnight batch produced. Ten
     # minutes is one long sanic call, which is the unit the margin has to cover.
     env["VANTA_DEADLINE_SECS"] = str(RUN_TIMEOUT_SECS - DEADLINE_MARGIN_SECS)
+    # [VANTA-WHY] M3 items S1–S3 — the ONE suite cache directory, made absolute and
+    # handed to every child. The harness process and the binary it spawns must look
+    # in the same place or a hit in one is a miss in the other, and the binary's own
+    # default is relative to its CWD. `VANTA_NO_CACHE`, when the caller set it, is
+    # deliberately NOT set here: it is inherited like everything else this function
+    # does not own, so `--no-cache` reaches the child and the harness process by the
+    # same route.
+    env[suite_cache.CACHE_DIR_ENV] = str(suite_cache.cache_dir().resolve())
     return env
 
 
@@ -871,12 +954,17 @@ def grade_candidate(
     candidate: Candidate,
     checkpoint: str,
     disk_mb: int,
+    budget: Optional["budget_mod.Budget"] = None,
 ) -> Candidate:
     """Grade ``candidate`` once, caching the result keyed by its own identity.
 
     The cache is what makes a resume cheap: re-deriving a candidate set after a
     crash must not re-grade a patch the batch already graded, or a 3-hour batch
     would spend its first hour repeating known-good evidence.
+
+    ``budget`` (M3 item Y1) is handed to :func:`oracle.grade` so the grading's two
+    pairs may overlap under the invocation's one scheduler; ``None`` — ``pool``,
+    ``mutants``, a test — keeps the serial grading they had.
     """
     cached = batch_dir / "oracle" / "candidates" / prep.slug / f"{candidate.name}.json"
     if cached.is_file():
@@ -897,6 +985,7 @@ def grade_candidate(
         label=f"cand-{prep.slug}-{candidate.name}",
         disk_mb=disk_mb,
         timeout_secs=ORACLE_TIMEOUT_SECS,
+        budget=budget,
     )
     cached.parent.mkdir(parents=True, exist_ok=True)
     oracle_mod.save(cached, result)
@@ -921,6 +1010,15 @@ def oracle_from_dict(payload: dict[str, Any]) -> oracle_mod.OracleResult:
         oracle_secs=float(payload.get("oracle_secs") or 0.0),
         error=str(payload.get("error") or ""),
         inconclusive=bool(payload.get("inconclusive", False)),
+        # M3 item S2 — record-only, and ABSENT stays absent. An ``oracle.json``
+        # written before this item has no ``cache`` key, and rebuilding it as ``[]``
+        # would invent a cache lookup that never happened; only a present list is
+        # copied in, so the re-read of a cached candidate keeps its own provenance.
+        cache=(
+            [dict(item) for item in payload["cache"]]
+            if isinstance(payload.get("cache"), list)
+            else None
+        ),
     )
     return result
 
@@ -1010,12 +1108,23 @@ def candidate_set(
     checkpoint: str,
     disk_mb: int,
     records: Sequence[dict[str, Any]],
+    budget: Optional["budget_mod.Budget"] = None,
 ) -> list[Candidate]:
     """The per-bug review set, identical for both configs (§5.4, §7.1).
 
     Always the developer fix (known-good by construction) and the no-op floor;
     plus up to two pooled failed patches. Built **once per bug** and reused by
     both configs' review passes, which is what makes those rows paired.
+
+    [VANTA-WHY] M3 item Y1. The candidates of one set are independent — each is
+    graded against its own patch bytes in its own oracle work tree, and none reads
+    another's result — so they are graded together on a pool sized by the shared
+    budget and the ORDER of the returned list is the input order, not completion
+    order. Two graders running at once is ordinary under S5/S6 as well, so
+    :func:`suite.run_suite_twice`'s in-process flight already covers the case where
+    they want the same key; here they want different ones. Without a concurrent
+    budget (``--jobs 1``, a test, ``pool``, ``mutants``) the set is graded serially
+    in construction order, exactly as before this item.
     """
     dev = write_candidate_patch(
         batch_dir,
@@ -1031,6 +1140,29 @@ def candidate_set(
     )
     candidates = [dev, noop]
     candidates += pool_failed_patches(batch_dir=batch_dir, prep=prep, records=records)
+    # M3 item Y1 — one grader per candidate, admitted as the shared budget allows.
+    # `slots` is indexed rather than appended, so the list a caller gets back is the
+    # candidate order b1/b2/… saw, never the order the graders happened to finish in.
+    if budget is not None and budget.concurrent and len(candidates) > 1:
+        graded: list[Optional[Candidate]] = [None] * len(candidates)
+        with ThreadPoolExecutor(
+            max_workers=min(len(candidates), max(1, budget.cores))
+        ) as pool:
+            futures = {
+                pool.submit(
+                    grade_candidate,
+                    batch_dir=batch_dir,
+                    prep=prep,
+                    candidate=candidate,
+                    checkpoint=checkpoint,
+                    disk_mb=disk_mb,
+                    budget=budget,
+                ): index
+                for index, candidate in enumerate(candidates)
+            }
+            for future, index in futures.items():
+                graded[index] = future.result()
+        return [candidate for candidate in graded if candidate is not None]
     return [
         grade_candidate(
             batch_dir=batch_dir,
@@ -1038,6 +1170,7 @@ def candidate_set(
             candidate=candidate,
             checkpoint=checkpoint,
             disk_mb=disk_mb,
+            budget=budget,
         )
         for candidate in candidates
     ]
@@ -1209,7 +1342,10 @@ def selected_paths(context_selection: str) -> list[str]:
         body = body[:-1]
     if body in ("", "none"):
         return []
-    return [entry.split("@", 1)[0] for entry in body.split(";") if entry]
+    # [VANTA-WHY] M3 item T2 — the driver percent-encodes each path so a spaced
+    # one cannot break the line; decode it back here so `localization_hit` and
+    # `fix_file_coverage` compare it against the fix patch's raw paths.
+    return [unquote(entry.split("@", 1)[0]) for entry in body.split(";") if entry]
 
 
 def fix_touched_paths(prep: prepare_mod.BugPrep) -> list[str]:
@@ -1372,7 +1508,10 @@ def selected_forms(context_selection: str) -> dict[str, str]:
     for entry in body.split(";"):
         if not entry:
             continue
-        path = entry.split("@", 1)[0]
+        # [VANTA-WHY] M3 item T2 — decode the same percent-encoding the driver
+        # applies, so `fix_file_coverage` keys the form map by the patch's own
+        # (raw) path.
+        path = unquote(entry.split("@", 1)[0])
         # The form is the token after the entry's LAST ``]`` (the one that closes
         # ``[reasons]``) up to the ``:`` that opens the ``bytesB/tok`` tail. An
         # entry with no ``]`` at all is not the grammar this producer writes; it is
@@ -2177,6 +2316,147 @@ def label_reason_for(verdict: str, oracle: oracle_mod.OracleResult) -> Optional[
     return None
 
 
+# ---------------------------------------------------------------------------
+# M3 item H — the best attempt's grade, beside the last attempt's
+# ---------------------------------------------------------------------------
+ORACLE_BEST_NOTE = (
+    "the best attempt's grade, chosen with oracle knowledge; recorded BESIDE the "
+    "primary (last-attempt) grade and never a deployable selector"
+)
+"""One sentence, on every row that carries ``oracle_best`` (M3 item H).
+
+A K arm spends exactly K attempts, so the run's own verdict is about the LAST one —
+and a Creator that fixed the bug at attempt 1 and then broke it again at attempt 4
+is graded ``unresolved``, with the correct fix sitting unread three attempts earlier
+(PySnooper/3 `b3-k4`, measured 2026-11-05). ``oracle_best`` answers the other
+question — *was a correct fix ever reached?* — and it can only be answered by
+grading each attempt against the hidden oracle, which is knowledge no deployable
+selector has. The primary label is unchanged; nothing reads this key but a reader.
+"""
+
+
+def best_attempt_of(
+    graded: Sequence[tuple[int, "oracle_mod.OracleResult"]],
+    *,
+    attempts_run: int,
+    primary: "oracle_mod.OracleResult",
+) -> tuple[int, "oracle_mod.OracleResult", bool]:
+    """``(attempt, result, same_as_primary)`` — which attempt is the best one.
+
+    A ``patch_good`` attempt beats one that is not; among good attempts the EARLIEST
+    wins, because a fix the Creator reached sooner is at least as good. When no
+    earlier attempt is ``patch_good`` the best attempt IS the last one (the run's
+    primary), and ``same_as_primary`` is ``True``: that flag is what lets a reader
+    read the key without comparing two blocks by hand.
+
+    Pure, so the ordering is testable without a VM.
+    """
+    best: Optional[tuple[int, "oracle_mod.OracleResult"]] = None
+    for attempt, result in graded:
+        if not result.patch_good:
+            continue
+        if best is None or attempt < best[0]:
+            best = (attempt, result)
+    if best is None:
+        return attempts_run, primary, True
+    return best[0], best[1], False
+
+
+def grade_best_attempt(
+    *,
+    prep: prepare_mod.BugPrep,
+    paths: BatchPaths,
+    session_dir: Path,
+    decision: str,
+    attempts_run: int,
+    primary: "oracle_mod.OracleResult",
+    checkpoint: str,
+    disk_mb: int,
+    stem: str,
+) -> Optional[dict[str, Any]]:
+    """M3 item H — grade every DISTINCT earlier attempt and record the best.
+
+    ``attempts_run <= 1`` returns ``None`` (nowhere for a "best" to differ), so a
+    one-attempt row keeps exactly the shape it had before this item.
+
+    [VANTA-WHY] Each attempt is read as a *diff against the sanitized base*
+    (``pool.attempt_patch``, the same reader the review pool uses), never as the
+    Creator's raw patch text: the Creator emits source markers or search/replace
+    blocks, and only the applied tree's diff is what ``git apply`` can be handed.
+    Attempts are de-duplicated by that diff's ``sha256``, so the common
+    "returned the same patch again" history costs ONE grading rather than K-1
+    (PySnooper/3 `b3-k4`: attempts 1-3 are one diff). An attempt whose snapshot is
+    gone is recorded in ``skipped`` with the reader's own reason and never guessed.
+
+    The gradings are **additive** work on a K arm only, and the primary grading is
+    untouched: this function cannot change the row's ``oracle``, ``label``,
+    ``verdict`` or admission.
+    """
+    if attempts_run < 2:
+        return None
+    # Deferred: `pool` imports this module at module level.
+    from . import pool as pool_mod
+
+    debug_dir = session_dir / "debug"
+    base_tree = prep.root / "vanta_clean"
+    out_dir = paths.batch_dir / "oracle_best"
+    graded: list[tuple[int, "oracle_mod.OracleResult"]] = []
+    skipped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for attempt in range(1, attempts_run + 1):
+        text, reason, _origin = pool_mod.attempt_patch(
+            debug_dir=debug_dir, base_tree=base_tree, attempt=attempt
+        )
+        if text is None:
+            skipped.append({"attempt": attempt, "reason": reason})
+            continue
+        digest = sha256_text(text)
+        if attempt == attempts_run or digest in seen:
+            # The last attempt IS the primary grading, and a repeated diff was
+            # already graded under the attempt it first appeared as.
+            seen.add(digest)
+            continue
+        seen.add(digest)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        patch_path = out_dir / f"{stem}__attempt{attempt}.patch"
+        patch_path.write_text(text, encoding="utf-8")
+        result = oracle_mod.grade(
+            prep=prep,
+            batch_dir=paths.batch_dir,
+            checkpoint=checkpoint,
+            patch_path=patch_path,
+            label=f"{session_dir.name}__attempt{attempt}",
+            disk_mb=disk_mb,
+            timeout_secs=ORACLE_TIMEOUT_SECS,
+        )
+        oracle_mod.save(out_dir / f"{stem}__attempt{attempt}.json", result)
+        graded.append((attempt, result))
+
+    best_attempt, best_result, same_as_primary = best_attempt_of(
+        graded, attempts_run=attempts_run, primary=primary
+    )
+    return {
+        "attempt": best_attempt,
+        "same_as_primary": same_as_primary,
+        "patch_good": best_result.patch_good,
+        "hidden_pass": best_result.hidden_pass,
+        "apply_ok": best_result.apply_ok,
+        "apply_outcome": best_result.apply_outcome,
+        "suite_regressions_count": len(best_result.suite_regressions),
+        # The label the row WOULD have carried had the run graded the best attempt
+        # instead of the last one. `label_for` is the same pure function the primary
+        # label came from, so the two are comparable by construction.
+        "label": label_for(decision, best_result),
+        "label_rule": label_rule_for(best_result),
+        # What was actually graded, and what could not be read — the audit trail for
+        # "we looked at every attempt" rather than "we looked at the last one".
+        "graded_attempts": [attempt for attempt, _result in graded],
+        "skipped": skipped,
+        "oracle_secs": round(sum(result.oracle_secs for _a, result in graded), 3),
+        "note": ORACLE_BEST_NOTE,
+    }
+
+
 def build_record(
     *,
     job: "Job",
@@ -2190,10 +2470,57 @@ def build_record(
     python_version: str,
     oracle_json: Optional[Path],
     compaction: "compact_mod.Compaction",
+    scheduler: Optional[dict[str, Any]] = None,
+    oracle_best: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """One ``manifest.jsonl`` line (§7.3)."""
+    """One ``manifest.jsonl`` line (§7.3).
+
+    ``scheduler`` is M3 item S6's account of what the one scheduler did for this
+    row, built by :func:`_scheduler_row_block` before the row ran and completed
+    here with the run-time facts only this function can see (the wall time, the
+    deadline left at the end, the peak of simultaneous microVMs the row actually
+    reached, and its provider retries). It is ``None`` for a caller that had no
+    budget — a unit test, a direct call — and a ``None`` scheduler adds **no key
+    at all**, so those rows stay byte-for-byte the rows they were before this
+    item while every row a real invocation writes states its own concurrency.
+
+    ``oracle_best`` (M3 item H) is the best-attempt grade :func:`grade_best_attempt`
+    built, or ``None`` for a row that is not a K arm and for every row older than
+    the item. ``None`` adds **no key at all**, for the same reason ``scheduler``
+    does not, so a non-K row keeps its exact shape.
+    """
     summary = outcome.summary
     total = outcome.run_secs + oracle_secs
+    if scheduler is not None:
+        # [VANTA-WHY] M3 item S6 — the run-time half of the row's account. Nathan:
+        # "Concurrency must not change outcomes through time limits. ...
+        # VANTA_DEADLINE_SECS and the native timeout caps are wall-clock: under
+        # load a row runs slower and could hit a deadline it would not hit
+        # serially, which changes its label. Record per row its wall time,
+        # deadline remaining at the end, and provider retries and 429s". The
+        # scheduler block is where those live so a reader can tell a row that
+        # finished serially from one that was slowed by its neighbours.
+        scheduler = dict(scheduler)
+        scheduler["wall_s"] = round(outcome.run_secs, 3)
+        deadline_secs = _int(summary.get("deadline_secs"))
+        scheduler["deadline_secs"] = deadline_secs
+        scheduler["deadline_remaining_s"] = (
+            round(deadline_secs - outcome.run_secs, 3)
+            if deadline_secs is not None
+            else None
+        )
+        # The peak of simultaneous live sandboxes this row's own process reached,
+        # from the process-global counter `vanta_m3` now exposes (§`sandbox`).
+        scheduler["peak_sandboxes"] = _int(summary.get("peak_sandboxes"))
+        # Provider pressure, read from the same `run.summary` keys the `llm` block
+        # uses: copied, never re-measured, so the two can never disagree.
+        scheduler["provider_retries"] = _int(summary.get("provider_retries"))
+        scheduler["provider_retries_rate_limit"] = _int(
+            summary.get("provider_retries_rate_limit")
+        )
+        scheduler["provider_retries_unavailable"] = _int(
+            summary.get("provider_retries_unavailable")
+        )
     # [VANTA-WHY] M3 item A2 — fix-file coverage, computed AFTER the row has
     # finished, from the same two inputs `localization_hit` uses just below: the
     # gold fix paths and the Creator's own recorded selection. It is built here
@@ -2214,7 +2541,7 @@ def build_record(
             fix_coverage_files,
             fix_coverage_reason,
         ) = fix_file_coverage(prep, summary.get("context_selection"))
-    return {
+    record = {
         "schema_version": manifest_mod.SCHEMA_VERSION,
         "kind": "run",
         "key": job.key,
@@ -2247,6 +2574,24 @@ def build_record(
         "config_path": (job.config_block or {}).get("config_path"),
         "config_override": (job.config_block or {}).get("config_override"),
         "config_overrides": list((job.config_block or {}).get("config_overrides") or []),
+        # Item T3 — the configuration the batch's PREPARATION recorded, carried
+        # onto every row beside the run's. `run`/`queue` refuse to run a batch whose
+        # preparation recorded a different `config_hash` or override status unless
+        # `--allow-override` waives it, so within a batch the two agree; recording
+        # both anyway is what lets `analyse` group on the preparation's claim (a
+        # batch prepared under one config and run under another is exactly the
+        # contradiction pooling must not average over). `None` when the batch's
+        # `prepare.json` recorded no config block. Item U8 — the preparation's
+        # applied overrides ride along beside them, because the run-side `config_hash`
+        # / `config_override` pair is likewise not the whole configuration: two
+        # preparations can share a `config_hash` and waive different frozen settings
+        # with `--config-override`, and a row that recorded only the flag cannot tell
+        # those two trees apart. Written RAW (not coerced to a list) so `analyse` can
+        # keep "no field at all" (`None`) distinct from a recorded empty list — the
+        # first says nothing about the waived values, the second says there were none.
+        "prep_config_hash": (job.prep_config_block or {}).get("config_hash"),
+        "prep_config_override": (job.prep_config_block or {}).get("config_override"),
+        "prep_config_overrides": (job.prep_config_block or {}).get("config_overrides"),
         # §14.23 — how the pinned seed was turned into a per-round seed. Recorded
         # because the offset is DEFAULT-ON: a row's own `seed` cannot say whether its
         # later review rounds were independent draws or deterministic duplicates, so
@@ -2264,6 +2609,16 @@ def build_record(
         # never be pooled with one after it. Read back from `run.summary` so a
         # batch table can cut by it without opening a session log.
         "seed_method": summary.get("seed_method"),
+        # [VANTA-WHY] W1 — which security boundary actually ran this row, read back
+        # from `run.summary` (the run's own `actual_backend`). `shuru` is a microVM;
+        # `subprocess` is untrusted code on the host with no boundary, reachable
+        # only by an explicit `VANTA_SANDBOX_BACKEND=subprocess` — the harness
+        # itself always forces `shuru` (`vanta_env`), so this is `subprocess` only
+        # for a run made outside it. Recording it per row makes the downgrade
+        # auditable rather than something a reader has to infer from a session log;
+        # `None` on a row written before the field existed. Appended after the
+        # pre-existing keys so older readers are unaffected.
+        "sandbox_backend": summary.get("sandbox_backend"),
         # §1.2 — the project version frozen into the sandbox tree at prepare time,
         # as `version_pin.as_record` recorded it on the bug's row and carried here
         # onto its run rows. Recorded for `seed_method`'s reason: the version a
@@ -2398,6 +2753,27 @@ def build_record(
         "attempts_edited_unshown_file": _int(
             summary.get("attempts_edited_unshown_file")
         ),
+        # [VANTA-WHY] Q1 — how many `===FILE:` marker lines across this run's
+        # Creator attempts carried leading whitespace and had to be trimmed to be
+        # recognised. The Creator prompt shows the markers four-space indented, so
+        # the old column-0-only parser could turn such a patch into "patch changed
+        # nothing" or a silently wrong patch; a positive count names that shape.
+        # RECORD ONLY: no metric, label or verdict reads it. `None` (the key
+        # absent) is an older row OR a review run, and is kept distinct from a
+        # repair run that genuinely trimmed nothing (`0`) — an absent field means
+        # UNKNOWN, never "zero markers were trimmed".
+        "markers_trimmed": _int(summary.get("markers_trimmed")),
+        # [VANTA-WHY] Q2 — the paths a Creator patch INTRODUCED: blocks whose path
+        # the original tree did not have and whose content was not empty, unioned
+        # across attempts and sorted. A mistyped marker path (`cartt.py` for a tree
+        # that has `cart.py`) lands here, so a patch that quietly created a file
+        # next to the one it meant to edit is visible on the row. RECORD ONLY: no
+        # metric, label or verdict reads it. The driver writes `none` for a genuine
+        # empty list (a repair run that created nothing), which reads as `[]`; an
+        # ABSENT key — a review run, or a row older than the field — reads as
+        # `None` (UNKNOWN), never as an empty list, so an old row is never claimed
+        # to have created no files.
+        "new_files_created": _list(summary.get("new_files_created")),
         # [VANTA-WHY] M3 item 9 — whether this run was asked to spend a FIXED
         # number of repair attempts (`--fixed-rounds K`), read back from
         # `run.summary` so a batch table can cut by it without opening a session
@@ -2459,6 +2835,16 @@ def build_record(
             "compact_reason": compaction.reason,
         },
     }
+    # M3 item S6 — the key is added only when there is a scheduler to describe.
+    # A `None` here is a unit test or a direct caller, and §14.33 requires those
+    # rows to keep the exact shape they had before this item.
+    if scheduler is not None:
+        record["scheduler"] = scheduler
+    # M3 item H — same rule, for the same reason: only a K arm's row carries the
+    # best-attempt grade, and every other row is byte-for-byte the row it was.
+    if oracle_best is not None:
+        record["oracle_best"] = oracle_best
+    return record
 
 
 def _bool(value: Optional[str]) -> Optional[bool]:
@@ -2472,6 +2858,40 @@ def _int(value: Optional[str]) -> Optional[int]:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _list(value: Optional[str]) -> Optional[list[str]]:
+    """A summary ``[a;b]`` list, or ``None`` when the key is absent.
+
+    [VANTA-WHY] Q2 — the reader keeps ABSENT distinct from EMPTY: the driver
+    writes the literal ``none`` for a genuine empty list (``[]`` here), while a
+    missing key returns ``None`` (UNKNOWN). An old row must never be read as
+    having created no files, so ``None`` is not collapsed to ``[]``.
+
+    [VANTA-WHY] M3 item T2 — each entry is percent-decoded, the inverse of the
+    driver's ``summary_escape::encode_summary_value``. ``new_files_created``
+    carries the Creator's own paths, and one shaped like
+    ``x final_decision=AllTestsPassed y.py`` would otherwise truncate the value at
+    its space and inject a field; the driver encodes it space-free and this reads
+    the path back exactly. An entry without a ``%`` is returned unchanged, so a
+    row written before this change still reads as it did.
+
+    [VANTA-WHY] M3 item U7 — the literal ``none`` is the empty-list sentinel only
+    when it is NOT bracketed. The driver brackets every non-empty list, so a
+    ``none`` inside brackets is one path actually NAMED ``none``: reading it as
+    the sentinel would report a run that created a file named ``none`` as having
+    created nothing. A bare ``none`` (and a bracketed empty body) still reads as
+    ``[]``, so an old row keeps its meaning.
+    """
+    if value is None:
+        return None
+    body = value.strip()
+    bracketed = body.startswith("[") and body.endswith("]")
+    if bracketed:
+        body = body[1:-1]
+    elif body in ("", "none"):
+        return []
+    return [unquote(item) for item in body.split(";") if item]
 
 
 # ---------------------------------------------------------------------------
@@ -2529,6 +2949,24 @@ class Job:
     one, which is every test-built job and every row written before this field.
     """
 
+    prep_config_block: Optional[dict[str, Any]] = None
+    """Item T3 — the configuration the batch's **preparation** recorded.
+
+    The same four keys as ``config_block`` above (``config_hash``,
+    ``config_path``, ``config_override``, ``config_overrides``), read back from the
+    batch's ``prepare.json``. It rides on every row (``build_record``) for the same
+    reason ``config_hash`` does: a run's rows and the preparation that sized their
+    context gate are two claims, and a row that records only one of them cannot say
+    whether the tree it graded was prepared under the configuration it ran under.
+    ``None`` on a row whose batch recorded no config block (a batch prepared before
+    item Q3, or a test-built job).
+
+    Item U8 — ``build_record`` carries all three of its pooling-relevant keys onto the
+    row (``prep_config_hash``, ``prep_config_override`` and ``prep_config_overrides``),
+    so two preparations that share a hash and a waiver flag but waived different frozen
+    settings cannot be pooled by ``analyse``.
+    """
+
     frozen_env: Optional[Mapping[str, str]] = None
     """Item 19 — the frozen configuration's ``[env]`` settings, applied to the child.
 
@@ -2584,19 +3022,24 @@ def python_version_of(paths: BatchPaths, checkpoint: str, disk_mb: int) -> str:
 
     §7.3 records both this and the pinned version. Probing costs one boot per
     checkpoint and is cached, so a 100-run batch pays it once per environment.
+
+    [VANTA-WHY] M3 item V8 — the probe needs no tree at all, only an interpreter, so
+    its VM mounts an empty root of its own (:class:`suite.VmRoot` with no tree)
+    rather than the whole batch directory.
     """
     cached = paths.env_cache / f"{checkpoint}.json"
     if cached.is_file():
         return str(_read_json(cached).get("python_version") or "")
     from . import shuru as shuru_mod
 
-    probe = shuru_mod.run(
-        checkpoint=checkpoint,
-        host_root=paths.batch_dir,
-        command=["sh", "-c", "python --version; python3 --version"],
-        disk_mb=disk_mb,
-        timeout_secs=PROBE_TIMEOUT_SECS,
-    )
+    with suite_mod.VmRoot(batch_dir=paths.batch_dir, tree_rel=None) as root:
+        probe = shuru_mod.run(
+            checkpoint=checkpoint,
+            host_root=root.host,
+            command=["sh", "-c", "python --version; python3 --version"],
+            disk_mb=disk_mb,
+            timeout_secs=PROBE_TIMEOUT_SECS,
+        )
     text = (probe.stdout + probe.stderr).strip()
     version = ""
     match = re.search(r"Python (\d+\.\d+\.\d+)", text)
@@ -2647,6 +3090,7 @@ def run_job(
     max_attempts: int,
     disk_mb: int,
     python_version: str,
+    scheduler: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     """Execute one job end to end, or return ``None`` if it left no evidence.
 
@@ -2655,10 +3099,23 @@ def run_job(
     summary has no row to write — a half-written row would be a fabricated
     dataset entry — so its failure goes to ``failures.jsonl`` instead and the
     cursor stays ``failed``, which means it is re-run rather than skipped.
+
+    ``scheduler`` is M3 item S6's per-row account of the one scheduler, or
+    ``None`` for a caller that had no budget. It is passed straight through to
+    :func:`build_record`, which is the only place with the run's summary in hand;
+    ``None`` leaves the row exactly as it was before this item.
     """
     manifest.mark(job.key, RUNNING)
     prep = job.prep
-    issue_path = paths.issues / f"{prep.slug}.txt"
+    # [VANTA-WHY] M3 item V1 — the issue file is keyed by the JOB, not the bug.
+    # `prep.slug` is the bug, and once rows run concurrently (S6) two rows of one
+    # bug would both write `issues/<slug>.txt` and then both read it back to hash
+    # the issue they *think* they were shown: whichever write won is the issue
+    # every row hashes, so a row's recorded `issue_sha256` can describe another
+    # row's prompt. `job.key` already carries bug × config × mode × seed ×
+    # candidate × hints, which is why `log_path` and `oracle_json` are keyed the
+    # same way; the issue path is the one that was still keyed by the bug.
+    issue_path = paths.issues / f"{_stem(job.key)}.txt"
     issue_path.parent.mkdir(parents=True, exist_ok=True)
     issue_path.write_text(issue_text_for(prep, show_hints=job.show_hints), encoding="utf-8")
     issue_sha256 = sha256_text(issue_path.read_text(encoding="utf-8"))
@@ -2672,6 +3129,8 @@ def run_job(
         memory_mb=prep.vm_memory_mb,
         # Item 19 — the frozen config's `[env]` settings, from the job (batch-level).
         frozen=job.frozen_env,
+        # M3 item U3 — the layer's identity, from the provenance `prepare` loaded.
+        deps=prep.deps,
     )
     outcome = invoke_vanta(
         vanta_bin=vanta_bin,
@@ -2736,6 +3195,27 @@ def run_job(
     # (it computes and writes every artifact before the first `rmtree`), and the
     # row records `failed` with the reason instead of vanishing.
     session_dir = sessions_dir() / outcome.session_id
+
+    # [VANTA-WHY] M3 item H — a K arm spends exactly K attempts, so its verdict is
+    # about the LAST one and an earlier correct fix would otherwise go unread. This
+    # grades the distinct earlier attempts (additive work, K arms only) and returns
+    # the secondary `oracle_best` block; `None` on every other row. It runs from the
+    # session's own trees, so it comes BEFORE compaction removes them — and it reads
+    # the compacted form if a session was already compacted.
+    oracle_best: Optional[dict[str, Any]] = None
+    if arms_mod.arm_fixed_rounds(job.arm) is not None:
+        oracle_best = grade_best_attempt(
+            prep=prep,
+            paths=paths,
+            session_dir=session_dir,
+            decision=outcome.decision,
+            attempts_run=_int(outcome.summary.get("attempts_run")) or 0,
+            primary=oracle,
+            checkpoint=job.checkpoint,
+            disk_mb=disk_mb,
+            stem=_stem(job.key),
+        )
+
     try:
         compaction = compact_mod.compact_session(
             session_dir=session_dir,
@@ -2763,6 +3243,12 @@ def run_job(
         python_version=python_version,
         oracle_json=oracle_json,
         compaction=compaction,
+        # M3 item S6 — `None` for a caller without a budget, which leaves the row
+        # byte-for-byte what it was before this item.
+        scheduler=scheduler,
+        # M3 item H — `None` for every row that is not a K arm (and for a K row
+        # with one attempt), which likewise leaves that row's shape untouched.
+        oracle_best=oracle_best,
     )
     # [VANTA-WHY] Item E6 + Q3 — the only reason `is_done` let this key through is
     # that its previous row's oracle was INCONCLUSIVE. Rows stay append-only, so the
@@ -2843,7 +3329,11 @@ def _null_lock() -> Iterator[None]:
 
 
 def _stem(key: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in key)
+    # M3-E follow-up — the stem is defined once, in `manifest.stem`, because the run
+    # log, the oracle JSON, the issue text and the measured-relabel sidecar are all
+    # named by it; a second copy here could drift from the one a reader uses to find
+    # a row's sidecar.
+    return manifest_mod.stem(key)
 
 
 @dataclass
@@ -2910,13 +3400,27 @@ def _row_cost(record: dict[str, Any]) -> Optional[float]:
     ``cost_usd: 0.0`` and that is a measurement; an absent or non-numeric field is
     a hole, and the gate answers a hole with the cold-start rule rather than with
     a number it invented.
+
+    [VANTA-WHY] M3 item F — the one hole that is not a hole. A row whose
+    ``llm.calls`` is a recorded ``0`` made no call, so it cannot have spent
+    anything: its absent ``cost_usd`` is $0.00 **as a measurement**, not an
+    unknown. The pipeline writes ``cost_usd=unset`` (→ ``None``) for "nothing was
+    priced", and a review row that only reused a candidate prices nothing because
+    it asked nothing — six such rows sat in the m3 smoke as "unknown spend" and
+    forced the batch's spend report to carry a hole it did not have. A hole is
+    still a hole when the row *did* call (``calls`` >= 1, or no ``calls`` field at
+    all): the cost exists and was not recorded, and the cold-start rule stays the
+    answer.
     """
     llm = record.get("llm")
     if not isinstance(llm, dict):
         return None
     cost = llm.get("cost_usd")
     if isinstance(cost, bool) or not isinstance(cost, (int, float)):
-        return None
+        calls = llm.get("calls")
+        if isinstance(calls, bool) or not isinstance(calls, (int, float)):
+            return None
+        return 0.0 if calls == 0 else None
     return float(cost)
 
 
@@ -3268,12 +3772,25 @@ def run_batch(
     spend_gate: Optional[SpendGate] = None,
     preflight: Optional[Callable[[], Optional[str]]] = None,
     config_block: Optional[dict[str, Any]] = None,
+    prep_config_block: Optional[dict[str, Any]] = None,
     frozen_env: Optional[Mapping[str, str]] = None,
     stop_file: Optional[Path] = None,
     announce: bool = True,
     arm_spellings: Optional[Sequence[str]] = None,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> tuple[int, list[WaveResult]]:
     """The whole batch: per wave, D13's four phases, then the wave-1 gate.
+
+    ``budget`` is M3 item S6's ONE scheduler (``budget.Budget``), or ``None`` for a
+    caller that has none (a unit test). It is the *only* cap on how many rows of a
+    phase run at once: ``budget.concurrent`` is the switch between the sequential
+    path this function has always had and the pooled path S6 adds, and
+    ``--jobs 1`` (a budget whose ``cores`` is 1) never enters the pooled path at
+    all — which is §14.33's rule that ``1`` must be a path N=1 does not enter
+    rather than a path that degenerates. With a budget in hand every row also
+    records what the scheduler did (``jobs``, ``concurrent``, the charge, the
+    slot wait, its own live-VM peak and the deadline left when it finished); with
+    ``None`` a row is byte-for-byte the row it was before this item.
 
     ``arm_spellings`` is the arms this invocation runs, or ``None`` for every arm
     the split declares (the whole protocol, which is what ``run`` does). The queue
@@ -3322,6 +3839,9 @@ def run_batch(
     ``config_block`` and ``frozen_env`` are item 19's frozen configuration, supplied by the
     ``run`` command (``frozen_config.resolve``) and carried on every job: the block goes onto
     each row (``build_record``), the environment onto each ``vanta_m3`` child (``vanta_env``).
+    ``prep_config_block`` is item T3's: the preparation's own block, read back from
+    ``prepare.json`` and carried onto every row beside the run's, so a row states both the
+    configuration it ran under and the one its batch was prepared under.
     Both are ``None`` by default for the same reason ``max_spend_usd`` and ``preflight`` are
     read in the CLI rather than here — the configuration belongs to the invocation, and a test
     that drives this loop must not depend on whatever file the developer happens to have
@@ -3432,154 +3952,159 @@ def run_batch(
         if announce:
             print(f"\n=== wave {wave}: {len(wave_preps)} bug(s) ===", flush=True)
         result = WaveResult(wave=wave)
-        for mode, written in phases:
-            config = arms_mod.config_of(written)
-            arm = arms_mod.arm_for(written, mode)
-            for prep in wave_preps:
-                entry = entries[prep.key]
-                checkpoint = entry["checkpoint"]
-                for seed in seeds:
-                    if mode == REPAIR:
-                        jobs = [
-                            Job(
-                                batch_id=batch_id,
-                                wave=wave,
-                                bug=prep.key,
-                                prep=prep,
-                                entry=entry,
-                                config=config,
-                                arm=arm,
-                                mode=REPAIR,
-                                seed=seed,
-                                checkpoint=checkpoint,
-                                python_version_pinned=entry["python_version"],
-                                harness=harness,
-                                show_hints=show_hints,
-                                config_block=config_block,
-                                frozen_env=frozen_env,
+        # M3 item S6 — D13's phases grouped by MODE. The groups appear in
+        # `phases_for`'s own order (every repair pass before every review pass) and
+        # the spellings keep their order inside a group, so the sequential path
+        # below visits exactly the rows it visited before this item, in the same
+        # order. Only the pooled path — which a budget of one core, i.e. `--jobs 1`,
+        # does not enter — lets a phase's rows overlap.
+        for mode, written_list in _mode_phases(phases):
+            jobs = _phase_jobs(
+                mode=mode,
+                spellings=written_list,
+                wave=wave,
+                wave_preps=wave_preps,
+                seeds=seeds,
+                entries=entries,
+                batch_id=batch_id,
+                harness=harness,
+                show_hints=show_hints,
+                config_block=config_block,
+                prep_config_block=prep_config_block,
+                frozen_env=frozen_env,
+                batch_dir=batch_dir,
+                manifest=manifest,
+                repair_configs=repair_configs,
+                disk_mb=disk_mb,
+                budget=budget,
+            )
+            if budget is not None and budget.concurrent:
+                status, phase_records, phase_failed = _run_jobs_concurrently(
+                    jobs=jobs,
+                    budget=budget,
+                    paths=paths,
+                    batch_dir=batch_dir,
+                    manifest=manifest,
+                    vanta_bin=vanta_bin,
+                    max_attempts=max_attempts,
+                    disk_mb=disk_mb,
+                    checkpoint_pythons=checkpoint_pythons,
+                    spend_gate=spend_gate,
+                    stop_file=stop_file,
+                    preflight=preflight,
+                )
+                result.records.extend(phase_records)
+                result.failed += phase_failed
+                if status == "stop_file":
+                    return stopped()
+                if status == "spend_cap":
+                    return 1, results
+                continue
+            for job in jobs:
+                if manifest.is_done(job.key):
+                    print(f"  {job.label()} done — skipping (resume)", flush=True)
+                    found = manifest.find(job.key)
+                    if found:
+                        result.records.append(found)
+                    continue
+                # Item 13 — the stop file. Checked between jobs, like the
+                # spend cap and for the same reason: the claim below is the
+                # last moment at which nothing has been written, so a stop
+                # never leaves a half-written row or a cursor parked at
+                # `running`. Deleting the file resumes from this key.
+                if stop_file is not None and Path(stop_file).exists():
+                    return stopped()
+                reservation: Optional[int] = None
+                # H7 — the `try` opens *before* `acquire`, not at the job.
+                # Between the return of a successful `acquire` and the old
+                # `try` there was a window in which a `KeyboardInterrupt` (or
+                # any other raise) left a token held by a frame that never
+                # reached the `finally`, and every waiter behind it slept out
+                # the batch. With the `finally` covering the acquire itself, a
+                # token is released on every path that can carry one;
+                # `release(None)` is a no-op, so a refusal or an H1 rollback
+                # still leaves nothing behind.
+                try:
+                    # §14.29 — the spend cap is checked BEFORE the job starts,
+                    # never during one: the check is between rows, so the row
+                    # that crossed the cap is already complete and the rows
+                    # that follow it are never half-written. `>=` rather than
+                    # `>`: a batch that has reached its budget has spent it.
+                    #
+                    # G1 — the admission is atomic across the queue's workers
+                    # (`SpendGate`): a re-read of the manifest was not. The
+                    # gate reserves this job's budget under a lock before the
+                    # job starts, so two workers cannot both pass on the same
+                    # `spent`, and `None` — the batch has reached its cap — is
+                    # the only value that stops it.
+                    if spend_gate is not None:
+                        reservation = spend_gate.acquire(job)
+                        if reservation is None:
+                            _record_spend_cap(
+                                batch_dir,
+                                spend_gate.cap_usd,
+                                _spent_so_far(manifest),
+                                job,
                             )
-                        ]
-                    else:
-                        jobs = [
-                            Job(
-                                batch_id=batch_id,
-                                wave=wave,
-                                bug=prep.key,
-                                prep=prep,
-                                entry=entry,
-                                config=config,
-                                arm=arm,
-                                mode=REVIEW,
-                                seed=seed,
-                                checkpoint=checkpoint,
-                                python_version_pinned=entry["python_version"],
-                                candidate=candidate,
-                                harness=harness,
-                                show_hints=show_hints,
-                                config_block=config_block,
-                                frozen_env=frozen_env,
-                            )
-                            for candidate in _review_candidates(
-                                batch_dir=batch_dir,
-                                batch_id=batch_id,
-                                manifest=manifest,
-                                prep=prep,
-                                configs=repair_configs,
-                                seed=seed,
-                                checkpoint=checkpoint,
-                                disk_mb=disk_mb,
-                                show_hints=show_hints,
-                            )
-                        ]
-                    for job in jobs:
-                        if manifest.is_done(job.key):
-                            print(f"  {job.label()} done — skipping (resume)", flush=True)
-                            found = manifest.find(job.key)
-                            if found:
-                                result.records.append(found)
-                            continue
-                        # Item 13 — the stop file. Checked between jobs, like the
-                        # spend cap and for the same reason: the claim below is the
-                        # last moment at which nothing has been written, so a stop
-                        # never leaves a half-written row or a cursor parked at
-                        # `running`. Deleting the file resumes from this key.
+                            return 1, results
+                        # H3 — the stop file can appear while this worker is
+                        # asleep in `acquire`. A job started after it exists
+                        # is exactly what the file was created to prevent, so
+                        # re-check it here; the `finally` releases the
+                        # reservation that `stopped()` returns past.
                         if stop_file is not None and Path(stop_file).exists():
                             return stopped()
-                        reservation: Optional[int] = None
-                        # H7 — the `try` opens *before* `acquire`, not at the job.
-                        # Between the return of a successful `acquire` and the old
-                        # `try` there was a window in which a `KeyboardInterrupt` (or
-                        # any other raise) left a token held by a frame that never
-                        # reached the `finally`, and every waiter behind it slept out
-                        # the batch. With the `finally` covering the acquire itself, a
-                        # token is released on every path that can carry one;
-                        # `release(None)` is a no-op, so a refusal or an H1 rollback
-                        # still leaves nothing behind.
-                        try:
-                            # §14.29 — the spend cap is checked BEFORE the job starts,
-                            # never during one: the check is between rows, so the row
-                            # that crossed the cap is already complete and the rows
-                            # that follow it are never half-written. `>=` rather than
-                            # `>`: a batch that has reached its budget has spent it.
-                            #
-                            # G1 — the admission is atomic across the queue's workers
-                            # (`SpendGate`): a re-read of the manifest was not. The
-                            # gate reserves this job's budget under a lock before the
-                            # job starts, so two workers cannot both pass on the same
-                            # `spent`, and `None` — the batch has reached its cap — is
-                            # the only value that stops it.
-                            if spend_gate is not None:
-                                reservation = spend_gate.acquire(job)
-                                if reservation is None:
-                                    _record_spend_cap(
-                                        batch_dir,
-                                        spend_gate.cap_usd,
-                                        _spent_so_far(manifest),
-                                        job,
-                                    )
-                                    return 1, results
-                                # H3 — the stop file can appear while this worker is
-                                # asleep in `acquire`. A job started after it exists
-                                # is exactly what the file was created to prevent, so
-                                # re-check it here; the `finally` releases the
-                                # reservation that `stopped()` returns past.
-                                if stop_file is not None and Path(stop_file).exists():
-                                    return stopped()
-                            # Item 14 — before the row, not after it. Asked here rather
-                            # than inside `run_job` because the refusal has to leave no
-                            # trace at all: `run_job`'s first act is to mark the key
-                            # `running` in `state.json`, and a key parked there is a row
-                            # the next resume re-runs. Raising before the call means the
-                            # cursor never moves and the batch continues from here once
-                            # the endpoint is back.
-                            if preflight is not None:
-                                require_model_endpoint(preflight=preflight, before=job.key)
-                            record = run_job(
-                                job=job,
-                                paths=paths,
-                                manifest=manifest,
-                                vanta_bin=vanta_bin,
-                                # The arm owns the budget, not the invocation: B0 is
-                                # "one Creator call, no feedback" (§M3 item 11), so a
-                                # pinned arm states its budget here and an explicit
-                                # `--max-attempts` that disagrees was already refused
-                                # by `_require_arm_budget`. Every other arm runs what
-                                # the invocation asked for, or the binary's default.
-                                max_attempts=_arm_attempt_budget(arm, max_attempts),
-                                disk_mb=disk_mb,
-                                python_version=checkpoint_pythons.get(checkpoint, ""),
+                    # Item 14 — before the row, not after it. Asked here rather
+                    # than inside `run_job` because the refusal has to leave no
+                    # trace at all: `run_job`'s first act is to mark the key
+                    # `running` in `state.json`, and a key parked there is a row
+                    # the next resume re-runs. Raising before the call means the
+                    # cursor never moves and the batch continues from here once
+                    # the endpoint is back.
+                    if preflight is not None:
+                        require_model_endpoint(preflight=preflight, before=job.key)
+                    record = run_job(
+                        job=job,
+                        paths=paths,
+                        manifest=manifest,
+                        vanta_bin=vanta_bin,
+                        # The arm owns the budget, not the invocation: B0 is
+                        # "one Creator call, no feedback" (§M3 item 11), so a
+                        # pinned arm states its budget here and an explicit
+                        # `--max-attempts` that disagrees was already refused
+                        # by `_require_arm_budget`. Every other arm runs what
+                        # the invocation asked for, or the binary's default.
+                        max_attempts=_arm_attempt_budget(job.arm, max_attempts),
+                        disk_mb=disk_mb,
+                        python_version=checkpoint_pythons.get(job.checkpoint, ""),
+                        # M3 item S6 — the scheduler's own account of this row,
+                        # written only when the invocation actually ran rows
+                        # concurrently. A budget of one core (`--jobs 1`) leaves
+                        # the row byte-for-byte the row it was before this item,
+                        # which is §14.33's closing rule; so does `None` (a test,
+                        # a direct caller).
+                        scheduler=(
+                            _scheduler_row_block(
+                                budget,
+                                charge_mb=budget.row_charge_mb(
+                                    job.prep.vm_memory_mb
+                                ),
                             )
-                        finally:
-                            # Reconcile against the job's recorded cost by releasing:
-                            # what it actually spent is on its row, which the next
-                            # `acquire` reads. Runs for a failed job and an
-                            # infra_failure too, so a reservation can never leak.
-                            if spend_gate is not None:
-                                spend_gate.release(reservation)
-                        if record:
-                            result.records.append(record)
-                        else:
-                            result.failed += 1
+                            if budget is not None and budget.concurrent
+                            else None
+                        ),
+                    )
+                finally:
+                    # Reconcile against the job's recorded cost by releasing:
+                    # what it actually spent is on its row, which the next
+                    # `acquire` reads. Runs for a failed job and an
+                    # infra_failure too, so a reservation can never leak.
+                    if spend_gate is not None:
+                        spend_gate.release(reservation)
+                if record:
+                    result.records.append(record)
+                else:
+                    result.failed += 1
         results.append(result)
         gate = wave_gate_failures(result.records)
         if gate:
@@ -3595,6 +4120,361 @@ def run_batch(
     return 0, results
 
 
+def _mode_phases(
+    phases: Sequence[tuple[str, str]],
+) -> list[tuple[str, list[str]]]:
+    """D13's ``(mode, written)`` phases grouped by mode, order preserved.
+
+    ``arms.phases_for`` already builds the list mode-major — every repair pass
+    before every review pass — so grouping the ADJACENT pairs cannot reorder
+    anything. The groups let the pooled path run one phase's rows together while
+    the phases themselves stay strictly sequential: a review row pools repair
+    rows, so it must not start before the repair phase has finished.
+
+    The second element keeps the SPELLING (``b1``, ``suite``), not the config, for
+    the same reason ``phases_for`` does: the config column of a phase's rows is
+    the spelling's config value, and a job key is byte-identical only if the
+    spelling is what reaches :func:`_phase_jobs`.
+    """
+    grouped: list[tuple[str, list[str]]] = []
+    for mode, written in phases:
+        if grouped and grouped[-1][0] == mode:
+            grouped[-1][1].append(written)
+        else:
+            grouped.append((mode, [written]))
+    return grouped
+
+
+def _phase_jobs(
+    *,
+    mode: str,
+    spellings: Sequence[str],
+    wave: int,
+    wave_preps: Sequence[prepare_mod.BugPrep],
+    seeds: Sequence[int],
+    entries: dict[str, dict[str, Any]],
+    batch_id: str,
+    harness: Any,
+    show_hints: bool,
+    config_block: Optional[dict[str, Any]],
+    prep_config_block: Optional[dict[str, Any]],
+    frozen_env: Optional[Mapping[str, str]],
+    batch_dir: Path,
+    manifest: Manifest,
+    repair_configs: Sequence[str],
+    disk_mb: int,
+    budget: Optional["budget_mod.Budget"] = None,
+) -> list["Job"]:
+    """One phase's jobs, in the exact order the serial loop visited them.
+
+    [VANTA-WHY] M3 item S6. The loop this replaces built and ran each
+    ``(spelling, prep, seed)`` unit's jobs in one pass; the pooled path needs the
+    whole phase's list first, so the construction is lifted out here — but the
+    ORDER is unchanged, spelling-major then prep then seed then candidate, because
+    the rows a phase writes and the order they are written in are what a
+    byte-identical ``--jobs 1`` run means (§14.33).
+
+    A review phase's candidate set comes from :func:`_review_candidates`, which
+    grades each candidate (booting oracle VMs). That grading happens HERE, on the
+    calling thread and *before* the pool is entered, so it never overlaps a ROW's
+    VMs — which it does not, because the phase's rows do not exist until this
+    function returns. It must also see every repair row of the wave already on
+    disk, which it does, because the phases are sequential and the repair phase has
+    joined its rows by now.
+
+    [VANTA-WHY] M3 item Y1. ``budget`` reaches that grading so a set's independent
+    candidates are admitted as the invocation's scheduler allows — the wait is for
+    the host's budget, not for the phase's rows, which have not started.
+    """
+    jobs: list["Job"] = []
+    for written in spellings:
+        config = arms_mod.config_of(written)
+        arm = arms_mod.arm_for(written, mode)
+        for prep in wave_preps:
+            entry = entries[prep.key]
+            checkpoint = entry["checkpoint"]
+            for seed in seeds:
+                if mode == REPAIR:
+                    jobs.append(
+                        Job(
+                            batch_id=batch_id,
+                            wave=wave,
+                            bug=prep.key,
+                            prep=prep,
+                            entry=entry,
+                            config=config,
+                            arm=arm,
+                            mode=REPAIR,
+                            seed=seed,
+                            checkpoint=checkpoint,
+                            python_version_pinned=entry["python_version"],
+                            harness=harness,
+                            show_hints=show_hints,
+                            config_block=config_block,
+                            prep_config_block=prep_config_block,
+                            frozen_env=frozen_env,
+                        )
+                    )
+                    continue
+                for candidate in _review_candidates(
+                    batch_dir=batch_dir,
+                    batch_id=batch_id,
+                    manifest=manifest,
+                    prep=prep,
+                    configs=repair_configs,
+                    seed=seed,
+                    checkpoint=checkpoint,
+                    disk_mb=disk_mb,
+                    show_hints=show_hints,
+                    budget=budget,
+                ):
+                    jobs.append(
+                        Job(
+                            batch_id=batch_id,
+                            wave=wave,
+                            bug=prep.key,
+                            prep=prep,
+                            entry=entry,
+                            config=config,
+                            arm=arm,
+                            mode=REVIEW,
+                            seed=seed,
+                            checkpoint=checkpoint,
+                            python_version_pinned=entry["python_version"],
+                            candidate=candidate,
+                            harness=harness,
+                            show_hints=show_hints,
+                            config_block=config_block,
+                            prep_config_block=prep_config_block,
+                            frozen_env=frozen_env,
+                        )
+                    )
+    return jobs
+
+
+def _scheduler_row_block(
+    budget: "budget_mod.Budget",
+    *,
+    charge_mb: int,
+    slot_wait_s: float = 0.0,
+) -> dict[str, Any]:
+    """M3 item S6 — the scheduler's account of ONE row, as far as it is known now.
+
+    The budget's own :meth:`budget.Budget.record` — the switch, ``jobs``, the
+    effective cores, the caps, the host's cores and load, the invocation's
+    high-water marks — plus this row's own price: the memory it was charged
+    (``peak_vms × vm_memory_mb``), whether that charge alone exceeds the whole
+    memory budget (a row the scheduler can never admit beside another, and so runs
+    alone), and how long the row waited for its slot. The run-time facts a row can
+    only state after it has finished — its wall time, the deadline left, the peak
+    of simultaneous VMs it actually reached, its provider retries — are added by
+    :func:`build_record`, which is the one place holding the session summary.
+    """
+    block = budget.record()
+    block["charge_mb"] = int(charge_mb)
+    block["charge_exceeds_budget"] = budget.charge_exceeds_budget(int(charge_mb))
+    block["peak_vms"] = budget.peak_vms
+    block["slot_wait_s"] = round(float(slot_wait_s), 3)
+    return block
+
+
+def _run_jobs_concurrently(
+    *,
+    jobs: Sequence["Job"],
+    budget: "budget_mod.Budget",
+    paths: BatchPaths,
+    batch_dir: Path,
+    manifest: Manifest,
+    vanta_bin: Path,
+    max_attempts: Optional[int],
+    disk_mb: int,
+    checkpoint_pythons: dict[str, str],
+    spend_gate: Optional["SpendGate"],
+    stop_file: Optional[Path],
+    preflight: Optional[Callable[[], Optional[str]]],
+) -> tuple[str, list[dict[str, Any]], int]:
+    """Run one phase's jobs on a pool, and report how the phase ended.
+
+    [VANTA-WHY] M3 item S6. This function is entered only when the budget's
+    effective concurrency is greater than one, so ``--jobs 1`` never reaches it —
+    §14.33's "a path N=1 does not enter rather than a path that degenerates". The
+    pool is sized by ``budget.cores`` and each row additionally holds
+    ``budget.slot(memory_mb=row_charge_mb(...))`` for the whole of its run, so the
+    number of rows in flight is bounded by the requested ``--jobs`` and the number
+    of VMs actually running is bounded by the memory budget; whichever binds
+    first wins, and neither is ever exceeded.
+
+    Everything the serial path guarantees per row is kept per row here:
+
+    * the resume skip, which reads the row's key from the cursor before claiming;
+    * item 13's stop file, checked before the claim and — H3 — again after the
+      spend gate's ``acquire`` returns, because the file can appear while a worker
+      sleeps;
+    * G1's :class:`SpendGate`, with H7's ``try`` opening before ``acquire`` so a
+      raise cannot leave a reservation nobody will release;
+    * item 14's endpoint preflight, asked once per row that is about to start;
+    * each row gets its OWN :class:`Manifest`, because ``FileLock`` excludes per
+      caller — one ``Manifest`` shared by two threads would let their appends
+      interleave.
+
+    Returns ``(status, records, failed)`` where ``status`` is ``""``, or
+    ``"stop_file"`` / ``"spend_cap"`` for the two conditions the caller turns into
+    a stop; ``records`` come back in JOB order and not completion order, so a
+    phase's rows read the way they would have read serially. A preflight refusal —
+    or any other raise inside a row — is re-raised from the lowest-index row that
+    raised, once the pool has drained, and it OUTRANKS a ``"stop_file"`` /
+    ``"spend_cap"`` status found on a different row (M3 item V3): an exception is
+    never converted into an orderly stop.
+    """
+    count = len(jobs)
+    # `slots[i]` is what happened to job i: None until a worker reaches it, then
+    # ("record"|"failed"|"skip"|"stopped"|"spend"|"halted"|"error", value).
+    slots: list[Optional[tuple[str, Any]]] = [None] * count
+    guard = threading.Lock()
+    halt = threading.Event()
+    spend_cap_hit = threading.Event()
+
+    # The resume cursor, read in job order before anything is submitted — the same
+    # read the serial loop made, at the same point in the order. It goes through
+    # the batch's own shared `Manifest` because no row is running yet, and each
+    # row that does run then gets a `Manifest` of its own below.
+    pending: list[tuple[int, "Job"]] = []
+    for index, job in enumerate(jobs):
+        if manifest.is_done(job.key):
+            print(f"  {job.label()} done — skipping (resume)", flush=True)
+            slots[index] = ("skip", manifest.find(job.key))
+            continue
+        pending.append((index, job))
+
+    def stop_file_present() -> bool:
+        return stop_file is not None and Path(stop_file).exists()
+
+    def worker(index: int, job: "Job") -> None:
+        if halt.is_set():
+            slots[index] = ("halted", None)
+            return
+        # One Manifest per row: `FileLock` is per caller (see its docstring), so a
+        # shared one would let two rows' appends interleave into one line.
+        row_manifest = Manifest(batch_dir)
+        if stop_file_present():
+            halt.set()
+            slots[index] = ("stopped", None)
+            return
+        reservation: Optional[int] = None
+        try:
+            if spend_gate is not None:
+                reservation = spend_gate.acquire(job)
+                if reservation is None:
+                    with guard:
+                        first = not spend_cap_hit.is_set()
+                        spend_cap_hit.set()
+                        halt.set()
+                        slots[index] = ("spend", None)
+                    # One spend.json per phase, not one per refused row: the file
+                    # names the batch's cap, which does not depend on which row
+                    # crossed it.
+                    if first:
+                        _record_spend_cap(
+                            batch_dir,
+                            spend_gate.cap_usd,
+                            _spent_so_far(row_manifest),
+                            job,
+                        )
+                    return
+                if stop_file_present():
+                    halt.set()
+                    slots[index] = ("stopped", None)
+                    return
+            if preflight is not None:
+                require_model_endpoint(preflight=preflight, before=job.key)
+            charge_mb = budget.row_charge_mb(job.prep.vm_memory_mb)
+            waited_from = time.monotonic()
+            with budget.slot(memory_mb=charge_mb, cores=1):
+                slot_wait_s = time.monotonic() - waited_from
+                # The last moment before `run_job` claims the key: a stop that
+                # appeared while this row waited for memory still stops it.
+                if spend_cap_hit.is_set():
+                    slots[index] = ("spend", None)
+                    return
+                if stop_file_present():
+                    halt.set()
+                    slots[index] = ("stopped", None)
+                    return
+                record = run_job(
+                    job=job,
+                    paths=paths,
+                    manifest=row_manifest,
+                    vanta_bin=vanta_bin,
+                    max_attempts=_arm_attempt_budget(job.arm, max_attempts),
+                    disk_mb=disk_mb,
+                    python_version=checkpoint_pythons.get(job.checkpoint, ""),
+                    scheduler=_scheduler_row_block(
+                        budget, charge_mb=charge_mb, slot_wait_s=slot_wait_s
+                    ),
+                )
+            slots[index] = ("failed" if record is None else "record", record)
+        except BaseException as exc:  # noqa: BLE001 — stored and re-raised in order
+            # Stored, not raised: a raise here would abandon the rows already in
+            # flight. `halt` keeps any row that has not started from starting, and
+            # the first error is re-raised below, in job order, once the pool has
+            # drained — which is the serial path's "the raise stops the batch".
+            # `BaseException` and not `Exception`, because a `KeyboardInterrupt`
+            # in a worker is a way out of the batch like any other (H7).
+            halt.set()
+            slots[index] = ("error", exc)
+        finally:
+            if spend_gate is not None:
+                spend_gate.release(reservation)
+
+    with ThreadPoolExecutor(max_workers=max(1, budget.cores)) as pool:
+        futures = [pool.submit(worker, index, job) for index, job in pending]
+        for future in futures:
+            future.result()
+
+    # First pass — a stored worker exception OUTRANKS any stop or spend status.
+    # [VANTA-WHY] M3 item V3. The status scan below reads the slots in job order
+    # and stops at the first row that ended the phase, but a raise and a stop can
+    # land on DIFFERENT rows: if row 0 saw the stop file and row 1 raised, the
+    # single interleaved loop would hit row 0's `stopped`, break, and hand the
+    # caller a clean `"stop_file"` — the exception would be swallowed and a row
+    # that actually failed would be reported as an orderly stop. A raise is a
+    # statement that the batch could not continue; a stop is a statement that the
+    # operator asked it not to. The raise has to win regardless of index, so it is
+    # looked for first, across every slot, and re-raised from the lowest-index row
+    # that raised — the same rule the docstring states.
+    for entry in slots:
+        if entry is not None and entry[0] == "error":
+            raise entry[1]
+    # Second pass — how the phase ended, from the lowest-index row that stopped it.
+    status = ""
+    for entry in slots:
+        if entry is None:
+            continue
+        kind, value = entry
+        if kind == "stopped":
+            status = "stop_file"
+            break
+        if kind == "spend":
+            status = "spend_cap"
+            break
+    # Third pass — the phase's rows, in job order.
+    records: list[dict[str, Any]] = []
+    failed = 0
+    for entry in slots:
+        if entry is None:
+            continue
+        kind, value = entry
+        if kind == "failed":
+            failed += 1
+        elif kind in ("record", "skip") and value is not None:
+            # `record` is a fresh row this phase wrote; `skip` is the row a resume
+            # found already on disk. Both are evidence the phase contributed, and
+            # `skip` is None only when the cursor was `done` but no row could be
+            # read back, which contributes nothing.
+            records.append(value)
+    return status, records, failed
+
+
 def _review_candidates(
     *,
     batch_dir: Path,
@@ -3606,6 +4486,7 @@ def _review_candidates(
     checkpoint: str,
     disk_mb: int,
     show_hints: bool = False,
+    budget: Optional["budget_mod.Budget"] = None,
 ) -> list[Candidate]:
     """The candidate set for one (bug, seed), from the repair rows already written.
 
@@ -3618,6 +4499,9 @@ def _review_candidates(
     list: it is part of the key (§2.4.4), so a with-hints batch's repair rows are
     keyed ``…#hints`` and a lookup that left the flag out would find none of them
     and silently shrink every review set.
+
+    ``budget`` (M3 item Y1) reaches :func:`candidate_set`, which is where the set's
+    graders are admitted; this function only finds the records they are pooled from.
     """
     records: list[dict[str, Any]] = []
     for config in configs:
@@ -3638,6 +4522,7 @@ def _review_candidates(
         checkpoint=checkpoint,
         disk_mb=disk_mb,
         records=records,
+        budget=budget,
     )
 
 
@@ -3778,16 +4663,21 @@ def wave_gate_failures(records: Sequence[dict[str, Any]]) -> list[str]:
         return ["the wave produced no records at all"]
     for record in records:
         tag = f"{record['bug']} {record['config']} {record['mode']}"
+        # M3-E follow-up — the EFFECTIVE label (`manifest.label_of`), so a censor a
+        # relabel has already corrected is not reported as one. A row the batch has
+        # not relabelled resolves to its own `label`, so this is the same test it
+        # has always been for every batch on disk.
+        label, _ = manifest_mod.label_of(record)
         if record.get("verdict") == "InfraFailure":
             problems.append(f"{tag}: InfraFailure — the environment, not the model")
-        elif record.get("label") in ("unobservable", "inconclusive"):
+        elif label in ("unobservable", "inconclusive"):
             # [VANTA-WHY] Item E7 — an INCONCLUSIVE grade (the patch applied but a run
             # wrote no readable report) is the same class of fact as `unobservable`: a
             # measurement the environment failed, not a decision about the model. Wave 1
             # is the go/no-go gate for "the oracle or the plumbing misbehaves", and an
             # unreadable grading is exactly that, so it stops the wave and names the row.
             problems.append(
-                f"{tag}: {record['label']} — verdict={record.get('verdict')} "
+                f"{tag}: {label} — verdict={record.get('verdict')} "
                 f"({record['oracle'].get('apply_detail') or record['oracle'].get('error')})"
             )
     # §8.2 item 5: the developer fix must grade good and the no-op must not. This
@@ -3882,6 +4772,19 @@ class PreparedBatch:
 
     n_ctx_source: Optional[str]
 
+    config_block: Optional[dict[str, Any]] = None
+    """Item T3 — the preparation's frozen-configuration block, as ``prepare.json``
+    recorded it.
+
+    ``prepare`` resolves the frozen config once and writes the same four keys a row
+    carries (``config_hash``, ``config_path``, ``config_override``,
+    ``config_overrides``). ``run``/``queue`` read them back here and refuse a run
+    whose own block contradicts the preparation's, unless ``--allow-override``
+    waives it (:func:`prepared_config_mismatch`). ``None`` when the batch recorded
+    no config block — a ``prepare.json`` written before item Q3 — in which case
+    there is nothing to compare and the run proceeds as it always did.
+    """
+
 
 def recorded_split_path(batch_dir: Path) -> Optional[Path]:
     """The split a batch was prepared with, as its ``prepare.json`` recorded it.
@@ -3948,16 +4851,31 @@ def load_prepared(
             f"{batch_dir / 'prepare.json'}: field 'n_ctx' is "
             f"{type(recorded_n_ctx).__name__}, not an integer"
         )
+    # Item T3 — the preparation's frozen-configuration block, read back with the
+    # SAME four keys `frozen_config.FrozenConfig.record` writes and `build_record`
+    # carries on a row. Absent for a `prepare.json` written before item Q3 (or by a
+    # caller that supplied no frozen config), in which case there is nothing to
+    # compare and the run proceeds. Read only when at least one key is present, so a
+    # pre-Q3 batch is `None` rather than a block of four `None`s that would look
+    # like a recorded configuration whose values all happen to be missing.
+    recorded_config = {
+        key: payload[key]
+        for key in ("config_hash", "config_path", "config_override", "config_overrides")
+        if key in payload
+    }
     return PreparedBatch(
         batch_dir=batch_dir,
         preps=preps,
         entries=entries,
         n_ctx=recorded_n_ctx,
         n_ctx_source=payload.get("n_ctx_source"),
+        config_block=recorded_config or None,
     )
 
 
-def context_window_warning(batch: PreparedBatch) -> Optional[str]:
+def context_window_warning(
+    batch: PreparedBatch, *, environ: Optional[Mapping[str, str]] = None
+) -> Optional[str]:
     """Warn when this run's window is not the one ``prepare`` sized against (§1.6.1).
 
     ``prepare`` refuses to gate against the 65536 fallback, but the *run* still
@@ -3967,6 +4885,15 @@ def context_window_warning(batch: PreparedBatch) -> Optional[str]:
     shell that starts the run). When it does, every context verdict in the batch was
     measured against a prompt the run will not send, which is exactly how PySnooper/1
     and /2 came to be rejected for a window no run would have used.
+
+    [VANTA-WHY] M3 item T5. ``environ`` is the invocation's *effective* environment
+    (``bugsinpy_run.effective_env``), not ``os.environ``: a setting frozen in
+    ``configs/v1-m3.toml`` but left out of the caller's shell is applied to every
+    child the run starts, so the window those children resolve is the frozen one.
+    Reading ``os.environ`` here would compare prepare's window against a window no
+    job will use — the same divergence the check exists to catch, on the side that
+    does the catching. The default is ``os.environ`` for a caller that has no
+    resolution of its own to pass (:func:`context.server_context_window`).
 
     Returns the message, or ``None`` when they agree; printing is the caller's job so
     the comparison is testable without a batch or a server.
@@ -3978,7 +4905,7 @@ def context_window_warning(batch: PreparedBatch) -> Optional[str]:
             "That batch predates the recorded window; re-run prepare before trusting "
             "its context verdicts."
         )
-    run_n_ctx, run_source = ctx_mod.server_context_window()
+    run_n_ctx, run_source = ctx_mod.server_context_window(environ=environ)
     if run_n_ctx == batch.n_ctx:
         return None
     prepare_budget, _ = ctx_mod.budget_tokens(batch.n_ctx)
@@ -3992,6 +4919,72 @@ def context_window_warning(batch: PreparedBatch) -> Optional[str]:
         "VANTA_LLM_CONTEXT_TOKENS (or point VANTA_LLM_BASE_URL at the server prepare "
         "measured) so the two agree, or re-run prepare."
     )
+
+
+def prepared_config_mismatch(
+    prepared: Optional[Mapping[str, Any]],
+    run: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    """Item T3 — refuse a run whose configuration contradicts its preparation's.
+
+    ``prepare`` resolves the frozen configuration once and records it in
+    ``prepare.json``; ``run``/``queue`` resolve their own and record it on every
+    row. When the two describe different experiments the batch is a contradiction:
+    the context gate was sized under one configuration and the repairs graded under
+    another, and nothing downstream could tell. The cheap moment to notice is before
+    the first job, so this returns the sentence the caller prints and refuses on —
+    or ``None`` when the two agree.
+
+    Two things are compared, and either alone is a mismatch:
+
+    * ``config_hash`` — the SHA-256 of the config file. A batch prepared against one
+      file and run against another measured two different prompt sets.
+    * ``config_override`` — whether the caller waived a frozen setting with
+      ``--allow-override``. A batch prepared with the waiver and run without it (or
+      the reverse) ran under a different environment even when the file is the same,
+      which is exactly the ``prepare --allow-override`` then bare ``run`` case.
+
+    A block that records neither field (a ``prepare.json`` written before item Q3,
+    or a caller that supplied no frozen config) has nothing to contradict, so it is
+    ``None`` — never a mismatch against a run that did record one. The caller waives
+    the refusal with ``--allow-override`` on the run, exactly as it waives
+    ``frozen_config.resolve``'s own contradiction check.
+    """
+    if not prepared:
+        return None
+    prep_hash = prepared.get("config_hash")
+    run_hash = (run or {}).get("config_hash")
+    if "config_hash" in prepared and prep_hash != run_hash:
+        return (
+            f"this batch was prepared under config_hash {str(prep_hash)[:12]} but "
+            f"this invocation resolves {str(run_hash)[:12]}. The context gate and the "
+            "repairs would run under different configurations, so their rows cannot be "
+            "read together. Re-run prepare under this configuration, or pass "
+            "--allow-override to run the batch anyway (the mismatch is then recorded on "
+            "every row)."
+        )
+    if "config_override" in prepared:
+        prep_override = bool(prepared.get("config_override"))
+        run_override = bool((run or {}).get("config_override"))
+        if prep_override != run_override:
+            prepared_with = (
+                "waived a frozen setting (--allow-override)"
+                if prep_override
+                else "did not waive any frozen setting"
+            )
+            run_with = (
+                "waives one (--allow-override)"
+                if run_override
+                else "waives none"
+            )
+            return (
+                f"this batch was prepared under a configuration that {prepared_with}, but "
+                f"this invocation {run_with}. The two ran under different environments, so "
+                "their rows cannot be read together. Re-run prepare under this invocation's "
+                "environment, or pass --allow-override so both sides waive it (the mismatch "
+                "is then recorded on every row)."
+            )
+    return None
 
 
 def _bug_key(entry: dict[str, Any]) -> str:
@@ -4125,6 +5118,11 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
                 "vanta_build_dirty": record.get("vanta_build_dirty"),
                 "runs": 0,
                 "labels": {},
+                # M3-E follow-up — which label SOURCE each row's label came from
+                # (measured relabel / derived relabel / original). Counted beside the
+                # histogram so a group that pooled a relabelled row and an original
+                # one is visible as such rather than reading as one kind of number.
+                "label_sources": {},
                 # §1.6.2 item 5 — the localization metric, pooled per group so the
                 # digest answers "was the bug's own file in the prompt" without a
                 # reader re-deriving it from `context_selection` strings. `unknown`
@@ -4147,8 +5145,21 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
             },
         )
         group["runs"] += 1
-        label = str(record.get("label"))
+        # [VANTA-WHY] M3-E follow-up — the histogram is of the EFFECTIVE label
+        # (`manifest.label_of`: measured relabel, then derived relabel, then the
+        # original), and the source each row used is counted beside it. A digest
+        # that read `record["label"]` directly would report the value a relabel
+        # exists to correct, and would disagree with every tool that resolves the
+        # precedence — the failure this rule exists to make impossible.
+        label, label_source = manifest_mod.label_of(record)
+        # A row with no label at all has always been counted under `str(None)`
+        # ("None"); the histogram is a count of what the rows say, so keep that
+        # spelling rather than inventing a new empty-string bucket for old batches.
+        label = label or str(record.get(manifest_mod.LABEL_KEY))
         group["labels"][label] = group["labels"].get(label, 0) + 1
+        group["label_sources"][label_source] = (
+            group["label_sources"].get(label_source, 0) + 1
+        )
         # Item T — derive the null when reading: a review row written before this
         # item can carry a `localization_hit`, and it cannot mean anything, so it
         # is ignored rather than counted. Rows on disk are never rewritten. Item V's
@@ -4172,9 +5183,23 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 
 def render_digest(payload: dict[str, Any]) -> str:
+    # M3-E follow-up — the label SOURCES are printed only when at least one row's
+    # label came from a relabel. A batch nobody has re-measured resolves every label
+    # from the row itself, so its line is byte-identical to what it printed before
+    # this item — the rule `judge_failed` follows, and for the same reason: a report
+    # must not change under a reader merely because a feature exists. A payload
+    # written before this item carries no `label_sources` and reads as all-original.
+    show_sources = any(
+        any(
+            source != manifest_mod.LABEL_SOURCE_ORIGINAL
+            for source in group.get("label_sources", {})
+        )
+        for group in payload.get("groups", [])
+    )
     lines = [
         f"{'config':<10} {'arm':<7} {'mode':<8} {'seed':>4} {'model':<18} {'harness':<10} "
-        f"{'build':<10} {'runs':>5}  labels  localization  unshown_edits",
+        f"{'build':<10} {'runs':>5}  labels  localization  unshown_edits"
+        + ("  sources" if show_sources else ""),
         "-" * 150,
     ]
     for group in payload.get("groups", []):
@@ -4182,6 +5207,14 @@ def render_digest(payload: dict[str, Any]) -> str:
         build = str(group.get("vanta_build_commit") or "")[:9]
         model = str(group.get("model") or "")[:18]
         labels = " ".join(f"{k}={v}" for k, v in sorted(group["labels"].items()))
+        sources = (
+            "  "
+            + " ".join(
+                f"{k}={v}" for k, v in sorted(group.get("label_sources", {}).items())
+            )
+            if show_sources
+            else ""
+        )
         loc = group.get("localization") or {}
         # Item T — a review group's localization rate is not reported: the question
         # has no meaning over a seeded candidate. `localization_applies` defaults
@@ -4205,7 +5238,7 @@ def render_digest(payload: dict[str, Any]) -> str:
             f"{str(group['config']):<10} {str(group.get('arm') or ''):<7} "
             f"{str(group['mode']):<8} {str(group['seed']):>4} "
             f"{model:<18} {harness:<10} {build:<10} {group['runs']:>5}  {labels}  "
-            f"{localization}  {unshown}"
+            f"{localization}  {unshown}{sources}"
         )
     # G1 — the spend cap, when the batch ran under one. A line rather than a
     # column: it describes the batch, not a group, and a report from an uncapped
@@ -4270,7 +5303,10 @@ def _spend_report(batch_dir: Path) -> Optional[dict[str, Any]]:
 
 
 def write_batch_report(
-    batch_dir: Path, records: Sequence[dict[str, Any]]
+    batch_dir: Path,
+    records: Sequence[dict[str, Any]],
+    *,
+    host_samples: Optional[dict[str, Any]] = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Write the batch's report artifacts, from the manifest and nothing else.
 
@@ -4278,6 +5314,12 @@ def write_batch_report(
     labels file are two views of them that can be regenerated at any time — so a
     crash between a run and a report costs nothing, and a report can never disagree
     with the rows it summarises.
+
+    M3 item S6 — ``host_samples`` is the batch-level sampler's summary, passed by
+    the concurrent run that produced it. When it is ``None`` the summary is read
+    back from the batch's own ``host_samples.jsonl`` (:func:`budget_mod.read_host_samples`),
+    so a ``report`` regeneration describes the same samples. A batch that never
+    sampled — every ``--jobs 1`` run — has neither, and gains no block.
     """
     labels_path = write_labels(records, batch_dir / "run_labels.json")
     payload = digest(records)
@@ -4287,6 +5329,11 @@ def write_batch_report(
     spend = _spend_report(batch_dir)
     if spend is not None:
         payload["spend"] = spend
+    # M3 item S6 — the batch's own host sampling, when it sampled at all.
+    if host_samples is None:
+        host_samples = budget_mod.read_host_samples(batch_dir / budget_mod.HOST_SAMPLES_NAME)
+    if host_samples is not None:
+        payload["host_samples"] = host_samples
     (batch_dir / "run_digest.json").write_text(
         json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8"
     )
@@ -4419,8 +5466,10 @@ def run_queue(
     max_spend_usd: Optional[float] = None,
     preflight: Optional[Callable[[], Optional[str]]] = None,
     config_block: Optional[dict[str, Any]] = None,
+    prep_config_block: Optional[dict[str, Any]] = None,
     frozen_env: Optional[Mapping[str, str]] = None,
     arm_spellings: Optional[Sequence[str]] = None,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> tuple[int, list[QueueOutcome]]:
     """Item 13 — run a prepared batch's bugs up to ``jobs`` at a time.
 
@@ -4441,6 +5490,12 @@ def run_queue(
     wave gate, or a job that left no usable session. It is deliberately the same
     value ``run_batch`` uses for the first three, because the queue's callers read
     the outcome list, not the number, to tell them apart.
+
+    M3 item S6 — ``budget`` is the invocation's ONE scheduler, shared by every
+    worker here and threaded down into each per-bug :func:`run_batch`. ``jobs`` is
+    therefore only the row cap: the memory and core budget can admit fewer rows
+    than ``jobs`` at once, never more, and the same scheduler governs ``prepare``,
+    ``run`` and the queue.
     """
     if jobs < 1:
         raise RunnerError(f"--jobs must be at least 1, not {jobs}.")
@@ -4468,8 +5523,10 @@ def run_queue(
             max_spend_usd=max_spend_usd,
             preflight=preflight,
             config_block=config_block,
+            prep_config_block=prep_config_block,
             frozen_env=frozen_env,
             arm_spellings=arm_spellings,
+            budget=budget,
         )
     finally:
         owner.release()
@@ -4521,8 +5578,17 @@ def _run_queue(**kwargs: Any) -> tuple[int, list[QueueOutcome]]:
             kwargs["waves"],
         )
     )
+    # M3 item S6 — the pool's own numbers, so an operator can see at a glance
+    # whether the memory budget, not `jobs`, is the binding constraint here.
+    budget: Optional[budget_mod.Budget] = kwargs.get("budget")
+    tail = ""
+    if budget is not None and budget.concurrent:
+        tail = (
+            f"; one scheduler, cores={budget.cores}/{budget.cap_cores} "
+            f"memory={'unbounded' if budget.cap_memory_mb is None else f'{budget.cap_memory_mb} MB'}"
+        )
     print(
-        f"[queue] {len(tasks)} task(s) = wave × bug, up to {jobs} at once; "
+        f"[queue] {len(tasks)} task(s) = wave × bug, up to {jobs} at once{tail}; "
         f"stop file {stop_file}",
         flush=True,
     )
@@ -4655,6 +5721,7 @@ def _run_task(
             spend_gate=kwargs["spend_gate"],
             preflight=kwargs["preflight"],
             config_block=kwargs["config_block"],
+            prep_config_block=kwargs["prep_config_block"],
             frozen_env=kwargs["frozen_env"],
             stop_file=stop_file,
             # The queue printed this batch's schedule once. `announce=False` keeps
@@ -4663,6 +5730,9 @@ def _run_task(
             # The arm selection, resolved once by `_run_queue` and carried on every
             # task so each bug runs exactly the arms the schedule named.
             arm_spellings=_select_arms(kwargs["split"], kwargs["arm_spellings"]),
+            # M3 item S6 — the ONE scheduler of the whole invocation, so every row
+            # of every bug of this wave shares the same budget.
+            budget=kwargs["budget"],
         )
     except Exception as exc:  # one bug must not take the queue down
         print(f"  [{prep.key}] FAILED — {type(exc).__name__}: {exc}", flush=True)

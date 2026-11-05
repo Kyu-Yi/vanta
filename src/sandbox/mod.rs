@@ -14,6 +14,7 @@ mod types;
 pub use types::{ExecutionResult, SandboxBackend, SandboxKind};
 
 use std::error::Error;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Once, OnceLock};
 use std::time::Duration;
 
@@ -172,6 +173,12 @@ pub fn precompile_argv(cmd: &[&str], precompile: &[String]) -> Vec<String> {
 
 /// The sandbox kind this process will actually use: the env preference, with
 /// `auto` resolved through the shuru availability + boot test.
+///
+/// [VANTA-WHY] W1 — `auto` now FAILS CLOSED, so this reports an error rather
+/// than a downgraded `Subprocess` on a machine where shuru is missing or will
+/// not boot. The driver calls it before the first attempt and propagates the
+/// error, so an unusable boundary stops the run at the top rather than during
+/// it.
 pub async fn actual_backend_kind() -> Result<SandboxKind, Box<dyn Error + Send + Sync>> {
     let backend = Backend::spawn().await?;
     let kind = backend.kind();
@@ -223,7 +230,7 @@ async fn shuru_boot_ok() -> bool {
             .unwrap_or_default();
         let first_lines = stderr.lines().take(3).collect::<Vec<_>>().join(" | ");
         tracing::warn!(
-            "shuru VM boot test failed — will use subprocess for this run. stderr: {}",
+            "shuru VM boot test failed — an auto/forced-shuru run will now REFUSE. stderr: {}",
             first_lines
         );
         eprintln!("⚠ shuru VM boot test failed: {first_lines}");
@@ -261,14 +268,19 @@ pub async fn network_alive() -> bool {
 }
 
 // ============================================================================
-// spawn_preferred_backend() — pick shuru if available, else subprocess
+// Backend::spawn() — choose the execution backend, or refuse
 // ============================================================================
 //
 // [VANTA-WHY] Shuru is the real security boundary; subprocess is the fast
-// path for trusted repos. We prefer shuru when the CLI is installed, and
-// gracefully fall back to subprocess with a warning. This keeps the pipeline
-// working on machines without shuru while using the stronger isolation when
-// available.
+// path for TRUSTED repos. `auto` prefers shuru and, as of W1, FAILS CLOSED
+// when shuru is missing or will not boot: it used to degrade to subprocess
+// with only a warning, which runs untrusted code directly on the host with no
+// security boundary — and did it quietly enough that a degraded run read as a
+// real one. A boundary that silently disappears is not a boundary, so an
+// unusable shuru is now a refusal that names the cause. The host backend stays
+// reachable, but only when a caller asks for it BY NAME
+// (`VANTA_SANDBOX_BACKEND=subprocess`), which warns loudly and is recorded on
+// every row the run produces.
 //
 // [PITFALL] We can't return `dyn SandboxBackend` easily because the trait
 // uses async fn (returns unnameable futures). For M2 we use an enum dispatch
@@ -282,8 +294,13 @@ pub fn shuru_available() -> bool {
     shuru::ShuruBackend::shuru_available()
 }
 
-/// Spawn the preferred backend: shuru if available, else subprocess.
-/// Returns a tagged enum so callers can match on the concrete type.
+/// The execution backend chosen by `Backend::spawn()`.
+///
+/// [VANTA-WHY] W1 — this used to read "shuru if available, else subprocess".
+/// `auto` no longer degrades: it selects shuru or REFUSES (see `spawn`). The
+/// host backend is reached only by the explicit
+/// `VANTA_SANDBOX_BACKEND=subprocess` preference. Returns a tagged enum so
+/// callers can match on the concrete type.
 pub enum Backend {
     Subprocess(subprocess::SubprocessBackend),
     Shuru(shuru::ShuruBackend),
@@ -303,18 +320,117 @@ fn announce_backend(line: &str) {
     ANNOUNCE_BACKEND.call_once(|| println!("{line}"));
 }
 
-/// Announce a subprocess fallback once per process (stderr — it is a warning).
-fn announce_fallback(line: &str) {
+/// Announce a security warning once per process (stderr — it is not the normal
+/// decision).
+///
+/// [VANTA-WHY] W1 — the only thing this announces is an explicitly requested
+/// subprocess backend, which is a deliberate security downgrade rather than a
+/// fallback: it goes to stderr and is worded so a reader of the log cannot miss
+/// that untrusted code is about to run with no boundary.
+fn announce_warning(line: &str) {
     ANNOUNCE_BACKEND.call_once(|| eprintln!("{line}"));
 }
 
+// ============================================================================
+// Live-sandbox counter (M3 item S6)
+// ============================================================================
+
+/// The process-wide live/peak microVM counter, as a value rather than a pair of
+/// statics.
+///
+/// [VANTA-WHY] The S6 scheduler charges each row `peak_vms × vm_memory_mb` of host
+/// memory, so it needs the row's ACTUAL peak of simultaneous live microVMs to
+/// calibrate that charge from real runs (S6's decided recording). `shuru` exposes
+/// no `ps`/`list`, so the host cannot enumerate live VMs; this in-process counter,
+/// kept at the one place every sandbox boots and dies, is the only thing that can
+/// see the peak. "Sandbox" here is a shuru microVM — the subprocess backend is not
+/// a sandbox (see types.rs) and is deliberately not counted, so the number is the
+/// VMs exactly. A row is one `vanta_m3` process, so the high-water mark is the
+/// row's observed peak.
+///
+/// [VANTA-WHY] M3 item V6. The S6 recording needs one process-wide counter, but a
+/// test that reads a process-wide counter can only assert on a *delta*: another
+/// thread's boot would move the number under the test, and the two statics gave
+/// the test no way to own the state it measured. Making the counter a value lets
+/// the real path keep one shared instance (`SANDBOXES`) while a test instantiates
+/// its own and asserts exact numbers.
+struct SandboxCounter {
+    live: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl SandboxCounter {
+    const fn new() -> Self {
+        Self { live: AtomicUsize::new(0), peak: AtomicUsize::new(0) }
+    }
+
+    /// Count a microVM boot and advance the high-water mark.
+    fn booted(&self) {
+        let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(live, Ordering::SeqCst);
+    }
+
+    /// Count a microVM teardown.
+    fn torn_down(&self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+/// The process-wide counter every real sandbox boot and teardown feeds.
+static SANDBOXES: SandboxCounter = SandboxCounter::new();
+
+/// The high-water mark of simultaneous live microVMs in this process so far.
+///
+/// [VANTA-WHY] Read by the terminal `run.summary` row as the space-free
+/// `peak_sandboxes` key, so the Python side can record the row's real peak for
+/// calibration instead of assuming the conservative default charge.
+pub fn peak_sandboxes() -> usize {
+    SANDBOXES.peak()
+}
+
+/// Count a microVM boot and advance the high-water mark.
+fn sandbox_booted() {
+    SANDBOXES.booted();
+}
+
+/// Count a microVM teardown.
+fn sandbox_torn_down() {
+    SANDBOXES.torn_down();
+}
+
 impl Backend {
+    /// Construct the shuru variant, counting the boot (M3 item S6).
+    ///
+    /// [VANTA-WHY] Every successful shuru spawn goes through here and every
+    /// teardown through `destroy`, so the pair is the exact live count. Keeping
+    /// it in a named constructor (rather than at each `Ok(Backend::Shuru(..))`)
+    /// means a future third spawn site cannot forget to count.
+    fn shuru(b: shuru::ShuruBackend) -> Self {
+        sandbox_booted();
+        Backend::Shuru(b)
+    }
+
     pub async fn spawn() -> Result<Self, Box<dyn Error + Send + Sync>> {
         match backend_preference()? {
             BackendPreference::Subprocess => {
                 let b = subprocess::SubprocessBackend::spawn().await?;
-                tracing::warn!("using SUBPROCESS backend (forced by VANTA_SANDBOX_BACKEND)");
-                announce_backend("▌ Backend: subprocess (forced, NO security boundary)");
+                // [VANTA-WHY] W1 — the host backend is reachable ONLY when a caller
+                // names it, so its warning is the loudest line the process prints:
+                // this is a deliberate security downgrade (untrusted code runs on
+                // the host with no boundary), not a fallback, and a reader of the
+                // log must be able to see it without knowing to look for it.
+                tracing::warn!(
+                    "using SUBPROCESS backend (explicitly requested via VANTA_SANDBOX_BACKEND); \
+                     untrusted code runs on the HOST with NO security boundary"
+                );
+                announce_warning(
+                    "⚠ SUBPROCESS BACKEND ACTIVE (explicitly requested via VANTA_SANDBOX_BACKEND): \
+                     NO security boundary — untrusted code runs directly on the host",
+                );
                 Ok(Backend::Subprocess(b))
             }
             BackendPreference::Shuru => {
@@ -331,37 +447,40 @@ impl Backend {
                 let b = shuru::ShuruBackend::spawn().await?;
                 tracing::info!("using SHURU microVM backend (forced by VANTA_SANDBOX_BACKEND)");
                 announce_backend("▌ Backend: SHURU microVM active (forced)");
-                Ok(Backend::Shuru(b))
+                Ok(Backend::shuru(b))
             }
             BackendPreference::Auto => {
-                // [VANTA-WHY] `auto` degrades to subprocess, and a SILENT degrade
-                // is indistinguishable from a real shuru run — which is exactly
-                // how a missing CLI or a failed VM boot gets misread as "shuru
-                // broke". Record the precise reason and print one greppable line
-                // so a run can be audited for which boundary actually ran.
-                let fallback_reason: String = if !shuru_available() {
-                    "shuru CLI not found in PATH".to_string()
-                } else if !shuru_boot_ok().await {
-                    "shuru VM boot test failed (see warning above for stderr)".to_string()
-                } else {
-                    match shuru::ShuruBackend::spawn().await {
-                        Ok(b) => {
-                            tracing::info!("using SHURU microVM backend (preferred)");
-                            announce_backend("▌ Backend: SHURU microVM active (auto-selected)");
-                            return Ok(Backend::Shuru(b));
-                        }
-                        Err(e) => format!("shuru spawn failed: {e}"),
-                    }
-                };
-                let b = subprocess::SubprocessBackend::spawn().await?;
-                tracing::warn!(
-                    reason = %fallback_reason,
-                    "using SUBPROCESS backend — FALLBACK (no security boundary)"
-                );
-                announce_fallback(&format!(
-                    "⚠ FALLBACK ACTIVE: subprocess backend (NO security boundary) — reason: {fallback_reason}"
-                ));
-                Ok(Backend::Subprocess(b))
+                // [VANTA-WHY] W1 — `auto` FAILS CLOSED. It used to fall back to
+                // the subprocess backend whenever shuru was missing or would not
+                // boot, and a silent degrade is indistinguishable from a real
+                // shuru run — which runs untrusted code on the host with no
+                // boundary while the log says nothing. Refuse instead, and name
+                // the cause so the operator can fix it (or opt into the host
+                // backend by name). The old fallback helper is gone; the only
+                // route to subprocess is now the explicit `subprocess` arm above.
+                if !shuru_available() {
+                    return Err(
+                        "VANTA_SANDBOX_BACKEND=auto but the shuru CLI is not available; \
+                         refusing to run untrusted code on the host. Install shuru, or set \
+                         VANTA_SANDBOX_BACKEND=subprocess to run on the host deliberately."
+                            .into(),
+                    );
+                }
+                if !shuru_boot_ok().await {
+                    return Err(
+                        "VANTA_SANDBOX_BACKEND=auto but the shuru VM boot test failed; \
+                         refusing to run untrusted code on the host. See the warning above for \
+                         the stderr, or set VANTA_SANDBOX_BACKEND=subprocess to run on the host \
+                         deliberately."
+                            .into(),
+                    );
+                }
+                // A shuru that booted but cannot spawn is still a failure: fail
+                // closed rather than degrade.
+                let b = shuru::ShuruBackend::spawn().await?;
+                tracing::info!("using SHURU microVM backend (auto-selected)");
+                announce_backend("▌ Backend: SHURU microVM active (auto-selected)");
+                Ok(Backend::shuru(b))
             }
         }
     }
@@ -397,7 +516,13 @@ impl Backend {
     pub fn destroy(self) {
         match self {
             Backend::Subprocess(b) => b.destroy(),
-            Backend::Shuru(b) => b.destroy(),
+            Backend::Shuru(b) => {
+                b.destroy();
+                // [VANTA-WHY] M3 item S6 — the matching teardown of the boot
+                // counted in `Backend::shuru`, so `peak_sandboxes` is the exact
+                // high-water mark of live microVMs.
+                sandbox_torn_down();
+            }
         }
     }
 }
@@ -405,13 +530,13 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn backend_preference_defaults_to_auto() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // M3 item X4 — the crate-wide environment lock, not a module-local one.
+        // These tests write `VANTA_SANDBOX_BACKEND` and `PATH`, and the harness
+        // tests that spawn pytest read the environment they inherit.
+        let _guard = crate::test_env::lock();
         unsafe {
             std::env::remove_var("VANTA_SANDBOX_BACKEND");
         }
@@ -420,7 +545,7 @@ mod tests {
 
     #[test]
     fn backend_preference_accepts_forced_values() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::test_env::lock();
         unsafe {
             std::env::set_var("VANTA_SANDBOX_BACKEND", "shuru");
         }
@@ -436,7 +561,7 @@ mod tests {
 
     #[test]
     fn backend_preference_rejects_unknown_value() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::test_env::lock();
         unsafe {
             std::env::set_var("VANTA_SANDBOX_BACKEND", "mystery");
         }
@@ -445,6 +570,52 @@ mod tests {
         unsafe {
             std::env::remove_var("VANTA_SANDBOX_BACKEND");
         }
+    }
+
+    /// [VANTA-WHY] W1 — the security property this item exists for. `auto` used
+    /// to degrade to the host backend when shuru was missing, which runs
+    /// untrusted code with no boundary; it must now REFUSE and name the cause
+    /// (including the way to opt in deliberately). Pointing `PATH` at a
+    /// directory that cannot hold `shuru` makes the machine fact deterministic
+    /// on any host, so this pins the refusal rather than the machine.
+    #[tokio::test]
+    async fn auto_refuses_instead_of_degrading_when_shuru_is_unavailable() {
+        let _guard = crate::test_env::lock();
+        let previous_path = std::env::var_os("PATH");
+        let previous_backend = std::env::var_os("VANTA_SANDBOX_BACKEND");
+        // SAFETY: M3 item X4 — the crate-wide `test_env` lock (taken above) makes
+        // this the only test writing or reading the environment for as long as it
+        // holds it, so no other thread observes `PATH` or the backend mid-test.
+        // The value is restored below, before the assertions.
+        unsafe {
+            std::env::set_var("PATH", "/nonexistent-vanta-w1-empty-path");
+            std::env::remove_var("VANTA_SANDBOX_BACKEND");
+        }
+        // Restore before asserting so a failure cannot leave PATH broken for the
+        // tests that follow.
+        let result = Backend::spawn().await;
+        unsafe {
+            match previous_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+            match previous_backend {
+                Some(value) => std::env::set_var("VANTA_SANDBOX_BACKEND", value),
+                None => std::env::remove_var("VANTA_SANDBOX_BACKEND"),
+            }
+        }
+        let msg = match result {
+            Ok(_) => panic!("auto must fail closed, not degrade, without shuru"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            msg.contains("VANTA_SANDBOX_BACKEND=auto") && msg.contains("shuru CLI is not available"),
+            "the refusal must name the cause; got: {msg}"
+        );
+        assert!(
+            msg.contains("VANTA_SANDBOX_BACKEND=subprocess"),
+            "the refusal must name the way to opt in deliberately; got: {msg}"
+        );
     }
 
     #[test]
@@ -486,5 +657,27 @@ mod tests {
             parse_sandbox_env("PYTHONPATH=./docs_src=./other").unwrap(),
             ("PYTHONPATH".to_string(), "./docs_src=./other".to_string())
         );
+    }
+
+    #[test]
+    fn peak_sandboxes_tracks_the_high_water_mark_of_live_vms() {
+        // [VANTA-WHY] M3 item V6 — the counter is a value, so this test owns its
+        // own instance and asserts exact numbers. Reading the process-wide
+        // `SANDBOXES` would let another thread's boot move the number under the
+        // assertions (the old test could only assert a delta for that reason).
+        let counter = SandboxCounter::new();
+        assert_eq!(counter.peak(), 0);
+        assert_eq!(counter.live.load(Ordering::SeqCst), 0);
+        counter.booted();
+        counter.booted();
+        counter.booted();
+        assert_eq!(counter.live.load(Ordering::SeqCst), 3);
+        assert_eq!(counter.peak(), 3);
+        counter.torn_down();
+        counter.torn_down();
+        counter.torn_down();
+        assert_eq!(counter.live.load(Ordering::SeqCst), 0);
+        // A teardown never lowers the high-water mark.
+        assert_eq!(counter.peak(), 3);
     }
 }

@@ -56,6 +56,8 @@ use crate::pipeline::harness::{self, TestExecutionDetails};
 use crate::pipeline::patch::{
     ApplyFailure, apply_patch_detailed, apply_patch_strict, patch_deleted_paths,
 };
+use crate::pipeline::safe_path::{confined_join, unsafe_relative_path_reason};
+use crate::pipeline::summary_escape::{encode_summary_path_list, encode_summary_value};
 use crate::pipeline::{BUDGET_EXHAUSTED, REVISE_BUDGET_PER_ATTEMPT, ReviseBudget};
 use crate::repo::Repo;
 use crate::session::{
@@ -925,6 +927,38 @@ fn cost_and_detail_totals(
         sum_of(|c| c.reasoning_tokens),
         basis_text,
     )
+}
+
+/// The run's served model version, collapsed from the per-call `served_model`
+/// facts (M3 item B).
+///
+/// * every call that reported one agrees → that snapshot;
+/// * the calls disagree → the sorted distinct snapshots as the `[a;b]` list
+///   `run.summary` writes for a set;
+/// * no call named one (including a run that made no call) → `unknown`.
+///
+/// [VANTA-WHY] M3 item B — `unknown` rather than the requested id: the field's
+/// job is to record what the SERVER said, and a run that never got an answer, or
+/// a local server that names nothing, did not state one. A run whose calls
+/// disagree is NOT collapsed to the first: that is exactly the
+/// alias-rolled-mid-run case the per-call rows exist to surface, and picking one
+/// would hide it. Values are encoded space-free so the `key=value` reader cannot
+/// be truncated by a model id that carries a space.
+fn served_model_version_value(calls: &[crate::llm::CallUsage]) -> String {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for model in calls.iter().filter_map(|c| c.served_model.as_deref()) {
+        if !model.is_empty() {
+            seen.insert(model);
+        }
+    }
+    match seen.len() {
+        0 => "unknown".to_string(),
+        1 => encode_summary_value(seen.iter().next().expect("len() == 1")),
+        _ => {
+            let owned: Vec<String> = seen.iter().map(|s| (*s).to_string()).collect();
+            encode_summary_path_list(owned.iter())
+        }
+    }
 }
 
 /// Count the calls the server cut off at `max_tokens`, per role (§14.5).
@@ -1831,6 +1865,17 @@ pub async fn run(
     let mut prior_feedback: Option<String> = None;
     let mut final_evidence: Vec<TestEvidence> = Vec::new();
     let mut final_patched_files: Option<HashMap<String, String>> = None;
+    // [VANTA-WHY] M3 item E — the last tree the run actually PRODUCED, i.e. the
+    // `patched_files` of the most recent attempt whose patch applied. The loop
+    // re-applies each attempt from `original_files` and writes nothing when an
+    // apply fails, so a run that ends on a malformed patch would otherwise leave
+    // `final_patched_files` at `None` and write no `final.patch` — censoring a
+    // `MaxAttemptsReached` row to `unobservable` even though the run produced a
+    // perfectly gradeable tree one attempt earlier. Holding the last applied tree
+    // lets the terminal arms below write THAT tree, and only a run where nothing
+    // ever applied falls back to the original (an empty patch, a measured
+    // failure). `None` until the first successful apply.
+    let mut last_applied_patched_files: Option<HashMap<String, String>> = None;
     // Accepted Attacker tests (concatenated source) for the PR, set on the
     // final approved attempt.
     let mut final_accepted_tests: Option<String> = None;
@@ -1921,6 +1966,14 @@ pub async fn run(
     // the tree's import. A `true` here never changes the label — the run is
     // `InfraFailure` either way — it only records WHICH infra fault it was.
     let mut native_timeout_seen = false;
+    // [VANTA-WHY] M3 item S1 — every native gate call's cache note, per attempt
+    // and per side, so the reuse is auditable from the run's own artifacts: which
+    // results were served from an earlier row, under which key, and from whose
+    // row. `native_cache_hits` is the count that rides `run.summary` so a digest
+    // can cut by "how much of this run was measured vs. served" without a reader
+    // having to walk `evidence.json`.
+    let mut native_cache_records: Vec<serde_json::Value> = Vec::new();
+    let mut native_cache_hits: u32 = 0;
     // [VANTA-WHY] M3 item D1 — the wall-clock cap every in-session native suite
     // of this run uses. Declared once, here, so the gate, the judge's run and the
     // terminal `run.summary` all name the SAME number: `None` on the config keeps
@@ -1948,6 +2001,24 @@ pub async fn run(
     // injects a file the Creator was not shown, and never touches the selection.
     let mut context_visibility_records: Vec<serde_json::Value> = Vec::new();
     let mut attempts_edited_unshown_file: u32 = 0;
+    // [VANTA-WHY] Q1 — how many `===FILE:` marker lines across this run's Creator
+    // attempts carried leading whitespace and had to be trimmed to be recognised.
+    // The Creator prompt shows the markers indented, so a run whose count is above
+    // zero is a Creator that copied the prompt's shape and a parser that would
+    // once have mis-read it. LOGGING ONLY: the number is counted and reported, and
+    // nothing — no metric, label or verdict — reads it. Present only where a
+    // Creator ran; a review run has no markers of its own.
+    let mut markers_trimmed: u32 = 0;
+    // [VANTA-WHY] Q2 — the paths a Creator patch INTRODUCED: blocks whose path the
+    // original tree did not have and whose content was not empty. A mistyped marker
+    // path (`===FILE: cartt.py===` for a tree that has `cart.py`) is exactly one of
+    // these, and the apply already accepts it verbatim rather than refusing it — it
+    // is a new module the fix adds as far as the tree can tell. Nothing used to
+    // record it, so a patch that quietly created a file next to the one it meant to
+    // edit looked like an ordinary apply. LOGGING ONLY: no metric, label or verdict
+    // reads the list; it names what happened, it does not judge it. Union across
+    // attempts, sorted; present only where a Creator ran.
+    let mut new_files_created: BTreeSet<String> = BTreeSet::new();
     // [VANTA-WHY] M3 item 9 — one record per attempt of a fixed-rounds run: the
     // patch it produced, the test set it ran, the feedback it handed to the next
     // attempt, the hash of the Creator prompt that produced it, and whether the
@@ -2266,10 +2337,18 @@ pub async fn run(
                 creator_response.confidence
             );
             patch_text = creator_response.patch_text.clone();
-            patch_files = split_multi_file_patch(
+            let (split_files, attempt_markers_trimmed) = split_multi_file_patch(
                 &creator_response.patch_text,
                 &creator_response.files_touched,
             );
+            patch_files = split_files;
+            // [VANTA-WHY] Q1 — how many `===FILE:` markers this attempt emitted
+            // with leading whitespace and so needed trimming. The prompt shows the
+            // markers indented, so a positive count is the Creator copying the
+            // prompt's shape; it rides the run's record because a count that stops
+            // being zero would name a prompt/parser mismatch before it becomes a
+            // "patch changed nothing".
+            markers_trimmed += attempt_markers_trimmed;
         }
 
         // [VANTA-WHY] F2 — open this attempt's record and advance the comparison
@@ -2452,6 +2531,12 @@ pub async fn run(
                     patched_files = changed;
                     any_changed = true;
                     all_patch_failed = false;
+                    // [VANTA-WHY] Q2 — the blocks that introduced a file the
+                    // original tree did not have. Recorded only on a success: a
+                    // Contract-B failure writes nothing, so it creates nothing. The
+                    // helper is pure, so the rule is tested directly.
+                    new_files_created
+                        .extend(new_files_from_patch(&original_files, &patch_files));
                 }
                 Ok(_) => {
                     // Every block was a no-op (e.g. an all-empty new-file block):
@@ -2547,6 +2632,14 @@ pub async fn run(
             if decision == GovernorDecision::Continue {
                 continue;
             }
+            // [VANTA-WHY] M3 item E — a run whose LAST attempt is the one that
+            // failed to apply terminates here (review mode stops on it, repair
+            // mode stops when that attempt exhausts the budget). It is a terminal
+            // verdict, so it must still leave a `final.patch`: the run's last
+            // PRODUCED tree, or the original tree when nothing ever applied. Only
+            // `HarnessFailure`/`InfraFailure` below stay patchless.
+            final_patched_files =
+                Some(final_patch_tree(last_applied_patched_files.as_ref(), &original_files));
             break decision;
         }
         let _ = any_changed; // used implicitly via all_patch_failed
@@ -2556,6 +2649,11 @@ pub async fn run(
         if let Some(record) = fixed_round_records.get_mut(fixed_round_record_index) {
             record["applied"] = serde_json::json!(true);
         }
+        // [VANTA-WHY] M3 item E — remember this applied tree as the run's last
+        // produced one, so a LATER attempt that fails to apply cannot erase it
+        // from `final.patch`. Cheap (a clone of the map the run already holds);
+        // the terminal arms read it only on the failed-apply path.
+        last_applied_patched_files = Some(patched_files.clone());
 
         // ---- Build source strings ----
         // [VANTA-WHY] §14.18 — the concat the tests run in is now the whole
@@ -3435,11 +3533,54 @@ pub async fn run(
         // once for the run, above): a row with a prepare measurement passes
         // `max(120, 3 × measured)`, and every other row keeps the historical
         // `harness::test_timeout_secs()`.
-        let native_original =
-            harness::run_native_suite(&original_concat, &test_cmd, config.native_timeout_secs).await;
-        let native_patched =
-            harness::run_native_suite(&native_patched_concat, &test_cmd, config.native_timeout_secs)
-                .await;
+        // [VANTA-WHY] M3 item S1 — the two sides go through the content-keyed
+        // cache. `native_original` is a function of the BUG (same original tree,
+        // same command, same cap), so across a Phase-3 arm-and-seed grid it is
+        // measured once per bug and served afterwards; `native_patched` is
+        // measured once per candidate patch. `origin` names this session, attempt
+        // and side so a served result is traceable to the row that produced it.
+        // [VANTA-WHY] M3 item AA3 — the two sides run at the same time. They are
+        // independent measurements (different trees, different cache keys) whose
+        // only shared resource is the sandbox counter, so overlapping them halves
+        // the wall time of a cold gate without changing what is measured. A side
+        // that is a cache hit returns at its own `plan_native_suite` lookup and
+        // spawns nothing, so a warm gate still boots no VM; the cold double-miss
+        // is the case that boots two at once and `peak_sandboxes` records 2 (a
+        // descriptive count, never a verdict). Everything the two sides produce —
+        // the reports, the cache keys and the entries written — is byte-identical
+        // to running them in sequence: each is the same call with the same
+        // arguments, joined rather than awaited one after the other.
+        let original_origin = format!("{}/a{}/original", session_id.as_str(), attempt + 1);
+        let patched_origin = format!("{}/a{}/patched", session_id.as_str(), attempt + 1);
+        let ((native_original, original_cache), (native_patched, patched_cache)) = tokio::join!(
+            harness::run_native_suite_cached(
+                &original_concat,
+                &test_cmd,
+                config.native_timeout_secs,
+                actual_backend,
+                &original_origin,
+            ),
+            harness::run_native_suite_cached(
+                &native_patched_concat,
+                &test_cmd,
+                config.native_timeout_secs,
+                actual_backend,
+                &patched_origin,
+            ),
+        );
+        for (side, note) in [("original", &original_cache), ("patched", &patched_cache)] {
+            if note.state == "hit" {
+                native_cache_hits += 1;
+            }
+            native_cache_records.push(serde_json::json!({
+                "attempt": attempt + 1,
+                "side": side,
+                "state": note.state.as_str(),
+                "key": note.key.as_str(),
+                "source": note.source.as_str(),
+                "would_hit": note.would_hit,
+            }));
+        }
         // [VANTA-WHY] M3 item W — a native gate that measured NOTHING is not a
         // clean gate. `native_regressions` over an empty original list is
         // vacuously empty and `native_suite_collapsed` needs a non-empty
@@ -3517,7 +3658,8 @@ pub async fn run(
             summary: format!(
                 "ran_original={} ran_patched={} original_tests={} patched_tests={} regressions={} \
                  native_vacuous={} native_expected_tests={} native_timeout_secs={} \
-                 original_timed_out={} patched_timed_out={} {}",
+                 original_timed_out={} patched_timed_out={} \
+                 native_original_cache={} native_patched_cache={} {}",
                 native_original.ran,
                 native_patched.ran,
                 native_original.tests.len(),
@@ -3528,6 +3670,11 @@ pub async fn run(
                 native_cap,
                 native_original.timed_out,
                 native_patched.timed_out,
+                // [VANTA-WHY] M3 item S1 — each side's cache note
+                // (`state|key|source|would_hit`). Appended after the D1 fields so
+                // an older row's reader sees the same tokens in the same order.
+                original_cache.token(),
+                patched_cache.token(),
                 harness::native_collection_summary(&native_original, &native_patched)
             ),
             timestamp: now_iso(),
@@ -4293,6 +4440,15 @@ pub async fn run(
                 break decision;
             }
             GovernorDecision::PatchApplicationFailed => {
+                // [VANTA-WHY] M3 item E — a terminal verdict, so it leaves a
+                // `final.patch` like every other: the run's last PRODUCED tree, or
+                // the original tree when nothing ever applied (an empty patch, a
+                // measured failure). This arm is the review-mode path — the
+                // candidate was written outside the run and would not apply — and
+                // an empty patch graded against the tests says "this candidate did
+                // not fix the bug", which is the honest label, not `unobservable`.
+                final_patched_files =
+                    Some(final_patch_tree(last_applied_patched_files.as_ref(), &original_files));
                 break decision;
             }
             GovernorDecision::HarnessFailure => {
@@ -4584,7 +4740,7 @@ pub async fn run(
                 "seq={} site={} round={} attempt={} prompt_tokens={} completion_tokens={} \
                  total_tokens={} source={} seed={} seed_mechanism={} finish_reason={} wall_ms={} \
                  truncated={} {} cached_tokens={} reasoning_tokens={} cost_usd={} cost_basis={} \
-                 provider_retries={} service_tier={}",
+                 provider_retries={} service_tier={} served_model={}",
                 usage.seq,
                 usage.site,
                 // [VANTA-WHY] §14.12 — the round and the retry index travel with
@@ -4643,6 +4799,14 @@ pub async fn run(
                 // Appended last so every key an older row carried keeps its
                 // position.
                 usage.service_tier,
+                // [VANTA-WHY] M3 item B — the model the SERVER said it served
+                // this call with, beside the tier and the cost it produced. The
+                // per-call fact; `run.summary` collapses these to one
+                // `model_version`. `unset` when the server named none — never the
+                // requested id, which would hide a provider serving a different
+                // snapshot than the one asked for. Appended last so every key an
+                // older row carried keeps its position.
+                usage.served_model.as_deref().unwrap_or("unset"),
             ),
             timestamp: now_iso(),
             benchmark_instance: None,
@@ -4847,8 +5011,9 @@ pub async fn run(
              quarantine_count={} quarantined=[{}] \
              seed_method={} import_guard={} \
              n_ctx={} creator_effort={} creator_effort_mechanism={} \
-             creator_prompt_tokens={}{} fixed_rounds={} native_vacuous={} \
-             native_timeout_secs={} native_timeout={}",
+             creator_prompt_tokens={}{}{}{} fixed_rounds={} native_vacuous={} \
+             native_timeout_secs={} native_timeout={} native_cache_hits={} \
+             peak_sandboxes={} sandbox_backend={} model_version={}",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -4984,8 +5149,21 @@ pub async fn run(
             // pre-existing keys so an older row's reader is unaffected.
             cfg.service_tier_text(),
             deciding_rule.as_deref().unwrap_or("none"),
-            deciding_evidence.join(","),
-            needs_review_weak.join(","),
+            // [VANTA-WHY] M3 item T2 — the evidence and the weak-failure list are
+            // TEST NAMES, and a pytest node id can carry a space (a parametrize id
+            // is free text). Each element is percent-encoded so one such name can
+            // neither truncate the value nor inject a `key=value`; a name without
+            // whitespace is written unchanged.
+            deciding_evidence
+                .iter()
+                .map(|evidence| encode_summary_value(evidence))
+                .collect::<Vec<_>>()
+                .join(","),
+            needs_review_weak
+                .iter()
+                .map(|weak| encode_summary_value(weak))
+                .collect::<Vec<_>>()
+                .join(","),
             vanta_commit,
             vanta_dirty,
             // [VANTA-WHY] §14.10 — the prompt identity of the run, the same
@@ -5035,15 +5213,16 @@ pub async fn run(
             ledger_text(grounded_kept_by_issue_total),
             // [VANTA-WHY] M3 item 17 — the quarantine ledger: how many probes the
             // Diagnostician removed from the shared set this run, and which ones.
-            // Names are space-free (pytest node ids), so the list survives the
-            // space-terminated `key=value` reader. The reason each was removed is
-            // the per-test `quarantine[<name>]` session row and the
-            // `attempt_*_diagnostic_<name>.json` debug artifact, both of which can
-            // hold free text the row cannot.
+            // [VANTA-WHY] M3 item T2 — each name is percent-encoded rather than
+            // assumed space-free: a pytest node id is free text (a parametrize id
+            // can carry a space), and an unencoded one could truncate this value.
+            // The reason each was removed is the per-test `quarantine[<name>]`
+            // session row and the `attempt_*_diagnostic_<name>.json` debug
+            // artifact, both of which can hold free text the row cannot.
             quarantined.len(),
             quarantined
                 .iter()
-                .map(|q| q.test_name.clone())
+                .map(|q| encode_summary_value(&q.test_name))
                 .collect::<Vec<_>>()
                 .join(","),
             // [VANTA-WHY] Item P — which mechanism seeded this run's sandboxes
@@ -5084,6 +5263,43 @@ pub async fn run(
             } else {
                 String::new()
             },
+            // [VANTA-WHY] Q1 — appended after every pre-existing key so an older
+            // row's reader is unaffected, and present only where a Creator ran:
+            // the count of `===FILE:` markers that needed trimming is a statement
+            // about the Creator's own output, which a review run (whose patch was
+            // written outside the run) cannot make. LOGGING ONLY — no metric, label
+            // or verdict reads it. The leading space lives in the value, the way
+            // `attempts_edited_unshown_file` carries its own.
+            if config.patch_path.is_none() {
+                format!(" markers_trimmed={markers_trimmed}")
+            } else {
+                String::new()
+            },
+            // [VANTA-WHY] Q2 — appended after every pre-existing key so an older
+            // row's reader is unaffected, and present only where a Creator ran: a
+            // review run's patch was written outside the run, so "which files did
+            // this patch introduce" is answered there by the patch the caller
+            // supplied, not by Vanta. Space-free, `;`-joined paths (the shape
+            // `selected=[…]` already uses) with the literal `none` for a genuine
+            // empty list — so an ABSENT key (an older row, or a review row) reads as
+            // UNKNOWN, never as "created no files". RECORD ONLY: no metric, label or
+            // verdict reads it.
+            //
+            // [VANTA-WHY] M3 item T2 — each path is percent-encoded
+            // (`summary_escape::encode_summary_value`) before the join, because a
+            // path is the Creator's own output: one shaped like
+            // `x final_decision=AllTestsPassed y.py` would otherwise TRUNCATE this
+            // value at its space and INJECT a `final_decision` the row never wrote.
+            // The runner's `_list` decodes each entry, so the row still names the
+            // path the patch really created.
+            if config.patch_path.is_none() {
+                format!(
+                    " new_files_created={}",
+                    encode_summary_path_list(new_files_created.iter())
+                )
+            } else {
+                String::new()
+            },
             // [VANTA-WHY] M3 item 9 — appended after every pre-existing key so an
             // older row's reader is unaffected, and space-free so it survives the
             // `key=value` reader. `off` is the default and means the loop stopped
@@ -5115,6 +5331,42 @@ pub async fn run(
             // `native_vacuous=true` and never changes the label.
             native_cap,
             native_timeout_seen,
+            // [VANTA-WHY] M3 item S1 — how many of this run's native gate calls
+            // were served from the cache instead of measured. Purely descriptive
+            // (nothing reads it), appended after `native_timeout` so an older
+            // row's reader sees the same fields in the same order.
+            native_cache_hits,
+            // [VANTA-WHY] M3 item S6 — the exact peak of simultaneous live
+            // microVMs this run booted (`sandbox::peak_sandboxes`), space-free so
+            // it survives the `key=value` reader. The scheduler charges a row
+            // `peak_vms × vm_memory_mb`; a reader compares this observed peak with
+            // the conservative `--peak-vms` charge to calibrate it from real runs.
+            // Purely descriptive — nothing here feeds a verdict, a selection or a
+            // guard. Appended after every pre-existing key so an older row's
+            // reader is unaffected.
+            crate::sandbox::peak_sandboxes(),
+            // [VANTA-WHY] W1 — which security boundary ACTUALLY ran this row.
+            // `sandbox_backend=shuru` is a microVM; `sandbox_backend=subprocess`
+            // is untrusted code on the host with no boundary, reachable only by
+            // an explicit `VANTA_SANDBOX_BACKEND=subprocess` (an `auto` run that
+            // cannot boot shuru now refuses before any row is written). Recording
+            // it per row is what makes that downgrade auditable: the value is the
+            // same one `session.start` already carries as `actual_backend`, read
+            // through to the row (`runner.build_record`). Space-free, so it
+            // survives the `key=value` reader; appended after every pre-existing
+            // key so an older row's reader is unaffected.
+            actual_backend,
+            // [VANTA-WHY] M3 item B — the run's served model version, collapsed
+            // from the per-call `served_model` rows (see
+            // `served_model_version_value`): the snapshot when every call that
+            // named one agrees, the sorted `[a;b]` list when they differ, and
+            // `unknown` when no call named one. This is ADDITIVE to
+            // `session.start`'s `model_version`, not a replacement: that row is
+            // written before the first call and so cannot know what the server
+            // served; it keeps its own `VANTA_MODEL_VERSION` env read. The
+            // measured, post-hoc fact lives here. Appended after every
+            // pre-existing key so an older row's reader is unaffected.
+            served_model_version_value(&call_usages),
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),
@@ -5159,8 +5411,13 @@ pub async fn run(
                 false
             }
         },
-        // PatchApplicationFailed / HarnessFailure / InfraFailure produce no patch
-        // of their own; there is nothing to diff.
+        // [VANTA-WHY] M3 item E — only `HarnessFailure` / `InfraFailure` still
+        // leave this `None`: the setup never ran or an LLM call failed, so no
+        // tree exists to diff and the row is genuinely unmeasurable
+        // (`unobservable`). Every other terminal verdict — including a
+        // `PatchApplicationFailed`, and a repair run that ended on a malformed
+        // patch — now attaches a tree (the last one produced, or the original when
+        // nothing ever applied), so the oracle grades it instead of censoring it.
         None => false,
     };
 
@@ -5183,7 +5440,14 @@ pub async fn run(
                 let stage_dir = debug_dir.join("patched_repo");
                 let _ = fs::create_dir_all(&stage_dir);
                 for (path, content) in patched {
-                    let out_path = stage_dir.join(path);
+                    // [VANTA-WHY] T1 — the last patch-derived write site. The
+                    // apply already refused an unsafe path, so this is the second
+                    // lock on the same door: a path that could not be written
+                    // under Contract B cannot be written into the debug copy of
+                    // the tree either.
+                    let Ok(out_path) = confined_join(&stage_dir, path) else {
+                        continue;
+                    };
                     if let Some(parent) = out_path.parent() {
                         let _ = fs::create_dir_all(parent);
                     }
@@ -5298,6 +5562,14 @@ pub async fn run(
             // not have to guess which one it got.
             "native_timeout_secs": config.native_timeout_secs,
             "native_timeout": native_timeout_seen,
+            // [VANTA-WHY] M3 item S1 — one entry per native gate call (attempt ×
+            // side) recording whether the result was measured or served from the
+            // suite cache, under which key, and from whose row. The reuse is
+            // deliberately auditable from the artifact: a row whose
+            // `native_original` came from an earlier session is a legitimate
+            // measurement of the same bytes, and this list is what lets a reader
+            // confirm that rather than assume it.
+            "native_cache": native_cache_records,
             "new_static_findings": static_findings_records,
             // [VANTA-WHY] The repo's own suite, per attempt. `native_test_source`
             // says the suite ran the ORIGINAL tests; this key names WHICH of them
@@ -5325,6 +5597,13 @@ pub async fn run(
             // review run, which has no Creator.
             "context_visibility": context_visibility_records,
             "attempts_edited_unshown_file": attempts_edited_unshown_file,
+            // [VANTA-WHY] Q2 — the paths a Creator patch INTRODUCED (absent from the
+            // original tree, non-empty content), unioned across attempts and sorted.
+            // RECORD ONLY: a mistyped marker path lands here, so "the patch quietly
+            // created a file next to the one it meant to edit" is answerable from the
+            // run's own artifacts. Nothing reads this but a reader. The same list
+            // rides `run.summary` as `new_files_created=[…]`.
+            "new_files_created": new_files_created.iter().cloned().collect::<Vec<_>>(),
             // [VANTA-WHY] M3 item 9 — every attempt's patch, the test set it ran,
             // the feedback it was given, the hash of the Creator prompt that
             // produced it, and whether the Governor read it as passing. The
@@ -5352,6 +5631,27 @@ pub async fn run(
     println!("▌ Session  → {session_path}");
 
     Ok(decision)
+}
+
+/// The tree `final.patch` is written from when a terminal verdict carried no
+/// tree of its own (M3 item E): the run's last PRODUCED tree — the most recent
+/// attempt whose patch applied — or the original tree when nothing ever applied.
+///
+/// [VANTA-WHY] M3 item E — the loop re-applies each attempt from the original and
+/// writes nothing on a failed apply, so a run whose LAST attempt was malformed
+/// (a review candidate that would not apply, or a repair run that spent its
+/// budget on one) has no `patched_files` of its own. Falling back to the original
+/// rather than leaving the terminal arms patchless keeps the label a measurement:
+/// the empty patch does not fix the bug, so the oracle grades the row a failure
+/// and it counts against the arm — which is the honest reading — instead of
+/// censoring it to `unobservable`.
+fn final_patch_tree(
+    last_applied: Option<&HashMap<String, String>>,
+    original: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    last_applied
+        .cloned()
+        .unwrap_or_else(|| original.clone())
 }
 
 // ============================================================================
@@ -5402,8 +5702,16 @@ fn write_final_patch(
 }
 
 fn write_diff_tree(root: &Path, files: &HashMap<String, String>) -> io::Result<()> {
+    // [VANTA-WHY] T1 — this stages the original/patched trees for `git diff
+    // --no-index`, so `root.join(path)` is a WRITE named by the patch. Confine
+    // it: the caller only ever passes the apply's own (already-vetted) map, and
+    // this is the second lock on the same door. `create_dir_all(root)` first, so
+    // the containment check can resolve the root.
+    fs::create_dir_all(root)?;
     for (path, contents) in files {
-        let out_path = root.join(path);
+        let out_path = confined_join(root, path).map_err(|why| {
+            io::Error::new(io::ErrorKind::PermissionDenied, why)
+        })?;
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -5443,6 +5751,24 @@ fn apply_patch_files_all_or_nothing(
     // nondeterministic.
     let mut paths: Vec<&String> = patch_files.keys().collect();
     paths.sort();
+    // [VANTA-WHY] T1 — the path in a `===FILE:` marker is MODEL text, taken
+    // verbatim at any indentation (item Q1). Every block is checked before any
+    // is applied: a block naming an absolute path, a `..` component, a drive or
+    // UNC prefix, an empty or NUL-bearing path — or a padded one the
+    // concatenation would re-read as a DIFFERENT path — fails the WHOLE patch
+    // under Contract B with the reason `unsafe_path`, and nothing is written
+    // anywhere. PURE, like the rest of this function: the check is a string
+    // predicate, so the rule is tested directly instead of through a sandbox.
+    // Sorted first, so WHICH unsafe block is reported does not depend on
+    // HashMap iteration order.
+    for path in &paths {
+        if let Some(why) = unsafe_relative_path_reason(path) {
+            return Err(ApplyFailure::UnsafePath {
+                path: (*path).clone(),
+                why,
+            });
+        }
+    }
     let mut patched = original_files.clone();
     for path in paths {
         let patch_content = &patch_files[path];
@@ -5486,6 +5812,30 @@ fn apply_patch_files_all_or_nothing(
         }
     }
     Ok(patched)
+}
+
+/// [VANTA-WHY] Q2 — the paths a repair patch INTRODUCES: blocks whose path the
+/// original tree does not have and whose content is not empty. An empty new-file
+/// block adds nothing (the apply's `None =>` arm), so it is not a created file.
+///
+/// [VANTA-WHY] PURE on purpose — `(original tree, patch blocks) -> sorted paths`,
+/// with no I/O and no logging — so the rule is tested directly. This decides
+/// NOTHING: `apply_patch_files_all_or_nothing` already accepts a new path, and
+/// this only names the ones it wrote so the run can RECORD them. Nothing reads
+/// the result but the record itself.
+fn new_files_from_patch(
+    original_files: &HashMap<String, String>,
+    patch_files: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut created: Vec<String> = patch_files
+        .iter()
+        .filter(|(path, content)| {
+            !original_files.contains_key(*path) && !content.trim().is_empty()
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+    created.sort();
+    created
 }
 
 // ============================================================================
@@ -6926,6 +7276,7 @@ fn now_iso() -> String {
 mod tests {
     use super::{
         apply_patch_files_all_or_nothing,
+        ApplyFailure,
         approval_invariant_status, attempt_verdict, bate_baseline_concat, benchmark_config_name,
         blocking_static_findings,
         build_fixed_round_pass_feedback,
@@ -6937,12 +7288,15 @@ mod tests {
         harness_infrastructure_collapse,
         is_judge_site,
         ledger_text,
-        modified_test_config_records, open_fixed_round_record, patch_attempt_id_for_patch,
+        modified_test_config_records, new_files_from_patch, open_fixed_round_record,
+        patch_attempt_id_for_patch,
         prompt_over_budget_reason,
         record_new_static_findings,
         refuse_reasoning_budget_on_judge_arm,
         rejection_signal_message, render_committed_test_file, require_clean_target_repo_for_open_pr,
         resolve_arm, resolve_fixed_rounds, resolve_native_timeout_secs, sampling_not_sent_rule,
+        served_model_version_value,
+        final_patch_tree,
         stamp_transition_row,
         stable_patch_fingerprint, ARMS,
         INVARIANT_SATISFIED,
@@ -6950,6 +7304,7 @@ mod tests {
     };
     use crate::agents::attacker::GeneratedTest;
     use crate::config::{LlmBackend, LlmConfig};
+    use crate::llm::{CallUsage, ShapedBody};
     use crate::core::{
         AttemptTransition, EvidenceSource, FailureClass, GovernorDecision, TestEvidence,
         TestIntent, TestResult, VerificationOutcome,
@@ -6975,6 +7330,110 @@ mod tests {
         assert_eq!(cache_hit_rate_value(Some(0), 0), "unset");
         // A whole prompt served from cache is a rate of one, not a special case.
         assert_eq!(cache_hit_rate_value(Some(500), 500), "1.0000");
+    }
+
+    /// M3 item B — the run-level `model_version` is DERIVED, not guessed: one
+    /// snapshot when every call that named one agrees, the sorted `[a;b]` list
+    /// when they disagree (an alias rolled mid-run), and `unknown` only when no
+    /// call named one. A value that collapsed a disagreement to the first would
+    /// hide exactly the drift the per-call rows exist to show.
+    #[test]
+    fn the_run_model_version_is_collapsed_from_the_per_call_facts_never_invented() {
+        // A call with no served model leaves nothing behind — it must not read as
+        // agreement with a named one.
+        assert_eq!(served_model_version_value(&[]), "unknown");
+
+        assert_eq!(
+            served_model_version_value(&[call_with_served(Some("gpt-5-2025-10-06"))]),
+            "gpt-5-2025-10-06"
+        );
+        // Two calls naming the SAME snapshot collapse to it, once.
+        assert_eq!(
+            served_model_version_value(&[
+                call_with_served(Some("gpt-5-2025-10-06")),
+                call_with_served(Some("gpt-5-2025-10-06")),
+            ]),
+            "gpt-5-2025-10-06"
+        );
+        // Two DIFFERENT snapshots are the `[a;b]` list, sorted, not the first.
+        assert_eq!(
+            served_model_version_value(&[
+                call_with_served(Some("gpt-5-2025-11-01")),
+                call_with_served(Some("gpt-5-2025-10-06")),
+            ]),
+            "[gpt-5-2025-10-06;gpt-5-2025-11-01]"
+        );
+        // A silent call beside a named one does not erase the named one, and does
+        // not turn it into a list.
+        assert_eq!(
+            served_model_version_value(&[
+                call_with_served(None),
+                call_with_served(Some("gpt-5-2025-10-06")),
+            ]),
+            "gpt-5-2025-10-06"
+        );
+        // A model id with a space is encoded space-free so the `key=value` reader
+        // cannot truncate it.
+        assert_eq!(
+            served_model_version_value(&[call_with_served(Some("local model v2"))]),
+            "local%20model%20v2"
+        );
+    }
+
+    /// A `CallUsage` carrying only what `served_model_version_value` reads — the
+    /// rest are the type's own defaults for this purpose.
+    fn call_with_served(model: Option<&str>) -> CallUsage {
+        CallUsage {
+            seq: 0,
+            site: "test".to_string(),
+            round: 1,
+            attempt: 1,
+            provider_retries: 0,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            cached_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: None,
+            cost_basis: "no_usage".to_string(),
+            source: "estimate".to_string(),
+            seed: None,
+            seed_mechanism: "unset".to_string(),
+            finish_reason: None,
+            wall_ms: 0,
+            truncated: false,
+            request_shape: ShapedBody { requested: Vec::new(), sent: Vec::new(), dropped: Vec::new(), renamed: Vec::new() },
+            service_tier: "unset".to_string(),
+            served_model: model.map(str::to_string),
+        }
+    }
+
+    /// M3 item E — the tree a terminal verdict with no tree of its own writes
+    /// `final.patch` from: the last tree the run PRODUCED when there was one, and
+    /// the original tree when nothing ever applied. The second half is the point:
+    /// a run whose only attempt was malformed must still be graded (an empty patch
+    /// that does not fix the bug is a measured failure) rather than censored to
+    /// `unobservable`.
+    #[test]
+    fn the_final_patch_falls_back_to_the_last_produced_tree_then_the_original() {
+        let original: HashMap<String, String> = HashMap::from([
+            ("pkg/mod.py".to_string(), "value = 1\n".to_string()),
+            ("pkg/tests/test_mod.py".to_string(), "def test_x():\n    pass\n".to_string()),
+        ]);
+        // Nothing ever applied: the fallback is the original tree, i.e. the empty
+        // diff — never a panic and never a missing patch.
+        let none = final_patch_tree(None, &original);
+        assert_eq!(none, original, "with no produced tree the original is the tree");
+
+        // One attempt applied, then the run ended on a later failed apply: the
+        // LAST produced tree is kept, not the original and not the first.
+        let applied_last: HashMap<String, String> = HashMap::from([
+            ("pkg/mod.py".to_string(), "value = 2\n".to_string()),
+            ("pkg/tests/test_mod.py".to_string(), "def test_x():\n    pass\n".to_string()),
+        ]);
+        let kept = final_patch_tree(Some(&applied_last), &original);
+        assert_eq!(kept, applied_last, "the last produced tree is what is written");
+        assert_ne!(kept, original, "it is not silently reset to the original");
     }
 
     // ---- M3 item F5: the prompt-over-budget reason ----------------------------
@@ -7668,7 +8127,7 @@ mod tests {
             "===FILE: util.py===\n",
             "===SEARCH===\n    return 999\n===REPLACE===\n    return 1\n===END===\n",
         );
-        let blocks = crate::agents::creator::split_multi_file_patch(&patch_text, &[]);
+        let (blocks, _trimmed) = crate::agents::creator::split_multi_file_patch(&patch_text, &[]);
         assert_eq!(blocks.len(), 2, "the patch must name two files");
 
         // The driver's own decision, exactly: on `Err` it writes nothing.
@@ -7704,7 +8163,7 @@ mod tests {
             "===FILE: util.py===\n",
             "def helper():\n    return 2\n",
         );
-        let blocks = crate::agents::creator::split_multi_file_patch(&patch_text, &[]);
+        let (blocks, _trimmed) = crate::agents::creator::split_multi_file_patch(&patch_text, &[]);
 
         let patched =
             apply_patch_files_all_or_nothing(&original, &blocks).expect("both blocks anchor");
@@ -7712,6 +8171,145 @@ mod tests {
         assert!(patched["calc.py"].contains("return x * 2"), "{patched:?}");
         assert!(patched["util.py"].contains("return 2"), "{patched:?}");
         assert_ne!(patched, original);
+    }
+
+    // ---- M3 item T1: a block naming an unsafe path fails the whole patch -----
+
+    /// [VANTA-WHY] M3 item T1. The path in a `===FILE:` marker is MODEL text,
+    /// taken verbatim at any indentation. An ABSOLUTE path must fail the whole
+    /// patch under Contract B with the reason `unsafe_path` — and the innocent
+    /// block beside it must not be written either, or the tree under test is a
+    /// tree nobody wrote.
+    #[test]
+    fn a_patch_naming_an_absolute_path_fails_with_unsafe_path_and_writes_nothing() {
+        let original = HashMap::from([(
+            "calc.py".to_string(),
+            "def scale(x):\n    return x\n".to_string(),
+        )]);
+        let patch_text = concat!(
+            "===FILE: calc.py===\n",
+            "def scale(x):\n    return x * 2\n",
+            "===FILE: /home/user/.ssh/authorized_keys===\n",
+            "ssh-rsa AAAA\n",
+        );
+        let (blocks, _trimmed) = crate::agents::creator::split_multi_file_patch(&patch_text, &[]);
+        assert_eq!(blocks.len(), 2, "both blocks must be recognised");
+
+        let (patched, failure) = match apply_patch_files_all_or_nothing(&original, &blocks) {
+            Ok(changed) => (changed, None),
+            Err(failure) => (original.clone(), Some(failure)),
+        };
+
+        let failure = failure.expect("an absolute path must fail the whole patch");
+        assert!(
+            matches!(failure, ApplyFailure::UnsafePath { .. }),
+            "expected UnsafePath; got {failure:?}"
+        );
+        assert!(
+            failure.feedback().starts_with("unsafe_path"),
+            "the reason must reach the `patch.apply_failed` row and the Creator's \
+             feedback verbatim; got: {}",
+            failure.feedback()
+        );
+        assert!(
+            failure.feedback().contains("/home/user/.ssh/authorized_keys"),
+            "the refused path must be named; got: {}",
+            failure.feedback()
+        );
+        assert_eq!(
+            patched, original,
+            "Contract B: no block may be written when any block names an unsafe path"
+        );
+    }
+
+    /// [VANTA-WHY] M3 item T1. The same rule for a `..` component: a patch that
+    /// climbs out of the tree is refused as `unsafe_path`, and the block that
+    /// would have written a legitimate file is refused with it.
+    #[test]
+    fn a_patch_naming_a_parent_escape_fails_with_unsafe_path_and_writes_nothing() {
+        let original = HashMap::from([(
+            "calc.py".to_string(),
+            "def scale(x):\n    return x\n".to_string(),
+        )]);
+        let patch_text = concat!(
+            "===FILE: calc.py===\n",
+            "def scale(x):\n    return x * 2\n",
+            "===FILE: ../escape.py===\n",
+            "evil = True\n",
+        );
+        let (blocks, _trimmed) = crate::agents::creator::split_multi_file_patch(&patch_text, &[]);
+        assert_eq!(blocks.len(), 2, "both blocks must be recognised");
+
+        let (patched, failure) = match apply_patch_files_all_or_nothing(&original, &blocks) {
+            Ok(changed) => (changed, None),
+            Err(failure) => (original.clone(), Some(failure)),
+        };
+
+        let failure = failure.expect("a parent escape must fail the whole patch");
+        assert!(
+            matches!(failure, ApplyFailure::UnsafePath { .. }),
+            "expected UnsafePath; got {failure:?}"
+        );
+        assert!(
+            failure.feedback().starts_with("unsafe_path"),
+            "got: {}",
+            failure.feedback()
+        );
+        assert_eq!(
+            patched, original,
+            "Contract B: the escape fails every block, not just the offending one"
+        );
+    }
+
+    // ---- Q2: the paths a Creator patch introduces (record only) ----------------
+
+    /// [VANTA-WHY] Q2 — a mistyped marker path (`cartt.py` for a tree that has
+    /// `cart.py`) is accepted verbatim by the apply (it looks like a new module the
+    /// fix adds), and the pure helper names it so the run can RECORD it. Nothing
+    /// refuses it: the point of Q2 is that this is recorded, not policed.
+    #[test]
+    fn a_mistyped_marker_path_is_recorded_as_a_new_file() {
+        let original = HashMap::from([(
+            "cart.py".to_string(),
+            "def total():\n    return 0\n".to_string(),
+        )]);
+        // The Creator meant `cart.py` and typed one letter too many.
+        let patch_text = "===FILE: cartt.py===\ndef total():\n    return 1\n";
+        let (blocks, _trimmed) = crate::agents::creator::split_multi_file_patch(&patch_text, &[]);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks.contains_key("cartt.py"));
+
+        // The apply accepts it (the new-file arm) and it does change the tree.
+        let patched =
+            apply_patch_files_all_or_nothing(&original, &blocks).expect("a new-file block applies");
+        assert_ne!(patched, original);
+
+        // The record names the file the patch actually wrote, not the one it meant.
+        assert_eq!(
+            new_files_from_patch(&original, &blocks),
+            vec!["cartt.py".to_string()]
+        );
+    }
+
+    /// An edit to a file the tree already has is not a created file, and an empty
+    /// new-file block adds nothing, so neither is recorded.
+    #[test]
+    fn an_edited_file_and_an_empty_new_block_are_not_new_files() {
+        let original = HashMap::from([(
+            "cart.py".to_string(),
+            "def total():\n    return 0\n".to_string(),
+        )]);
+        let blocks = HashMap::from([
+            (
+                "cart.py".to_string(),
+                "def total():\n    return 1\n".to_string(),
+            ),
+            ("empty.py".to_string(), "   \n".to_string()),
+        ]);
+        assert!(
+            new_files_from_patch(&original, &blocks).is_empty(),
+            "an existing file is an edit and a blank block writes nothing"
+        );
     }
 
     /// [VANTA-WHY] A syntax-broken block is refused, and the refusal names the
@@ -8236,6 +8834,10 @@ mod tests {
             }
         }
 
+        // M3 item X4 — the crate-wide environment lock: two of the three switch
+        // tests below write `VANTA_BATE`, so they are exclusive with each other and
+        // with every other test that reads the environment.
+        let _env = crate::test_env::lock();
         // An absent switch is the documented default ON, not an error.
         let previous = std::env::var("VANTA_BATE").ok();
         unsafe { std::env::remove_var("VANTA_BATE") };
@@ -8300,6 +8902,8 @@ mod tests {
     // `vanta` row for a run the operator asked to be `b2`.
     #[test]
     fn the_bate_switch_is_strict_and_defaults_on() {
+        // M3 item X4 — the crate-wide environment lock (see the note above).
+        let _env = crate::test_env::lock();
         let previous = std::env::var("VANTA_BATE").ok();
 
         unsafe { std::env::remove_var("VANTA_BATE") };
@@ -8333,6 +8937,8 @@ mod tests {
     // before.
     #[test]
     fn an_absent_arm_var_resolves_to_the_switch_derived_name() {
+        // M3 item X4 — the crate-wide environment lock (see the note above).
+        let _env = crate::test_env::lock();
         let previous = std::env::var("VANTA_ARM").ok();
 
         unsafe { std::env::remove_var("VANTA_ARM") };

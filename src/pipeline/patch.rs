@@ -44,6 +44,8 @@ use std::fs;
 use std::process::Command;
 use tracing::{debug, info, warn};
 
+use crate::pipeline::safe_path::{UNSAFE_PATH, confined_join, unsafe_relative_path_reason};
+
 // ============================================================================
 // apply_patch_strict — the ONLY entry point for an externally supplied `--patch`
 // ============================================================================
@@ -69,11 +71,23 @@ pub fn apply_patch_strict(
     patch_text: &str,
     touched: &[String],
 ) -> Result<HashMap<String, String>, String> {
+    // [VANTA-WHY] T1 — a `--patch` file's `+++ b/...` headers name destinations,
+    // and the file came from OUTSIDE the run. A path that would leave the tree
+    // (absolute, `..`, drive/UNC, empty, NUL) is refused before anything is
+    // staged: review mode's whole promise is that only the patch's own content
+    // touches the tree, and a header reading `+++ b/../../etc/passwd` breaks it.
+    for path in repo_files.keys().chain(touched.iter()) {
+        if let Some(why) = unsafe_relative_path_reason(path) {
+            return Err(format!(
+                "{UNSAFE_PATH}: the patch names `{path}` ({why}) — refusing to apply it"
+            ));
+        }
+    }
     let dir = tempfile::tempdir().map_err(|e| format!("could not create a temp dir: {e}"))?;
     let root = dir.path();
 
     for (path, content) in repo_files {
-        let out = root.join(path);
+        let out = confined_join(root, path)?;
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("{path}: {e}"))?;
         }
@@ -100,12 +114,29 @@ pub fn apply_patch_strict(
         debug!("git apply refused the patch but --recount accepted it (miscounted header)");
     }
 
+    // [VANTA-WHY] U5 — a touched path that is ABSENT after the apply is only
+    // legitimate when the diff itself sends it to `/dev/null`; there is then no
+    // content to test and the path is skipped BY NAME, read from the diff.
+    // Everything else — a path the confinement gate refuses, or one that cannot
+    // be read for any other reason — is a failure this function must report.
+    // Swallowing it means a run tests fewer files than the patch named while
+    // reporting a verdict about the whole tree.
+    let deleted = patch_deleted_paths(patch_text);
     let mut changed: HashMap<String, String> = HashMap::new();
     for path in touched {
-        let Ok(patched) = fs::read_to_string(root.join(path)) else {
-            // Deleted by the patch, or never written. Either way there is no
-            // content to test.
-            continue;
+        let out = confined_join(root, path)?;
+        let patched = match fs::read_to_string(&out) {
+            Ok(patched) => patched,
+            Err(_) if deleted.contains(path) => {
+                debug!("{path}: deleted by the patch — nothing to test");
+                continue;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "{UNSAFE_PATH}: the patch names `{path}` but it could not be read \
+                     ({error}) — only a path the patch deletes may be absent"
+                ));
+            }
         };
         match repo_files.get(path) {
             Some(original) if original == &patched => {}
@@ -198,6 +229,22 @@ pub enum ApplyFailure {
     /// A strategy produced a changed file, but the original parsed as Python and
     /// the result does not. Carries the interpreter's own message.
     InvalidPython(String),
+    /// The patch named a path Vanta may not write under the tree root (M3 item
+    /// T1) — an absolute path, a drive/UNC prefix, a `..` component, an empty or
+    /// NUL-bearing string, or a path that resolves (through an existing symlink)
+    /// outside the root.
+    ///
+    /// [VANTA-WHY] This is a Contract-B failure like any other: the whole patch
+    /// is refused and NOTHING is written, because a patch that writes outside
+    /// the tree is not a candidate at all. `why` is the pure predicate's own
+    /// reason, and `feedback()` leads with the `unsafe_path` token so the
+    /// `patch.apply_failed` row carries it verbatim.
+    UnsafePath {
+        /// The path the patch named.
+        path: String,
+        /// The predicate's reason (e.g. "parent-directory component").
+        why: &'static str,
+    },
 }
 
 /// One strategy's outcome inside the apply cascade, kept so the Creator can be
@@ -227,6 +274,12 @@ impl ApplyFailure {
             ApplyFailure::InvalidPython(err) => {
                 format!("patch result is not valid Python: {err}")
             }
+            // [VANTA-WHY] T1 — the token leads, so the row's reason is recognisably
+            // `unsafe_path` and a reader can tell it apart from "did not anchor".
+            ApplyFailure::UnsafePath { path, why } => format!(
+                "{UNSAFE_PATH}: the patch names `{path}` ({why}) — it is not a path inside the \
+                 tree, so no block was written"
+            ),
             ApplyFailure::DidNotApply {
                 path,
                 strategies,
@@ -281,6 +334,25 @@ pub fn apply_patch_detailed(
     patch_text: &str,
     path: &str,
 ) -> (String, bool, Option<ApplyFailure>) {
+    // [VANTA-WHY] T1 — `path` comes from the patch itself (a `===FILE:` marker or
+    // a diff header) and is written at `root.join(path)` below so the diff
+    // strategies see the layout `git apply` expects. An absolute path or one
+    // that leaves the root would write outside the temp tree, so it is refused
+    // before any strategy runs. An EMPTY path is not refused here: it is the
+    // deliberate `source.txt` fallback the layout note describes.
+    let trimmed_path = path.trim();
+    if !trimmed_path.is_empty() {
+        if let Some(why) = unsafe_relative_path_reason(trimmed_path) {
+            return (
+                original.to_string(),
+                false,
+                Some(ApplyFailure::UnsafePath {
+                    path: path.to_string(),
+                    why,
+                }),
+            );
+        }
+    }
     // [VANTA-WHY] Every non-git strategy lands here first. A file that no longer
     // compiles is not a candidate, and "patched (changed)" for one is a lie the
     // rest of the pipeline cannot see through: the heretic run reported it for a
@@ -361,6 +433,11 @@ pub fn apply_patch_detailed(
     // ---- Strategies 3-5: standard diff tools (for backward compat) ----
     // [PITFALL] The file must sit at the path the diff header names. A copy
     // called `source.txt` can never be matched by `a/src/pkg/mod.py`.
+    // [VANTA-WHY] T1 — `root.join(rel)` is a write, but the entry guard above
+    // already refused every unsafe `path` and an EMPTY one is the fixed
+    // `source.txt` fallback, and `root` is a freshly created temp dir with no
+    // symlink in it, so nothing can escape here. The confinement for this
+    // function is that one check, made before any strategy touches the disk.
     if let Ok(dir) = tempfile::tempdir() {
         let root = dir.path();
         let rel = if path.trim().is_empty() {
@@ -1284,6 +1361,73 @@ diff --git a/src/pkg/mod.py b/src/pkg/mod.py
         let err = apply_patch_strict(&files, patch, &["src/pkg/mod.py".to_string()])
             .expect_err("a patch that changes nothing is not an application");
         assert!(err.contains("no-op"), "unhelpful reason: {err}");
+    }
+
+    /// [VANTA-WHY] U5 — a touched path is skipped ONLY when the diff itself
+    /// sends it to `/dev/null`. The skip is read off the patch, not inferred
+    /// from the file being gone.
+    #[test]
+    fn strict_apply_skips_only_a_path_the_patch_deletes() {
+        let mut files = repo();
+        files.insert("src/pkg/gone.py".to_string(), "x = 1\n".to_string());
+        let patch = "\
+diff --git a/src/pkg/gone.py b/src/pkg/gone.py
+--- a/src/pkg/gone.py
++++ /dev/null
+@@ -1 +0,0 @@
+-x = 1
+diff --git a/src/pkg/mod.py b/src/pkg/mod.py
+--- a/src/pkg/mod.py
++++ b/src/pkg/mod.py
+@@ -1,5 +1,5 @@
+ def f():
+-    return 1
++    return 7
+ 
+ 
+ def g():
+";
+        let changed = apply_patch_strict(
+            &files,
+            patch,
+            &["src/pkg/gone.py".to_string(), "src/pkg/mod.py".to_string()],
+        )
+        .expect("a clean deletion plus a clean edit must apply");
+        assert!(
+            !changed.contains_key("src/pkg/gone.py"),
+            "a deleted path has no content to test"
+        );
+        assert!(changed.get("src/pkg/mod.py").unwrap().contains("return 7"));
+    }
+
+    /// [VANTA-WHY] U5 — an absent touched path the patch does NOT delete is a
+    /// failure, not a skip: the run would otherwise report a verdict for a tree
+    /// with fewer files than the patch named, and say nothing about it.
+    #[test]
+    fn strict_apply_refuses_a_touched_path_it_cannot_read() {
+        let files = repo();
+        let patch = "\
+--- a/src/pkg/mod.py
++++ b/src/pkg/mod.py
+@@ -1,5 +1,5 @@
+ def f():
+-    return 1
++    return 7
+ 
+ 
+ def g():
+";
+        let err = apply_patch_strict(
+            &files,
+            patch,
+            &[
+                "src/pkg/mod.py".to_string(),
+                "src/pkg/never_written.py".to_string(),
+            ],
+        )
+        .expect_err("an absent path the patch does not delete is not skippable");
+        assert!(err.starts_with(UNSAFE_PATH), "got: {err}");
+        assert!(err.contains("never_written.py"), "got: {err}");
     }
 
     // ---- Fix 1 regression: the syntax guard ----

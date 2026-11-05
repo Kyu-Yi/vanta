@@ -135,14 +135,45 @@ def unavailable(why: str) -> str:
     return f"unavailable({why})"
 
 
-def label_for(record: Mapping[str, Any]) -> str:
-    """One manifest row's §5.3 label, or ``""`` when the row carries no oracle."""
+def label_and_source(record: Mapping[str, Any]) -> tuple[str, str]:
+    """``(label, source)`` for one row — the EFFECTIVE label and where it was read.
+
+    [VANTA-WHY] M3-E follow-up — the row's stored ``label`` is the ORIGINAL, and two
+    corrections outrank it under the ONE fixed precedence (``manifest.label_of``): a
+    MEASURED relabel (the oracle re-run on the reconstructed final patch) and a
+    DERIVED one. Reading the stored value rather than re-deriving it here is what
+    keeps this module, the batch digest and ``compare_batches`` from disagreeing —
+    re-deriving would report the exact value a relabel exists to correct, which is
+    the failure the precedence rule exists to make impossible.
+
+    A row that records NO label under any of the three keys is read the way it always
+    was: from its own verdict and oracle. That is still the ORIGINAL reading (the
+    row's own evidence), and it keeps every legacy row — and the rows the runner
+    wrote before it recorded a ``label`` — readable.
+    """
+    label, source = manifest_mod.label_of(record)
+    if label:
+        return label, source
     payload = record.get("oracle")
     if not isinstance(payload, dict):
-        return ""
-    return runner_mod.label_for(
+        return "", ""
+    derived = runner_mod.label_for(
         str(record.get("verdict") or ""), runner_mod.oracle_from_dict(payload)
     )
+    if not derived:
+        return "", ""
+    return derived, manifest_mod.LABEL_SOURCE_ORIGINAL
+
+
+def label_for(record: Mapping[str, Any]) -> str:
+    """One manifest row's EFFECTIVE §5.3 label, or ``""`` when it carries none."""
+    return label_and_source(record)[0]
+
+
+def label_source_for(record: Mapping[str, Any]) -> str:
+    """Which source :func:`label_for` read: a relabel (measured or derived), or the
+    original label. ``""`` for a row that carries no label at all."""
+    return label_and_source(record)[1]
 
 
 def label_rule_for(record: Mapping[str, Any]) -> str:
@@ -178,6 +209,24 @@ def label_rule_counts(analysis: "Analysis") -> dict[str, int]:
             rule = label_rule_for(record)
             if rule:
                 counts[rule] = counts.get(rule, 0) + 1
+    return counts
+
+
+def label_source_counts(analysis: "Analysis") -> dict[str, int]:
+    """How many rows resolved their label from each source (M3-E follow-up).
+
+    The companion of :func:`label_rule_counts`: the rule says WHICH LABELLING RULE
+    a row's label came from, this says WHICH OF THE THREE COPIES it was read from —
+    a measured relabel, a derived relabel, or the original. A load that pooled a
+    relabelled row and an original one under one bucket is visible here rather than
+    implied by the number.
+    """
+    counts: dict[str, int] = {}
+    for batch in analysis.batches:
+        for record in batch.records:
+            source = label_source_for(record)
+            if source:
+                counts[source] = counts.get(source, 0) + 1
     return counts
 
 
@@ -362,6 +411,11 @@ def load_manifest(path: Path) -> list[dict[str, Any]]:
     the replay selector) drops exactly the same rows rather than each re-deriving
     "the last per key, minus a superseded session" for itself. A torn last line is
     dropped here: the writer died mid-append and the cursor still says `running`.
+
+    [VANTA-WHY] M3-E follow-up — a row the batch has MEASURED-relabelled carries
+    that correction too (``manifest.with_measured_relabels``), so the label this
+    module reports is the same one every other reader resolves. The sidecar lives
+    beside the manifest, which is why it is read here from ``path.parent``.
     """
     rows: list[dict[str, Any]] = []
     with open(path, encoding="utf-8") as handle:
@@ -373,7 +427,9 @@ def load_manifest(path: Path) -> list[dict[str, Any]]:
                 rows.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    return manifest_mod.effective_records(rows)
+    return manifest_mod.with_measured_relabels(
+        manifest_mod.effective_records(rows), path.parent
+    )
 
 
 def load_replays(batch_dir: Path) -> tuple[list[dict[str, Any]], int]:
@@ -548,9 +604,45 @@ hash can be two different experiments. The rendered overrides are the other half
 key. Named here for the same reason ``CONFIG_HASH_FIELD`` is — a typo would make the
 guard read every row as "no overrides recorded" and pool them all."""
 
+PREP_CONFIG_HASH_FIELD = "prep_config_hash"
+"""M3 item T3 — the ``config_hash`` the batch's **preparation** recorded.
 
-def _config_group(record: Mapping[str, Any]) -> tuple[Any, Any]:
-    """The ``(config_hash, config_overrides)`` key two rows must share to be poolable.
+[VANTA-WHY] A run's rows and the ``prepare.json`` that sized their context gate are two
+claims about the same batch, and a row that records only the run's hash cannot say
+whether the tree it graded was prepared under the configuration it ran under. ``run``
+and ``queue`` refuse a batch whose preparation recorded a different hash or override
+status unless ``--allow-override`` waives it, so within one batch the two agree; the
+pooling key still reads the preparation's own field, because a batch directory can carry
+rows from a resume across a re-prepare, and averaging over those would be the same
+mistake ``CONFIG_HASH_FIELD`` exists to stop. A row written before this field existed
+reads as ``None`` and is its own group, exactly as a row with no ``config_hash`` is."""
+
+PREP_CONFIG_OVERRIDE_FIELD = "prep_config_override"
+"""M3 item T3 — whether the **preparation** waived a frozen setting with ``--allow-override``.
+
+The other half of the preparation's claim: a batch prepared with the waiver and run
+without it (or the reverse) ran under a different environment even when the config file
+is identical. Named here for the same reason the other two are — a typo would pool two
+preparations that differ only in their waiver."""
+
+PREP_CONFIG_OVERRIDES_FIELD = "prep_config_overrides"
+"""M3 item U8 — the overrides the **preparation** was run with.
+
+[VANTA-WHY] ``prep_config_hash`` and ``prep_config_override`` are not the whole of the
+preparation's configuration: ``--config-override`` waives a named frozen setting without
+touching the config file, so two preparations can share a hash and waive *something* with
+different values — the same reason item B8 added the run-side ``config_overrides`` to the
+key. Without this field those two are one group and their rows average the waived and the
+re-waived run under one name. The list is rendered strings (``frozen_config.Override.render``)
+and is sorted into the key. Named here for the same reason the others are — a typo would
+read every row as "no overrides recorded" and pool them all."""
+
+
+def _config_group(record: Mapping[str, Any]) -> tuple[Any, Any, Any, Any, Any]:
+    """The pooling key two rows must share to be comparable.
+
+    The key is ``(config_hash, config_overrides, prep_config_hash, prep_config_override,
+    prep_config_overrides)``.
 
     Overrides are recorded as an unordered list of rendered strings
     (``frozen_config.Override.render``), so they are sorted into the key — two rows that
@@ -560,13 +652,34 @@ def _config_group(record: Mapping[str, Any]) -> tuple[Any, Any]:
     ``config_hash`` does: the first says nothing about its overrides, the second says
     there were none, and pooling an unknown with a known under the known one's name is
     what the guard exists to stop.
+
+    M3 item T3 adds the **preparation's** ``config_hash`` and override flag as the
+    second half of the key, under the same absence rule: a row whose batch recorded no
+    preparation config (``None``) is its own group, never agreement with a row whose
+    batch did.
+
+    M3 item U8 completes the preparation half with its **applied overrides**
+    (``prep_config_overrides``), sorted and under the same absence rule — a row that
+    never recorded them is its own group, never agreement with one that recorded an
+    empty list.
     """
     value = record.get(CONFIG_HASH_FIELD)
     hash_key = None if value is None else str(value)
     raw = record.get(OVERRIDES_FIELD)
     if not isinstance(raw, list):
-        return hash_key, None
-    return hash_key, tuple(sorted(str(item) for item in raw))
+        overrides = None
+    else:
+        overrides = tuple(sorted(str(item) for item in raw))
+    prep_value = record.get(PREP_CONFIG_HASH_FIELD)
+    prep_hash = None if prep_value is None else str(prep_value)
+    prep_raw = record.get(PREP_CONFIG_OVERRIDE_FIELD)
+    prep_override = None if prep_raw is None else bool(prep_raw)
+    prep_over = record.get(PREP_CONFIG_OVERRIDES_FIELD)
+    if not isinstance(prep_over, list):
+        prep_overrides = None
+    else:
+        prep_overrides = tuple(sorted(str(item) for item in prep_over))
+    return hash_key, overrides, prep_hash, prep_override, prep_overrides
 
 
 def _refuse_mixed_configs(batches: Sequence[Batch]) -> None:
@@ -586,21 +699,42 @@ def _refuse_mixed_configs(batches: Sequence[Batch]) -> None:
     (:func:`_config_group`): one file hash can be run with and without `--config-override`
     waivers, and those rows are as incomparable as two different files. So the guard
     reads both fields and the refusal names the overrides that made the groups differ.
+
+    [VANTA-WHY] M3 item T3 — the key also carries the batch's **preparation**
+    (``prep_config_hash`` and its override flag), because a row that records only the run's
+    configuration cannot say the tree it graded was prepared under it. When the preparation
+    half is what makes two groups differ, the refusal names it; when every row's preparation
+    is the same the label is left as it was, so the message stays about the difference that
+    actually split the load.
+
+    [VANTA-WHY] M3 item U8 — the preparation half carries its **applied overrides**
+    (``prep_config_overrides``) as well, for the same reason the run half carries
+    ``config_overrides``: two trees prepared with the same file and waiver flag but
+    different waived values are different experiments, and the refusal names those values
+    when they are what split the load.
     """
-    groups: dict[tuple[Any, Any], list[str]] = {}
+    groups: dict[tuple[Any, Any, Any, Any, Any], list[str]] = {}
     for batch in batches:
         for record in batch.records:
             groups.setdefault(_config_group(record), []).append(str(batch.path))
     if len(groups) <= 1:
         return
+    # Only describe the preparation half when it is part of what split the load.
+    prep_varies = len({(group[2], group[3], group[4]) for group in groups}) > 1
     described: list[str] = []
-    for (hash_key, overrides), where in sorted(
+    for (hash_key, overrides, prep_hash, prep_override, prep_overrides), where in sorted(
         groups.items(),
         key=lambda item: (
             item[0][0] is not None,
             item[0][0] or "",
             item[0][1] is not None,
             item[0][1] or (),
+            item[0][2] is not None,
+            item[0][2] or "",
+            item[0][3] is not None,
+            bool(item[0][3]),
+            item[0][4] is not None,
+            item[0][4] or (),
         ),
     ):
         if hash_key is None:
@@ -611,6 +745,17 @@ def _refuse_mixed_configs(batches: Sequence[Batch]) -> None:
                 label += " (overrides not recorded)"
             elif overrides:
                 label += " (with overrides " + ", ".join(overrides) + ")"
+        if prep_varies:
+            if prep_hash is None:
+                label += " (prepared under no recorded config)"
+            else:
+                waived = "waived frozen settings" if prep_override else "waived none"
+                label += f" (prepared under {prep_hash[:12]}, {waived}"
+                if prep_overrides:
+                    label += " with overrides " + ", ".join(prep_overrides)
+                elif prep_overrides is None:
+                    label += ", overrides not recorded"
+                label += ")"
         described.append(
             f"{label} ({len(where)} row(s) in {', '.join(sorted(set(where)))})"
         )
@@ -1993,6 +2138,15 @@ def render_summary(analysis: Analysis, results: Sequence[MetricResult]) -> str:
         lines.append("label rules:")
         for rule in sorted(rules):
             lines.append(f"  {rule:<20} {rules[rule]}")
+    # M3-E follow-up — which of the three copies of the label each row was read
+    # from. Printed only when at least one row was read from a RELABEL, so a
+    # summary of an un-relabelled load is unchanged by this item.
+    sources = label_source_counts(analysis)
+    if any(source != manifest_mod.LABEL_SOURCE_ORIGINAL for source in sources):
+        lines.append("")
+        lines.append("label sources:")
+        for source in sorted(sources):
+            lines.append(f"  {source:<20} {sources[source]}")
     for result in results:
         lines.extend(result.summary)
     lines.append("")

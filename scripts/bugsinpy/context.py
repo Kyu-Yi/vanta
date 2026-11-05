@@ -700,9 +700,20 @@ def precheck(
 # ---------------------------------------------------------------------------
 # the server's own `n_ctx`
 # ---------------------------------------------------------------------------
-def env_context_window() -> Optional[tuple[int, str]]:
-    """``VANTA_LLM_CONTEXT_TOKENS`` as ``(n_ctx, source)``, or ``None`` if unset."""
-    override = os.environ.get(ENV_SOURCE, "").strip()
+def env_context_window(
+    *, environ: Optional[Mapping[str, str]] = None
+) -> Optional[tuple[int, str]]:
+    """``VANTA_LLM_CONTEXT_TOKENS`` as ``(n_ctx, source)``, or ``None`` if unset.
+
+    ``environ`` is the environment to read and defaults to the process's own. It
+    exists so a caller whose *effective* environment is not ``os.environ`` — item
+    Q3's ``prepare``, whose frozen ``[env]`` settings are applied to every child
+    the run spawns but which the caller's shell never exported — can size the gate
+    against the window the children will actually see (§1.6.1). It is a pure
+    parameter: nothing in this module mutates ``os.environ``.
+    """
+    env = os.environ if environ is None else environ
+    override = env.get(ENV_SOURCE, "").strip()
     if not override:
         return None
     try:
@@ -714,7 +725,9 @@ def env_context_window() -> Optional[tuple[int, str]]:
     return value, ENV_SOURCE
 
 
-def server_context_window() -> tuple[int, str]:
+def server_context_window(
+    *, environ: Optional[Mapping[str, str]] = None
+) -> tuple[int, str]:
     """``n_ctx`` the way ``llm::context_window_tokens`` resolves it.
 
     Order: ``VANTA_LLM_CONTEXT_TOKENS`` (wins), else the server's ``/props``,
@@ -723,17 +736,22 @@ def server_context_window() -> tuple[int, str]:
     this is the run-time mirror, and a run really does fall back — but the
     precheck does not go through this function: see
     :func:`explicit_context_window`.
+
+    ``environ`` is read instead of ``os.environ`` when given (see
+    :func:`env_context_window`).
     """
-    env = env_context_window()
+    env = env_context_window(environ=environ)
     if env is not None:
         return env
-    probed = probe_props_n_ctx()
+    probed = probe_props_n_ctx(environ=environ)
     if probed is not None:
         return probed, PROPS_SOURCE
     return FALLBACK_CONTEXT_TOKENS, FALLBACK_SOURCE
 
 
-def explicit_context_window(*, n_ctx: Optional[int] = None) -> tuple[int, str]:
+def explicit_context_window(
+    *, n_ctx: Optional[int] = None, environ: Optional[Mapping[str, str]] = None
+) -> tuple[int, str]:
     """The window to size the context gate against, from an **explicit** source.
 
     Either ``VANTA_LLM_CONTEXT_TOKENS``, ``--n-ctx``, or a reachable server's
@@ -753,9 +771,15 @@ def explicit_context_window(*, n_ctx: Optional[int] = None) -> tuple[int, str]:
     fallback — it never reads this flag — so a flag that disagrees would size
     against a window the run will not use, which is the bug this whole function
     exists to prevent.
+
+    ``environ`` is the environment the two variable reads use, defaulting to
+    ``os.environ`` (see :func:`env_context_window`). Item Q3 threads the caller's
+    *effective* environment here so that a shell which exported none of the
+    frozen settings still sizes the gate against the window
+    ``configs/v1-m3.toml`` freezes — which is what every child of the run gets.
     """
-    env = env_context_window()
-    probed = probe_props_n_ctx()
+    env = env_context_window(environ=environ)
+    probed = probe_props_n_ctx(environ=environ)
     if n_ctx is not None:
         if env is not None and env[0] != n_ctx:
             raise ContextError(
@@ -784,8 +808,11 @@ def explicit_context_window(*, n_ctx: Optional[int] = None) -> tuple[int, str]:
     )
 
 
-def probe_props_n_ctx(timeout_secs: float = 5.0) -> Optional[int]:
-    base = os.environ.get("VANTA_LLM_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+def probe_props_n_ctx(
+    timeout_secs: float = 5.0, *, environ: Optional[Mapping[str, str]] = None
+) -> Optional[int]:
+    env = os.environ if environ is None else environ
+    base = env.get("VANTA_LLM_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
     urls = []
     if base.endswith("/v1"):
         urls.append(base[: -len("/v1")] + "/props")

@@ -76,3 +76,36 @@ pub mod sandbox;
 pub mod session;
 pub mod terminal;
 pub mod repo;
+
+// [VANTA-WHY] M3 item X4 — the ONE lock for every test in this crate that writes
+// the process environment. `std::env` is process-global and `cargo test` runs the
+// lib's tests on parallel threads by default, so a test that sets a variable (or
+// takes one away) can be observed mid-test by any other test that reads the
+// environment — including the harness tests below that spawn real pytest
+// subprocesses, which inherit it. Each site used to guard only its own module
+// (`pr`'s `TEST_ENV_LOCK`, `sandbox`'s `ENV_LOCK`) and `harness`'s
+// `ExplicitHostBackend` had no lock at all and relied on `--test-threads=1`; a
+// per-module lock cannot see a sibling module's mutation, so the whole suite had
+// to stay serial. One shared lock makes every such test exclusive with every
+// other one, which is what lets the flag go — the same shape as C6's
+// `SEED_GLOBAL_LOCK` for the process-wide seed globals.
+//
+// It lives at the crate root because the sites are spread over `pr`, `sandbox`,
+// `config`, `pipeline::driver` and `pipeline::harness`, and none of those may
+// depend on another just to borrow a test-only lock.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Held for the whole of a test that writes the environment. Poisoning is
+    /// ignored on purpose: the guard is a serialisation token, not data, so a
+    /// panic in one test must not make the lock unusable for the next.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take the process-environment lock for the rest of the caller's scope.
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}

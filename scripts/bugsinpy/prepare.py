@@ -20,12 +20,14 @@ Every suite run happens inside Shuru — ``prepare`` is not exempt from C3.
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 from . import bake as bake_mod
+from . import budget as budget_mod
 from . import context as ctx
 from . import issue as issue_mod
 from . import issue_source
@@ -123,6 +125,20 @@ traversal, or a symlink the checkout planted. That refusal used to escape
 ``strip_and_baseline`` as an uncaught ``VersionPinError`` and kill prepare with no gate
 failure recorded; it is one more refusal of this step, recorded under this name like
 every other one."""
+
+
+VERSION_PIN_UNMEASURED_REASON = "version_pin_unmeasured"
+"""[VANTA-WHY] M3 item P3. The project's version machinery was reached and could not
+produce a version to freeze (``PinOutcome.measurement_failed``). Preparing on regardless
+was the pandas/1 failure: the bug was measured, run, and killed two stages later as
+``native_vacuous`` — because the tree the session seeded from reported the ``0+unknown``
+placeholder, which makes xarray's ``LooseVersion`` comparison raise and aborts collection
+on both sides — while the gate that would have named the cause had already been read as
+"pin recorded, nothing to see". The refusal belongs here, where the measurement failed and
+where the reason is in front of the reader, and not at the end of a suite run. It is
+recorded like the escape above it; the one outcome with a ``reason`` that is *not* a failed
+measurement — setuptools_scm configured without a ``write_to``, so the project keeps no
+version file at all — keeps preparing exactly as before."""
 
 
 NO_ISSUE_SOURCE_REASON = "issue_source=none"
@@ -438,6 +454,20 @@ class BugPrep:
     (``not built: setup.py declares no ext_modules…``), so a tree with no entry would
     mean the stage was skipped rather than that the tree needed nothing.
     """
+    tree_hashes: dict[str, str] = field(default_factory=dict)
+    """M3 item V8 — the fingerprint of each tree the host ADOPTED from a VM.
+
+    [VANTA-WHY] The in-place build and the patch apply run in a VM of their own and
+    the host adopts the tree that VM produced (``suite.VmRoot.adopt``), so the bytes
+    every later step reads are the bytes that VM wrote — validated (no symlink out of
+    the tree, no device, no setuid bit, within a size limit) and swapped in
+    atomically. The adopted tree's ``suite_cache.tree_fingerprint`` is recorded here,
+    per tree, so a reader can line a later cache key up with the exact bytes that
+    produced it. Empty for a bug whose trees were never mutated by a VM.
+
+    A tree that fails validation is a prepare gate failure with the reason on
+    ``gate_failures`` — never a silent fallback to the tree the VM did not touch.
+    """
     version_pin: dict[str, Any] = field(default_factory=dict)
     """§1.2 — the project version frozen into the sandbox tree, and how.
 
@@ -473,6 +503,22 @@ class BugPrep:
     a ``BugPrep`` built in this process holds before the freeze stage fills it: a
     ``prepare.json`` written before this key existed is refused by ``from_dict``
     like any other missing field, whose error says to re-run the stage.
+    """
+    scheduler: dict[str, Any] = field(default_factory=dict)
+    """M3 items S5/S6 — the host-capacity budget this bug's own suite runs were made
+    under, and how long each of them took.
+
+    [VANTA-WHY] Items S5 and S6 let independent suite runs overlap, which means a run's
+    *result* is now a function of what else was running beside it — so "concurrent yes
+    or no", the jobs the operator asked for, the budget the host actually allowed
+    (cores and memory), the host load at the start and the peak the scheduler reached
+    all have to be on the record, or a flaky nodeid introduced by contention is
+    indistinguishable from one the project has. The value is :meth:`budget.Budget.record`
+    plus ``runs``: one entry per tree this bug ran, ``run1_secs``/``run2_secs`` — the
+    in-VM wall time of each of a pair's two runs (``suite.SuiteRun.secs``), the number
+    the D1 cap is derived from. Empty on a bug prepare refused before any suite ran, and
+    written on every row so a reader can tell a serial measurement from a concurrent one
+    without reading the batch's invocation-level record.
     """
 
     @property
@@ -581,7 +627,9 @@ class BugPrep:
             "issue_text_names_symbols": sorted(self.issue_text_names_symbols),
             "deps": self.deps,
             "builds": self.builds,
+            "tree_hashes": self.tree_hashes,
             "version_pin": self.version_pin,
+            "scheduler": self.scheduler,
         }
 
     @classmethod
@@ -677,7 +725,9 @@ class BugPrep:
             ),
             deps=field_of(payload, "deps", owner=owner, where=where),
             builds=map_of(payload, "builds", owner=owner, where=where),
+            tree_hashes=map_of(payload, "tree_hashes", owner=owner, where=where),
             version_pin=record_of(payload, "version_pin", owner=owner, where=where),
+            scheduler=record_of(payload, "scheduler", owner=owner, where=where),
         )
 
 
@@ -764,6 +814,7 @@ def check_deps(
     checkpoint: str,
     batch_dir: Path,
     deps: dict[str, Any],
+    budget: Optional[budget_mod.Budget] = None,
 ) -> set[str]:
     """Prove the bug's layer can run its suite *before* the derivation spends it.
 
@@ -795,6 +846,7 @@ def check_deps(
     tree_rel = _rel(prep, "oracle_tree")
     env = prep.sandbox_env or None
 
+    progress(prep.key, "deps gate: collect oracle_tree")
     try:
         nodeids = suite_mod.collect_only(
             checkpoint=checkpoint,
@@ -805,12 +857,14 @@ def check_deps(
             extra_env=env,
             memory_mb=prep.vm_memory_mb,
             precompile=prep.precompile,
+            budget=budget,
         )
     except suite_mod.SuiteError as exc:
         nodeids = _collect_flip_or_raise(
-            prep, exc, checkpoint=checkpoint, batch_dir=batch_dir, env=env
+            prep, exc, checkpoint=checkpoint, batch_dir=batch_dir, env=env, budget=budget
         )
 
+    progress(prep.key, f"deps gate: import probe {module}")
     try:
         where = suite_mod.import_probe(
             checkpoint=checkpoint,
@@ -822,6 +876,7 @@ def check_deps(
             extra_env=env,
             memory_mb=prep.vm_memory_mb,
             precompile=prep.precompile,
+            budget=budget,
         )
     except suite_mod.SuiteError as exc:
         raise suite_mod.SuiteError(
@@ -844,6 +899,7 @@ def _collect_flip_or_raise(
     checkpoint: str,
     batch_dir: Path,
     env: Optional[dict[str, str]],
+    budget: Optional[budget_mod.Budget] = None,
 ) -> set[str]:
     """The collect gate's second reading: the error is a collect-flip, so re-run.
 
@@ -860,7 +916,7 @@ def _collect_flip_or_raise(
     what passes is a clean collection rather than a filtered error list.
     """
     flips, nodeids, errors = detect_collect_flip(
-        prep, checkpoint=checkpoint, batch_dir=batch_dir, env=env
+        prep, checkpoint=checkpoint, batch_dir=batch_dir, env=env, budget=budget
     )
     unexplained = {file: err for file, err in errors.items() if file not in flips}
     if not flips or unexplained:
@@ -868,6 +924,7 @@ def _collect_flip_or_raise(
 
     prep.hidden_by_collect_flip = flips
     prep.collect_flip_nodeids = nodeids
+    progress(prep.key, "deps gate: collect oracle_tree ignoring the flipped files")
     return suite_mod.collect_only(
         checkpoint=checkpoint,
         batch_dir=batch_dir,
@@ -878,6 +935,7 @@ def _collect_flip_or_raise(
         ignore=sorted(flips),
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
+        budget=budget,
     )
 
 
@@ -887,6 +945,7 @@ def detect_collect_flip(
     checkpoint: str,
     batch_dir: Path,
     env: Optional[dict[str, str]] = None,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> tuple[dict[str, str], list[str], dict[str, str]]:
     """Fixed-commit test files that error on the buggy source and collect on the fixed one.
 
@@ -929,6 +988,7 @@ def detect_collect_flip(
         extra_env=env,
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
+        budget=budget,
     )
     if not buggy.errors:
         return {}, [], {}
@@ -942,6 +1002,7 @@ def detect_collect_flip(
         extra_env=env,
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
+        budget=budget,
     )
     fixed_by_file = suite_mod.collect_by_file(sorted(fixed.nodeids))
     flips = {
@@ -987,7 +1048,12 @@ def setup_args_for(pythonpath: Optional[str]) -> tuple[str, ...]:
 
 
 def build_trees_in_place(
-    prep: BugPrep, *, checkpoint: str, batch_dir: Path, repo: Path
+    prep: BugPrep,
+    *,
+    checkpoint: str,
+    batch_dir: Path,
+    repo: Path,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> None:
     """Build each of the bug's trees in the layer, and record what happened.
 
@@ -1006,7 +1072,9 @@ def build_trees_in_place(
     against. The command follows the rule's own trigger (:func:`setup_args_for`) and the
     environment is the layer's (``bake.build_env_for``) with the project's own
     ``build_env`` added to it and its ``build_files`` written beside the trees, for the
-    reason ``suite.build_tree_in_place`` records.
+    reason ``suite.build_tree_in_place`` records. Each build's VM mounts a clone of its
+    own tree (M3 item V8), so the build files travel *into* that clone and each built
+    tree comes back adopted, with its fingerprint recorded on the row.
 
     Only ``full`` prepares reach this — it is called after ``load_deps`` and before the
     dependency gate — so a measure-only run never pays a compiler.
@@ -1032,18 +1100,27 @@ def build_trees_in_place(
             env[name] = f"{layer_value} {value}".strip() if layer_value else value
     if prep.build_files:
         # §3.4 — the build's own configuration file, written into the batch directory
-        # rather than into a tree: ``batch_dir`` is what Shuru mounts at ``/workspace``,
-        # so the file lands *beside* the trees and the trees stay exactly what the
-        # benchmark ships. Written before the first VM boots, so every one of the three
-        # builds already sees it, and rewritten each time so a re-prepare is the same
-        # run. The name is a bare file name (§3.4, the split's own validation), so it
-        # cannot be a path to somewhere else.
+        # rather than into a tree, so the trees stay exactly what the benchmark ships.
+        # Written before the first VM boots, and rewritten each time so a re-prepare is
+        # the same run. Each build's VM mounts a clone of its tree only (item V8), so
+        # the name is carried into that clone beside the tree rather than being visible
+        # because the whole batch is mounted. The name is a bare file name (§3.4, the
+        # split's own validation), so it cannot be a path to somewhere else.
         for name, content in sorted(prep.build_files.items()):
             (batch_dir / name).write_text(content, encoding="utf-8")
     setup_args = setup_args_for(prep.bug.pythonpath)
     command = f"python setup.py {' '.join(setup_args)}"
-    for tree_name in BUILD_TREES:
-        suite_mod.build_tree_in_place(
+    # [VANTA-WHY] M3 item V8 — the build file lives in the batch directory, which the
+    # guest no longer sees as ``/workspace``: the VM mounts a clone of the tree only,
+    # so the name is carried in beside it. The relative path inside the clone is the
+    # same, so ``build_env``'s own ``/workspace/<name>`` still resolves.
+    carry = tuple(sorted(prep.build_files))
+    # M3 item Y1 — each build's VM holds one slot of the invocation's budget while it
+    # boots (suite.build_tree_in_place), so a concurrent prepare prices them like the
+    # suite runs they sit beside; without a budget they boot as they always did.
+    def build_one(tree_name: str) -> str:
+        progress(prep.key, f"build {tree_name}")
+        return suite_mod.build_tree_in_place(
             checkpoint=checkpoint,
             batch_dir=batch_dir,
             tree_rel=_rel(prep, tree_name),
@@ -1052,8 +1129,39 @@ def build_trees_in_place(
             disk_mb=DISK_MB,
             env=env,
             memory_mb=prep.vm_memory_mb,
+            carry=carry,
+            budget=budget,
         )
+
+    # [VANTA-WHY] M3 item AA1 — the three trees are independent exports from git, so
+    # their builds are independent work and run at the same time under the one budget,
+    # which prices them like the suite runs they sit beside. At `--prepare-jobs 1` (or
+    # for a caller with no budget) `budget.concurrent` is false and this is the serial
+    # loop it always was, in the same order, recording the same rows. When they do
+    # overlap, the rows are still written in `BUILD_TREES` order and the first failure
+    # in that order is the one raised, so `prep.builds`/`prep.tree_hashes` and the
+    # recorded gate failure are byte-for-byte what a serial run would have produced.
+    if budget is not None and budget.concurrent:
+        outcomes: dict[str, tuple[Optional[str], Optional[BaseException]]] = {}
+        with ThreadPoolExecutor(max_workers=len(BUILD_TREES)) as pool:
+            futures = {tree: pool.submit(build_one, tree) for tree in BUILD_TREES}
+            for tree, future in futures.items():
+                try:
+                    outcomes[tree] = (future.result(), None)
+                except BaseException as exc:  # recorded in order, raised below
+                    outcomes[tree] = (None, exc)
+        ordered = ((tree, *outcomes[tree]) for tree in BUILD_TREES)
+    else:
+        ordered = ((tree, build_one(tree), None) for tree in BUILD_TREES)
+
+    for tree_name, fingerprint, failure in ordered:
+        if failure is not None:
+            raise failure
         prep.builds[tree_name] = f"built: {command}"
+        # The VM built the tree and the host adopted it (item V8/Q1); the adopted
+        # bytes' fingerprint goes on the row so a later cache key can be lined up
+        # with the tree that produced it.
+        prep.tree_hashes[tree_name] = fingerprint
 
 
 # ---------------------------------------------------------------------------
@@ -1169,6 +1277,7 @@ def derive_hidden(
     checkpoint: str,
     batch_dir: Path,
     collected: Optional[set[str]] = None,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> None:
     if collected is None:
         suite_mod.collect_only(
@@ -1182,9 +1291,49 @@ def derive_hidden(
             precompile=prep.precompile,
         )
 
-    buggy = _suite(checkpoint, batch_dir, prep, "src_buggy", "src_buggy")
-    before = _suite(checkpoint, batch_dir, prep, "oracle_tree", "oracle")
-    after = _suite(checkpoint, batch_dir, prep, "src_fixed", "src_fixed")
+    # [VANTA-WHY] M3 item S5 — the three derivations are independent: each reads its own
+    # tree and nothing they produce is read by another (the sets are only combined
+    # below), so running them back to back was a sequence with no dependency to justify
+    # it. They are submitted together and the shared budget decides how many actually
+    # overlap, which is ``--prepare-jobs`` — the concurrency is the operator's, not a
+    # number this function invents. Without a budget (or at one job) the three stay
+    # sequential, which is today's order and today's memory profile; when they do
+    # overlap, the row records it (:func:`_scheduler_record`), because two suites
+    # competing for the host is a fact a later flakiness reading must be able to see.
+    trees = (
+        ("src_buggy", "src_buggy"),
+        ("oracle_tree", "oracle"),
+        ("src_fixed", "src_fixed"),
+    )
+    if budget is not None and budget.concurrent:
+        with ThreadPoolExecutor(max_workers=len(trees)) as pool:
+            futures = [
+                pool.submit(
+                    _suite,
+                    checkpoint,
+                    batch_dir,
+                    prep,
+                    tree_name,
+                    stem,
+                    budget=budget,
+                )
+                for tree_name, stem in trees
+            ]
+            buggy, before, after = (future.result() for future in futures)
+    else:
+        buggy, before, after = (
+            _suite(checkpoint, batch_dir, prep, tree_name, stem, budget=budget)
+            for tree_name, stem in trees
+        )
+    _scheduler_record(
+        prep,
+        budget,
+        (
+            ("src_buggy", buggy),
+            ("oracle_tree", before),
+            ("src_fixed", after),
+        ),
+    )
 
     flaky = (
         buggy.flaky_nodeids
@@ -1330,7 +1479,23 @@ def _suite(
     prep: BugPrep,
     tree_name: str,
     stem_suffix: str,
+    *,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> suite_mod.SuitePair:
+    # M3 item S3 — a repeat prepare of the same bug measures the same tree bytes,
+    # so the pair is served from the cache instead of re-run (``origin`` turns the
+    # lookup on; see ``suite.run_suite_twice``). The tree name is part of the
+    # origin only, never of the key: the key is the tree's bytes, so a re-prepared
+    # tree is a hit exactly when it is the same tree.
+    #
+    # M3 item S5 — ``budget`` is threaded straight through: the pair's two runs are
+    # the scheduler's unit, so one call here is up to two units and the caller's
+    # ``--prepare-jobs`` sizes them. Keyword-only so the five positional parameters
+    # stay the shape callers and tests already bind.
+    # M3 item AA1 — one progress line per suite pair, so the derivations, the
+    # stripped baseline and every other prepare suite are visible while they run
+    # rather than only when the bug finishes.
+    progress(prep.key, f"suite {tree_name} ({stem_suffix})")
     return suite_mod.run_suite_twice(
         checkpoint=checkpoint,
         batch_dir=batch_dir,
@@ -1341,10 +1506,58 @@ def _suite(
         extra_env=prep.sandbox_env or None,
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
+        origin=f"{prep.slug}/{tree_name}",
+        budget=budget,
     )
 
 
-def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bool:
+def _scheduler_record(
+    prep: BugPrep,
+    budget: Optional[budget_mod.Budget],
+    runs: Sequence[tuple[str, suite_mod.SuitePair]],
+) -> None:
+    """Record the budget this bug's suite runs were made under, and their wall times.
+
+    [VANTA-WHY] M3 items S5/S6. Overlapping means a run's flakiness can be the host's
+    rather than the project's, so the row has to say whether the runs overlapped, under
+    what cap, on a host already at what load — and how long each of the two runs of each
+    tree actually took, because that is the figure the in-session cap is derived from
+    (item D1, ``native_secs``). Recording it here, at the moment the pairs are in hand,
+    is the only place that has both numbers; a later reader has neither.
+
+    ``budget`` is the ONE scheduler of the invocation (S5/S6/``--jobs``); ``None`` means
+    a caller that does not participate, which is recorded as the empty mapping rather
+    than as "serial", because serial is a statement about a budget that exists.
+
+    [VANTA-WHY] M3 item S7 — each tree also carries its pair's ``cache`` block
+    (``suite.SuitePair.cache``: the key, whether it was a hit, the writer and the
+    cache ROOT it came from). ``prepare`` is the only stage that measures a tree
+    through the cache, so this is the only place the Python half of the cache can
+    be audited from the batch — and the equivalence check needs it to prove the
+    two batches did not share one root. It rides the ``scheduler`` mapping, which
+    ``BugPrep.to_dict`` already writes whole and ``from_dict`` already reads with
+    ``record_of``, so no field is added to the record's own schema.
+    """
+    previous = prep.scheduler.get("runs") if prep.scheduler else None
+    recorded = dict(previous) if isinstance(previous, Mapping) else {}
+    for tree_name, pair in runs:
+        recorded[tree_name] = {
+            "run1_secs": pair.first.secs,
+            "run2_secs": pair.second.secs,
+            "cache": pair.cache,
+        }
+    block = {} if budget is None else budget.record()
+    block["runs"] = recorded
+    prep.scheduler = block
+
+
+def strip_and_baseline(
+    prep: BugPrep,
+    *,
+    checkpoint: str,
+    batch_dir: Path,
+    budget: Optional[budget_mod.Budget] = None,
+) -> bool:
     """Cut ``vanta_tree``/``vanta_clean`` from ``oracle_tree`` and re-run the suite.
 
     Returns whether the native baseline was recorded. ``False`` means this step
@@ -1371,6 +1584,7 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bo
     oracle = prep.root / "oracle_tree"
     vanta = prep.root / "vanta_tree"
 
+    progress(prep.key, "strip oracle_tree and run the stripped baseline")
     report = _read_report(batch_dir, f"{prep.slug}-oracle")
     # Through the shared reader: the oracle report of a bug whose own pytest pin caps
     # pytest-json-report at 0.2 is a flat list (§3.2), and reading only `["tests"]`
@@ -1442,11 +1656,25 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bo
             # leak above, so the bug is refused with a cause a reader can see.
             prep.gate_failures.append(f"{VERSION_PIN_ESCAPE_REASON}: {exc}")
             return False
+    elif pin.measurement_failed:
+        # [VANTA-WHY] M3 item P3 — the machinery was reached and produced no version to
+        # freeze, so the sandbox's tree would report the ``0+unknown`` placeholder. The
+        # pandas/1 shape: running on anyway reached the native suite, which aborted at
+        # collection on both sides and ended the row ``native_vacuous`` — an
+        # ``infra_failure`` naming the tree for what is a fact about the pin. Refused
+        # here, with the probe's own complaint in the record, so the cause is the row.
+        prep.gate_failures.append(
+            f"{VERSION_PIN_UNMEASURED_REASON}: {pin.reason}"
+        )
+        return False
     prep.version_pin = version_pin_mod.as_record(
-        pin.pin, reason=pin.reason, probed=pin.probed
+        pin.pin, reason=pin.reason, probed=pin.probed, skipped=pin.skipped
     )
 
-    after_strip = _suite(checkpoint, batch_dir, prep, "vanta_tree", "vanta")
+    after_strip = _suite(
+        checkpoint, batch_dir, prep, "vanta_tree", "vanta", budget=budget
+    )
+    _scheduler_record(prep, budget, (("vanta_tree", after_strip),))
     # The same rule as ``derive_hidden``'s, on the fifth graded run. The baseline below
     # is measured from it, and an unmeasured run leaves it empty — which reads as "the
     # tree is natively green" and would clear every candidate of every regression. Left
@@ -1475,7 +1703,13 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bo
     return True
 
 
-def selfcheck_dev_fix(prep: BugPrep, *, batch_dir: Path, checkpoint: str) -> bool:
+def selfcheck_dev_fix(
+    prep: BugPrep,
+    *,
+    batch_dir: Path,
+    checkpoint: str,
+    budget: Optional[budget_mod.Budget] = None,
+) -> bool:
     """Grade the developer fix with the real oracle; refuse the bug unless it is good.
 
     Returns whether the bug may continue. Called last, after the strip, because the
@@ -1496,8 +1730,13 @@ def selfcheck_dev_fix(prep: BugPrep, *, batch_dir: Path, checkpoint: str) -> boo
     if not prep.hidden_nodeids:
         return True
 
+    progress(prep.key, "developer-fix self-check (the real oracle grades the dev fix)")
     result = oracle_mod.grade_dev_fix(
-        prep=prep, batch_dir=batch_dir, checkpoint=checkpoint, disk_mb=DISK_MB
+        prep=prep,
+        batch_dir=batch_dir,
+        checkpoint=checkpoint,
+        disk_mb=DISK_MB,
+        budget=budget,
     )
     if result.patch_good:
         return True
@@ -1928,6 +2167,8 @@ def prepare_manifest(
     preps: list[BugPrep],
     n_ctx: int,
     n_ctx_source: str,
+    config_block: Mapping[str, Any],
+    scheduler: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """The whole ``prepare.json`` payload — the one writer ``run`` reads back.
 
@@ -1941,6 +2182,14 @@ def prepare_manifest(
     ``n_ctx``/``n_ctx_source`` are the window the gate was sized against (§1.6.1):
     recorded here, and compared against the run's own window by
     ``runner.context_window_warning``.
+
+    ``config_block`` is item 19's frozen-configuration block — ``config_hash``,
+    ``config_path``, ``config_override`` and ``config_overrides``, the same four
+    keys ``build_record`` puts on every row (item Q3). It is passed in rather than
+    loaded here so that the stage resolves the configuration *once*, at the start,
+    exactly as ``run`` does: the hash on the file is then the hash the batch
+    measured under, and a ``prepare.json`` naming a different configuration from
+    its rows is a contradiction this payload cannot express.
     """
     return {
         "schema_version": 1,
@@ -1957,8 +2206,14 @@ def prepare_manifest(
         # number came from. ``run`` reads these back and warns when its own differs.
         "n_ctx": n_ctx,
         "n_ctx_source": n_ctx_source,
+        **config_block,
         "selected": list(selected),
         "breaks": [{"bug": key, "detail": detail} for key, detail in broken],
+        # M3 items S5/S6 — the invocation's ONE scheduler, as it ended: whether the
+        # runs overlapped, the jobs asked for, the budget the host allowed, the load
+        # at the start and the peak reached. The per-bug copy is on each row
+        # (``BugPrep.scheduler``); this one is what the batch as a whole ran under.
+        "scheduler": dict(scheduler) if scheduler is not None else {},
         "bugs": [prep.to_dict() for prep in preps],
     }
 
@@ -2253,6 +2508,27 @@ def _batch_root(prep: BugPrep) -> Path:
     return prep.root.parent.parent
 
 
+PROGRESS_CLOCK = "%H:%M:%S"
+"""The wall-clock shape of a progress line (M3 item AA1)."""
+
+
+def progress(key: str, step: str) -> None:
+    """One timestamped line for a prepare step or a suite run (M3 item AA1).
+
+    [VANTA-WHY] ``prepare`` is minutes of silent work: the batch printed
+    ``[<key>] full ...`` and then nothing at all until ``[<key>] ok``, so a
+    28-minute pandas prepare, a hung one and a batch running at a crawl all read
+    the same on the terminal — the operator cannot tell progress from a stall.
+    One line per setup step and per suite run makes the stage legible while
+    changing nothing it computes: the line goes to stdout and is read by no
+    verdict, label, admission or result. It is emitted here rather than inside
+    ``suite.run_suite_twice`` because that would print for every stage of the
+    harness (``run``, ``queue``, ``replay``); ``prepare`` is the stage that was
+    silent, so ``prepare`` is where the line belongs.
+    """
+    print(f"[{datetime.now().strftime(PROGRESS_CLOCK)}] [{key}] {step}", flush=True)
+
+
 def _read_report(batch_dir: Path, stem: str) -> dict:
     path = batch_dir / f"reports/{stem}.run1.json"
     try:
@@ -2398,6 +2674,7 @@ def prepare_one(
     n_ctx_source: str,
     vanta_bin: Path,
     refreeze: bool = False,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> BugPrep:
     """Everything ``prepare`` does for one bug, in the order §1.3 fixes.
 
@@ -2411,6 +2688,13 @@ def prepare_one(
 
     ``refreeze`` comes from ``prepare --refreeze PROJECT/BUG`` and means exactly one
     thing: this bug's committed report is to be re-fetched and rewritten (§2.4.3).
+
+    ``budget`` is the ONE host-capacity scheduler (M3 items S5/S6), created once per
+    ``prepare`` invocation by the caller and handed down so this bug's independent
+    suite runs (the three derivations) can overlap under ``--prepare-jobs``. It is
+    also what the row records (``BugPrep.scheduler``), so a reader can tell a
+    concurrent measurement from a serial one. ``None`` keeps the serial behaviour
+    for a caller that does not participate.
     """
     project = entry["project"]
     bug_id = int(entry["bug_id"])
@@ -2454,6 +2738,7 @@ def prepare_one(
         precompile=_precompile_entry(entry),
     )
 
+    progress(prep.key, "check the row against the split")
     mismatches = check_declared(entry, bug)
     # `needs_build` is checked against the buggy commit's own tree and not against the
     # metadata: it is a property of the files (§3.2), and the split is the protocol, so
@@ -2464,6 +2749,7 @@ def prepare_one(
         prep.gate_failures.extend(mismatches)
         return prep
 
+    progress(prep.key, "materialise the trees (git exports)")
     prep.test_paths = build_trees(bug, repo_cache, prep.root)
 
     # The issue text comes from the committed frozen report, and it is read *here*
@@ -2474,6 +2760,7 @@ def prepare_one(
     if not github_url:
         prep.gate_failures.append(f"{FROZEN_ISSUE_REASON}: no github_url for {project}")
         return prep
+    progress(prep.key, "read the frozen issue text")
     frozen = build_issue(
         prep,
         repo_cache=repo_cache,
@@ -2494,6 +2781,7 @@ def prepare_one(
     # (the strip only removes test functions), so measuring it costs nothing and
     # saves the three double suite runs on a bug that cannot fit anyway — which is
     # the whole point of the precheck for a candidate like youtube-dl.
+    progress(prep.key, "precheck (pre-strip tree, window-sized)")
     early = ctx.precheck(
         prep.root / "oracle_tree",
         prep.issue.text,
@@ -2513,6 +2801,7 @@ def prepare_one(
     # The dependency gate comes first, and comes before the derivation, because a
     # missing dependency must never be reported as an oracle failure (§3.3). It
     # needs no oracle work at all: the layer is baked, the trees are on disk.
+    progress(prep.key, "load the layer's dependency provenance")
     try:
         deps = bake_mod.load_deps(deps_dir, checkpoint)
         prep.deps = deps
@@ -2539,27 +2828,42 @@ def prepare_one(
     # has C extensions is not importable until its own `setup.py` has run (§3.4), so
     # without this the gate's failure would be the ImportError the build exists to
     # prevent — a missing *extension* reported as a missing *dependency*.
+    progress(prep.key, "build the trees in place")
     try:
         build_trees_in_place(
-            prep, checkpoint=checkpoint, batch_dir=batch_dir, repo=repo_cache
+            prep,
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            repo=repo_cache,
+            budget=budget,
         )
     except suite_mod.SuiteError as exc:
         prep.gate_failures.append(str(exc))
         note_drops()
         return prep
 
+    progress(prep.key, "dependency gate")
     try:
         collected = check_deps(
-            prep, checkpoint=checkpoint, batch_dir=batch_dir, deps=deps
+            prep,
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            deps=deps,
+            budget=budget,
         )
     except suite_mod.SuiteError as exc:
         prep.gate_failures.append(str(exc))
         note_drops()
         return prep
 
+    progress(prep.key, "derive the hidden oracle (three suite pairs)")
     try:
         derive_hidden(
-            prep, checkpoint=checkpoint, batch_dir=batch_dir, collected=collected
+            prep,
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            collected=collected,
+            budget=budget,
         )
     except (suite_mod.SuiteError, tree_mod.TreeError) as exc:
         prep.gate_failures.append(f"hidden-oracle derivation failed: {exc}")
@@ -2573,6 +2877,7 @@ def prepare_one(
     # text was gated against a narrower oracle than the run grades with. Flagged, never
     # re-gated — the committed text is what the run sends.
     if frozen is not None:
+        progress(prep.key, "check the frozen text against the derived oracle")
         drift = check_gate_drift(prep, frozen, issues_dir=issue_sources.issues_dir)
         if drift:
             prep.gate_failures.append(drift)
@@ -2581,7 +2886,7 @@ def prepare_one(
 
     try:
         baseline_recorded = strip_and_baseline(
-            prep, checkpoint=checkpoint, batch_dir=batch_dir
+            prep, checkpoint=checkpoint, batch_dir=batch_dir, budget=budget
         )
     except suite_mod.SuiteError as exc:
         prep.gate_failures.append(f"post-strip suite run failed: {exc}")
@@ -2604,7 +2909,9 @@ def prepare_one(
     # measured as a candidate; those two numbers would only describe a bug no run will
     # ever use.
     try:
-        if not selfcheck_dev_fix(prep, batch_dir=batch_dir, checkpoint=checkpoint):
+        if not selfcheck_dev_fix(
+            prep, batch_dir=batch_dir, checkpoint=checkpoint, budget=budget
+        ):
             note_drops()
             return prep
     except suite_mod.SuiteError as exc:
@@ -2616,6 +2923,7 @@ def prepare_one(
     # issue text it will actually be given. Smaller than `early`, never larger — the
     # text is the same frozen file, and the tree is the same source with the hidden
     # tests stripped.
+    progress(prep.key, "authoritative context measurement (vanta_tree)")
     prep.context = ctx.precheck(
         prep.root / "vanta_tree",
         prep.issue.text if prep.issue else "",
@@ -2676,12 +2984,19 @@ def render_summary(
     *,
     n_ctx: Optional[int] = None,
     n_ctx_source: Optional[str] = None,
+    cache_state: Optional[str] = None,
 ) -> str:
     """The ``prepare`` console + ``prepare_summary.md`` table.
 
     The window is printed above the table (§1.6.1) because every ``context tok``
     below it is meaningless without it: the first full prepare sized against the
     65536 fallback and rejected two PySnooper bugs, and nothing in the table said so.
+
+    ``cache_state`` is one line the caller composes (``bugsinpy_run.cache_state_line``,
+    M3 item U3) saying whether every selected layer can key the suite cache. It rides
+    the summary for the same reason the window does: a layer with no ``checkpoint_id``
+    turns the cache off *silently* — every suite is measured and nothing is reused —
+    and a batch whose summary does not say so reads exactly like one whose cache is on.
     """
     lines: list[str] = []
     if n_ctx is not None:
@@ -2690,6 +3005,8 @@ def render_summary(
             "every verdict below was sized against this window.",
             "",
         ]
+    if cache_state is not None:
+        lines += [cache_state, ""]
     lines += [
         "| bug | role | wave | mode | verdict | F2P | collected | native fails | context tok | issue |",
         "|---|---|---|---|---|---|---|---|---|---|",

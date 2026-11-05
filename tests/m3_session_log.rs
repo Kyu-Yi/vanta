@@ -1495,6 +1495,14 @@ fn run_patch_mode_with_output(
         .env("VANTA_LLM_IDLE_TIMEOUT_SECS", "5")
         .env("VANTA_PYTHON", python)
         .env("PATH", "/usr/bin:/bin")
+        // [VANTA-WHY] W1 — these integration tests drive the real `vanta_m3`
+        // binary with a deliberately restricted `PATH` (`/usr/bin:/bin`, so no
+        // `shuru` on it) and no backend choice of their own. Before W1 an `auto`
+        // run silently degraded to the host here; W1 makes `auto` REFUSE
+        // instead. They exercise session-log semantics, not the sandbox
+        // boundary, so they request the host backend BY NAME rather than
+        // passing only because the backend silently changed underneath them.
+        .env("VANTA_SANDBOX_BACKEND", "subprocess")
         .env("VANTA_SANDBOX_MEMORY_MB", "0");
     for (key, value) in extra_env {
         cmd.env(key, value);
@@ -1530,6 +1538,14 @@ fn run_creator_mode_with_output(
         .env("VANTA_LLM_IDLE_TIMEOUT_SECS", "5")
         .env("VANTA_PYTHON", python)
         .env("PATH", "/usr/bin:/bin")
+        // [VANTA-WHY] W1 — these integration tests drive the real `vanta_m3`
+        // binary with a deliberately restricted `PATH` (`/usr/bin:/bin`, so no
+        // `shuru` on it) and no backend choice of their own. Before W1 an `auto`
+        // run silently degraded to the host here; W1 makes `auto` REFUSE
+        // instead. They exercise session-log semantics, not the sandbox
+        // boundary, so they request the host backend BY NAME rather than
+        // passing only because the backend silently changed underneath them.
+        .env("VANTA_SANDBOX_BACKEND", "subprocess")
         .env("VANTA_SANDBOX_MEMORY_MB", "0");
     for (key, value) in extra_env {
         cmd.env(key, value);

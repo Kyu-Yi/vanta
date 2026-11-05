@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+from . import budget as budget_mod
 from . import suite as suite_mod
 from . import trees as tree_mod
 from .prepare import BugPrep
@@ -113,6 +114,26 @@ class OracleResult:
     failure — and must never be pooled as a known-bad patch.
     """
 
+    cache: Optional[list[dict[str, Any]]] = None
+    """Which grading runs were served from the suite cache (M3 item S2).
+
+    [VANTA-WHY] One entry per grading pair — ``{"side": "hidden"|"patched", …}``
+    around that pair's own cache note (``key``, ``state``, ``source``,
+    ``would_hit``). **Record-only**, exactly as item Q's fields are: nothing here
+    may be read by a metric, a label or a verdict, and it is written beside the
+    evidence rather than instead of it — the cached pair IS the measurement, so a
+    hit changes no number, only where the number came from.
+
+    ``None`` means "not recorded" and is not the same claim as ``[]``. The pair
+    notes are appended only once a grading has actually consulted the cache, so an
+    ``oracle.json`` written before this item — which has no ``cache`` key at all —
+    must read back as unknown rather than as an empty list: ``[]`` would say the
+    cache was consulted and held nothing, which for a row graded before the cache
+    existed is a statement about a lookup that never happened. The point is
+    auditability: a ``true_reject`` whose grading came from a cached pair must be
+    traceable to the row that measured those bytes first.
+    """
+
     @property
     def label_input(self) -> str:
         """What §5.3's table switches on: ``patch_good``, the censor, or the
@@ -144,6 +165,10 @@ class OracleResult:
             "oracle_secs": round(self.oracle_secs, 3),
             "error": self.error,
             "inconclusive": self.inconclusive,
+            # M3 item S2 — the cache notes of the two grading pairs, record-only.
+            # Copied per entry so a caller cannot mutate the field through the dict.
+            # ``None`` stays ``None``: "not recorded" is never written as ``[]``.
+            "cache": None if self.cache is None else [dict(item) for item in self.cache],
         }
 
 
@@ -240,6 +265,7 @@ def grade(
     disk_mb: int,
     baseline_failures: Optional[Sequence[str]] = None,
     timeout_secs: int = 1800,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> OracleResult:
     """Grade ``patch_path`` against ``prep``'s oracle. Never raises for a bad patch.
 
@@ -250,6 +276,14 @@ def grade(
     The work tree is left in place on purpose: §6.3's rerun-safety rule needs the
     graded tree to still exist for a session whose signal has to be re-run, so
     deleting it here would move a disk problem onto the correctness path.
+
+    ``budget`` (M3 item Y1) is the invocation's ONE scheduler, threaded straight
+    into both grading pairs so each pair's two runs may overlap exactly as a
+    preparation suite's do (:func:`suite.run_suite_twice`). The two PAIRS stay
+    sequential, and must: the patched suite only runs once the hidden pair has
+    produced a readable report (item B4's guard returns before the second pair
+    whenever it has not). ``None`` — a test, ``pool``, ``mutants`` — keeps the
+    grading exactly the serial pair it was.
     """
     started = time.monotonic()
     # M3 item D1 — the grading runs cover the same *native* suite the in-session gate
@@ -317,6 +351,11 @@ def grade(
     # read ``absent`` and a good developer fix graded ``bad``. Omitting it was the
     # only asymmetry between "measuring" and "grading" the identical tree.
     sandbox_env = prep.sandbox_env or None
+    # [VANTA-WHY] M3 item S2 — ``origin`` turns on the content-keyed cache for this
+    # pair. A candidate patch's tree is the same bytes in every round, arm and seed,
+    # and the hidden command is a function of the patch and the oracle, so the pair
+    # is measured once per candidate rather than once per grading. The label is the
+    # session or the candidate hash, so the entry records which row measured it.
     hidden_pair = suite_mod.run_suite_twice(
         checkpoint=checkpoint,
         batch_dir=batch_dir,
@@ -331,7 +370,17 @@ def grade(
         extra_env=sandbox_env,
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
+        origin=f"{prep.slug}/{label}/hidden",
+        budget=budget,
     )
+    # M3 item S2 — record how the hidden pair was obtained BEFORE the guard below
+    # can return: a censored grading is still a grading that may have been served
+    # from the cache, and dropping the note there would make exactly the rows whose
+    # evidence is weakest the ones whose provenance is least visible. Assigning
+    # rather than appending is what keeps the field ``None`` until a grading has
+    # actually reached the cache (see the field's docstring).
+    if hidden_pair.cache is not None:
+        result.cache = [{"side": "hidden", **hidden_pair.cache}]
     # [VANTA-WHY] Item B4. The patch applied, but if the hidden run wrote no
     # pytest report at all there is nothing to compare against: every hidden
     # nodeid would read ``absent``, ``score`` would say ``hidden_pass = false``
@@ -370,7 +419,14 @@ def grade(
         extra_env=sandbox_env,
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
+        # M3 item S2 — the same keying as the hidden pair, on the native command
+        # (the patched side of the regression reading).
+        origin=f"{prep.slug}/{label}/patched",
+        budget=budget,
     )
+    # M3 item S2 — the patched pair's note, again before its guard can return.
+    if patched_pair.cache is not None:
+        result.cache = [*(result.cache or []), {"side": "patched", **patched_pair.cache}]
 
     # [VANTA-WHY] Item E3 — the mirror of the hidden guard, on the patched side.
     # A patched run that wrote no report leaves ``stable_failures`` empty, so
@@ -419,6 +475,7 @@ def grade_dev_fix(
     checkpoint: str,
     disk_mb: int,
     timeout_secs: int = 1800,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> OracleResult:
     """Grade the developer fix against the oracle ``prep`` just derived (§11 step 2).
 
@@ -457,6 +514,7 @@ def grade_dev_fix(
         label=DEV_FIX_STEM,
         disk_mb=disk_mb,
         timeout_secs=timeout_secs,
+        budget=budget,
     )
     save(batch_dir / f"{stem}.oracle.json", result)
     return result

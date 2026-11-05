@@ -44,6 +44,7 @@ The disk requirement is a measured fact, not a tuning knob: the base image is
 from __future__ import annotations
 
 import ast
+import hashlib
 import io
 import json
 import re
@@ -54,6 +55,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Container, Iterable, Mapping, Optional, Sequence
@@ -67,6 +69,7 @@ from packaging.version import InvalidVersion, Version
 from .bugsinpy_meta import read_metadata_text
 from . import redact as redact_mod
 from . import suite as suite_mod
+from . import suite_cache as suite_cache_mod
 from . import trees as tree_mod
 from .shuru import (
     BUILD_JOB_ENV,
@@ -81,6 +84,7 @@ from .shuru import (
     checkpoint_create,
     checkpoint_delete,
     checkpoint_exists,
+    run as shuru_run,
     startup_check_lines,
 )
 from .split import Split, SplitError
@@ -10706,11 +10710,115 @@ def deps_path(deps_dir: Path, checkpoint: str) -> Path:
     return deps_dir / f"{checkpoint}.json"
 
 
+CHECKPOINT_ID_KEY = suite_cache_mod.CHECKPOINT_ID_KEY
+BAKED_AT_KEY = suite_cache_mod.BAKED_AT_KEY
+"""The two stamp keys of a layer's identity (M3 item U3).
+
+[VANTA-WHY] Named once, in :mod:`suite_cache`, and bound here rather than spelled
+again: the writer (:func:`stamp_provenance`) and the readers (``suite_cache``, and
+through ``VANTA_SHURU_CHECKPOINT_ID`` the Rust half of the cache) must not be able
+to disagree about the key they mean.
+"""
+
+
+def provenance_digest(provenance: Mapping[str, Any]) -> str:
+    """A sha256 over the DECISIVE fields of one layer's provenance.
+
+    [VANTA-WHY] M3 item U3. This is what makes a checkpoint's identity a fact
+    about the layer rather than about its name: two bakes that resolved the same
+    pins produce the same digest, and a re-bake that resolved different ones
+    produces a different one — which is exactly the question the suite cache has
+    to answer before it serves a measurement.
+
+    Three keys are excluded, and each for its own reason:
+
+    * the two stamp keys themselves, or the digest would depend on itself;
+    * :data:`PIP_CHECK_KEY`, because it is the layer's verdict on itself written
+      back AFTER the bake (:func:`record_pip_check`) and not an input to it. A
+      digest that covered it would change the identity of a layer whenever its
+      own ``pip check`` output was recorded — turning every re-bake of an already
+      recorded layer into a "different" layer and emptying the suite cache.
+
+    Everything else is decisive, including the ``notes`` and ``skipped`` lists: a
+    field that moved is a resolution that changed, and the honest answer for the
+    cache is a miss.
+    """
+
+    material = {
+        key: value
+        for key, value in provenance.items()
+        if key not in (CHECKPOINT_ID_KEY, BAKED_AT_KEY, PIP_CHECK_KEY)
+    }
+    blob = json.dumps(
+        material, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def stamp_provenance(
+    provenance: Mapping[str, Any], previous: Optional[Mapping[str, Any]] = None
+) -> dict[str, Any]:
+    """``provenance`` with its layer identity stamped in (M3 item U3).
+
+    ``previous`` is the provenance already on disk for this checkpoint, when there
+    is one. A re-bake that resolved the SAME layer keeps the ``baked_at`` it had,
+    so an unchanged layer keeps its identity: a fresh timestamp on every ``bake``
+    invocation would change ``checkpoint_id`` for a layer nothing about which
+    changed, and take the whole suite cache down with it every time the bake was
+    re-run. A layer the re-bake resolved differently gets a new stamp, which is
+    the point — the entry the old identity's key found describes a layer that no
+    longer exists.
+
+    ``checkpoint_id`` is the digest of the stamped material, so it moves when
+    either the layer or the moment it was first baked moves.
+    """
+
+    digest = provenance_digest(provenance)
+    baked_at = ""
+    if isinstance(previous, Mapping) and provenance_digest(previous) == digest:
+        remembered = previous.get(BAKED_AT_KEY)
+        if isinstance(remembered, str):
+            baked_at = remembered
+    if not baked_at:
+        baked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    identity = hashlib.sha256(f"{baked_at}\x00{digest}".encode("utf-8")).hexdigest()
+    stamped = dict(provenance)
+    stamped[BAKED_AT_KEY] = baked_at
+    stamped[CHECKPOINT_ID_KEY] = identity
+    return stamped
+
+
+def _read_provenance(path: Path) -> Optional[dict[str, Any]]:
+    """The provenance already at ``path``, or ``None`` — never raises.
+
+    [VANTA-WHY] :func:`stamp_provenance`'s ``previous`` is an optimisation and a
+    consistency check, not a dependency: a first bake, an unreadable file and a
+    file from a build that did not stamp at all all mean the same thing here —
+    there is nothing to preserve, so the layer gets a fresh stamp.
+    """
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def write_deps(deps_dir: Path, deps: BugDeps) -> Path:
+    """Write one layer's provenance, stamped with its identity (M3 item U3).
+
+    [VANTA-WHY] The stamp is computed HERE rather than in :func:`deps_provenance`
+    because only this function can see the file the layer may already have — and
+    preserving ``baked_at`` across a re-bake is what keeps an unchanged layer's
+    identity (and so the suite cache's entries for it) stable. See
+    :func:`stamp_provenance`.
+    """
+
     deps_dir.mkdir(parents=True, exist_ok=True)
     path = deps_path(deps_dir, deps.checkpoint)
+    provenance = stamp_provenance(deps.provenance, previous=_read_provenance(path))
     path.write_text(
-        json.dumps(deps.provenance, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        json.dumps(provenance, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     return path
 
@@ -10761,6 +10869,496 @@ def record_pip_check(
         json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     return path
+
+
+# ---------------------------------------------------------------------------
+# giving the layers baked before U3 an identity (M3 item U3, `stamp-existing`)
+# ---------------------------------------------------------------------------
+STAMPED_EXISTING_KEY = "stamped_existing"
+"""The provenance key saying an identity came from ``stamp-existing``, not from a bake.
+
+[VANTA-WHY] M3 item U3 gave every layer baked *after* it an identity and left every layer
+baked before it with none, so ``suite._measure_suite`` answered ``off:unknown_checkpoint``
+for all of them and the whole suite cache was inert: every suite with a checkpoint was
+measured again, in every batch, forever. Re-baking was the only way to give those layers a
+stamp, and a re-bake re-derives an environment that is already correct, minutes at a time.
+
+The key is deliberately **inside** the digested material — :func:`provenance_digest`
+excludes only the two stamp keys themselves and :data:`PIP_CHECK_KEY` — and that is what
+keeps the two ways of getting an identity from colliding: :func:`write_deps` never writes
+this key, so a bake of a stamped layer digests different material, cannot preserve
+``baked_at``, and gives the layer a fresh identity. A stamped identity therefore describes
+only the layer that was stamped, which is the whole of "any future rebake still gets a new
+one".
+"""
+
+PREFLIGHT_SUFFIX = ".preflight.json"
+"""The bake's pin-classification files, which sit in ``deps/`` and are not layers.
+
+Skipped by name when the directory is walked, and never the target of a stamp: a
+``.preflight.json`` is what the *bake* predicted before a layer existed, it holds no
+``installs``, and it has no identity to fix.
+"""
+
+LAYER_VERIFY_TIMEOUT_SECS = 300
+"""One boot-verify's budget. The marker probe uses the same 300 s (§3.2)."""
+
+VERIFY_MARKER_OK = "VANTA-VERIFY-MARKER-OK"
+"""Printed by :func:`boot_layer_probe` when the layer carries its ``touch`` marker."""
+
+VERIFY_MARKER_MISSING = "VANTA-VERIFY-MARKER-MISSING"
+"""Printed when it does not — the layer would have been deleted by its own bake."""
+
+VERIFY_NO_PYTHON = "VANTA-VERIFY-NO-PYTHON"
+"""Printed when the layer has no ``python`` on ``PATH``, so there is nothing to query."""
+
+VERIFY_INTERPRETER = "VANTA-VERIFY-INTERPRETER"
+VERIFY_VERSION = "VANTA-VERIFY-VERSION"
+"""The boot's own reading of the interpreter it queried: its path, then its version.
+
+Recorded rather than assumed because the table has to show which interpreter a layer was
+verified through, and "``python`` is the 3.8 venv wrapper in every layer" is exactly the
+assumption this step exists not to make (the base image's ``python3`` is a different
+Python entirely).
+"""
+
+VERIFY_LISTING_BEGIN = "VANTA-VERIFY-LISTING-BEGIN"
+VERIFY_LISTING_END = "VANTA-VERIFY-LISTING-END"
+VERIFY_LISTING_FAILED = "VANTA-VERIFY-LISTING-FAILED"
+"""The envelope around the distributions the layer's interpreter can see.
+
+[VANTA-WHY] M3 item U3 — an envelope rather than a bare listing, because the ways of
+failing to *read* an environment (no interpreter, a listing that exits non-zero, a listing
+that prints nothing) have to stay distinguishable from an environment that really is
+missing a pin. Without the sentinels each of them reads as "every recorded package is not
+installed", which is the one verdict this step must not reach: it refuses a layer that is
+fine, and it reports drift about an environment nothing managed to look at.
+"""
+
+LAYER_INTERPRETER = "python"
+"""The interpreter the verify queries — the one every split's ``test_cmd[0]`` names.
+
+[VANTA-WHY] A suite runs ``python -m pytest`` with the tree as the guest's working
+directory (``suite.run_suite_twice`` over ``split.test_cmd``), so the environment a
+measurement happens in is the one bare ``python`` resolves to. Querying any other
+interpreter would verify an environment the suite is never run in — and ``python3`` in
+particular is the *base image's*, not the layer's venv wrapper.
+"""
+
+ENV_UNREADABLE = "verify could not read the environment"
+"""The one reason a boot that could not be read refuses with.
+
+Deliberately not a mismatch sentence: a reader has to be able to tell "the layer drifted"
+from "the verify did not manage to look", because the two want different responses — a
+re-bake, versus a look at the probe.
+"""
+
+LIST_ENV_CODE = (
+    "import importlib.metadata as m; "
+    "[print(f\"{d.metadata.get('Name')}=={d.version}\") "
+    "for d in m.distributions() if d.metadata.get('Name')]"
+)
+"""The listing the layer's own interpreter is asked for: what it can see installed.
+
+[VANTA-WHY] ``importlib.metadata`` and not ``pip freeze``, measured on the layers
+themselves. pip's listing commands skip any distribution whose name is a standard-library
+module — ``pip._internal.commands.list`` does ``skip = set(stdlib_pkgs)`` — so
+``argparse==1.3.0``, which ``luigi/1`` and ``luigi/2`` really carry (``pip show argparse``
+reports 1.3.0 and ``importlib.metadata`` reports ``('argparse', '1.3.0')``), is absent
+from ``pip freeze``, from ``pip freeze --all`` *and* from ``pip list --format=freeze``.
+Plain ``pip freeze`` additionally hides ``pip``/``setuptools``/``distribute``/``wheel``
+unless ``--all`` is given, which is how ``pandas/1``'s recorded ``setuptools==46.4.0``
+came back as "not installed". Both are pip's own filters and not facts about the layer,
+and comparing recorded pins against a listing that cannot show them refuses healthy
+layers. ``importlib.metadata`` is the interpreter's own answer, with no pip in the way.
+"""
+
+
+def was_stamped_existing(provenance: Mapping[str, Any]) -> bool:
+    """Whether a layer's identity came from ``stamp-existing`` rather than from a bake."""
+    return bool(provenance.get(STAMPED_EXISTING_KEY))
+
+
+def layer_deps_files(deps_dir: Path) -> list[Path]:
+    """The deps files that describe a baked layer, in name order.
+
+    ``*.preflight.json`` is skipped (:data:`PREFLIGHT_SUFFIX`): it is the bake's own
+    record of what it predicted, written before a layer existed and holding no
+    ``installs``, so it is not a layer and has no identity. What is left is one
+    provenance file per layer.
+    """
+    return sorted(
+        path
+        for path in deps_dir.glob("*.json")
+        if not path.name.endswith(PREFLIGHT_SUFFIX)
+    )
+
+
+def boot_layer_probe(checkpoint: str, *, disk_mb: int = BAKE_DISK_MB) -> ExecResult:
+    """Boot ``checkpoint`` once, read-only, and report its marker and its environment.
+
+    [VANTA-WHY] The layer's own truth — ``/opt/vanta-deps-ok`` and what its ``python``
+    can see installed — lives *inside* the checkpoint and cannot be read without booting
+    it, so a stamp that refuses to describe a layer that changed has to boot it. One
+    boot, three readings: the marker, the interpreter it queried, and that interpreter's
+    own listing, each echoed between sentinels so a single VM start answers all of them
+    and a layer that lost any one still says which.
+
+    [VANTA-WHY] **One** ``sh -c`` string, not an argv of several commands. The probe used
+    to pass ``["sh", "-c", A, "sh", "-c", B]``, which :func:`shuru.run` quotes with
+    ``shlex.join`` into ``sh -c A sh -c B`` — and POSIX ``sh -c`` takes ``$0,$1,$2`` from
+    the words after the script, so ``B`` was never executed at all. The marker printed and
+    the listing did not, which read downstream as an environment missing every recorded
+    pin (a *mismatch*) rather than as a probe that never looked. A single script removes
+    the failure mode instead of documenting it.
+
+    ``--disk-size`` is the disk the layer was *built* at (:data:`BAKE_DISK_MB`), so the
+    boot cannot be the thing that truncates it, and the mount is read-only with no host
+    writes: verifying a layer must not be able to change it. No ``--memory`` — reading an
+    environment needs no more than shuru's own default. The boot's start-up guard prints
+    on stderr (``DEV_SHM_GUARD``), so ``stdout`` carries only these readings.
+    """
+    interpreter = shlex.quote(LAYER_INTERPRETER)
+    script = "\n".join(
+        [
+            f"if test -f {MARKER}; then echo {VERIFY_MARKER_OK}; "
+            f"else echo {VERIFY_MARKER_MISSING}; fi",
+            f"if command -v {interpreter} >/dev/null 2>&1; then",
+            f"  echo {VERIFY_INTERPRETER} \"$(command -v {interpreter})\"",
+            f"  echo {VERIFY_VERSION} \"$({interpreter} -V 2>&1)\"",
+            f"  echo {VERIFY_LISTING_BEGIN}",
+            f"  if {interpreter} -c {shlex.quote(LIST_ENV_CODE)}; then "
+            f"echo {VERIFY_LISTING_END}; else echo {VERIFY_LISTING_FAILED}; fi",
+            "else",
+            f"  echo {VERIFY_NO_PYTHON}",
+            "fi",
+        ]
+    )
+    return shuru_run(
+        checkpoint=checkpoint,
+        host_root=Path.cwd(),
+        command=["sh", "-c", script],
+        disk_mb=disk_mb,
+        timeout_secs=LAYER_VERIFY_TIMEOUT_SECS,
+        allow_host_writes=False,
+    )
+
+
+def freeze_versions(lines: Iterable[str]) -> dict[str, str]:
+    """``{canonical name: version}`` for the distributions a listing names.
+
+    Compared by canonical name because a listing spells a project per PEP 503 while a
+    pin keeps the spelling its own file used (:func:`unpinned_freeze`), so
+    ``PySnooper`` and ``pysnooper`` are the same distribution and
+    :func:`canonicalize_name` is what makes them so.
+    """
+    out: dict[str, str] = {}
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith(("-", "#")):
+            continue
+        name = line.partition("==")[0].partition(" @ ")[0].strip()
+        if not name:
+            continue
+        out[canonicalize_name(name)] = line.partition("==")[2].strip()
+    return out
+
+
+@dataclass(frozen=True)
+class LayerVerify:
+    """What one boot-verify read from a layer, and whether it matches its record.
+
+    ``ok`` is whether the layer's environment matches the pins its provenance records;
+    ``detail`` is the sentence a refusal prints. ``interpreter`` and ``version`` are what
+    the boot reported querying — recorded even on a refusal, so the table shows what was
+    looked at rather than leaving the reader to guess which ``python`` answered.
+    """
+
+    ok: bool
+    detail: str
+    interpreter: str = ""
+    version: str = ""
+
+
+def _sentinel_value(lines: Sequence[str], prefix: str) -> str:
+    """The value after ``prefix`` on the first line that carries it, else ``""``."""
+    for line in lines:
+        if line.startswith(prefix + " "):
+            return line[len(prefix) + 1:].strip()
+    return ""
+
+
+def compare_layer(result: ExecResult, *, installs: Sequence[str]) -> LayerVerify:
+    """Whether a boot-verify's readings match the layer's recorded installs.
+
+    [VANTA-WHY] M3 item U3 — a failure to *read* the environment and a layer that is
+    genuinely missing a pin are different verdicts, and this function is where they are
+    kept apart. Every reading comes from a sentinel the probe printed (:data:`VERIFY_NO_PYTHON`,
+    :data:`VERIFY_LISTING_FAILED`, an empty listing) precisely so that "could not look"
+    returns :data:`ENV_UNREADABLE` rather than the "the layer no longer matches its
+    recorded provenance" sentence, which is a claim about the layer. A reader has to be
+    able to tell a re-bake from a look at the probe, and only the reason distinguishes
+    them. Names are compared per :func:`canonicalize_name`, so a PEP 503 spelling in the
+    listing matches the pin's own spelling (:func:`freeze_versions`).
+    """
+    if not result.ok:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the boot failed: exit={result.exit_code}"
+            + (" (timeout)" if result.timed_out else "")
+            + f"; stderr: {result.stderr.strip()[-400:] or '(empty)'}",
+        )
+    lines = [line.strip() for line in result.stdout.splitlines()]
+    if VERIFY_MARKER_MISSING in lines:
+        return LayerVerify(False, f"the layer has no marker {MARKER}")
+    if VERIFY_MARKER_OK not in lines:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the boot reported neither the marker nor its absence; "
+            f"stdout: {result.stdout.strip()[-400:] or '(empty)'}",
+        )
+    interpreter = _sentinel_value(lines, VERIFY_INTERPRETER)
+    version = _sentinel_value(lines, VERIFY_VERSION)
+    if VERIFY_NO_PYTHON in lines or not interpreter:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the layer has no {LAYER_INTERPRETER} on PATH",
+            interpreter,
+            version,
+        )
+    if VERIFY_LISTING_FAILED in lines:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the listing exited non-zero",
+            interpreter,
+            version,
+        )
+    try:
+        begin = lines.index(VERIFY_LISTING_BEGIN)
+        end = lines.index(VERIFY_LISTING_END)
+    except ValueError:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the listing did not complete",
+            interpreter,
+            version,
+        )
+    listing = [line for line in lines[begin + 1:end] if line]
+    if not listing:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the listing was empty",
+            interpreter,
+            version,
+        )
+    malformed = [line for line in listing if "==" not in line]
+    if malformed:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the listing could not be parsed: "
+            f"{malformed[0][:80]}",
+            interpreter,
+            version,
+        )
+    frozen = freeze_versions(listing)
+    differed: list[str] = []
+    for pin in installs:
+        name, _, pin_version = pin.partition("==")
+        held = frozen.get(canonicalize_name(name.strip()))
+        if held is None:
+            differed.append(f"{pin} is not installed")
+        elif pin_version and held != pin_version:
+            differed.append(f"{pin} is installed at {name.strip()}=={held}")
+    if differed:
+        return LayerVerify(
+            False,
+            "the layer no longer matches its recorded provenance: "
+            + "; ".join(differed),
+            interpreter,
+            version,
+        )
+    return LayerVerify(
+        True,
+        f"{interpreter} ({version}); marker present; "
+        f"{len(installs)} recorded pin(s) at their recorded version",
+        interpreter,
+        version,
+    )
+
+
+@dataclass(frozen=True)
+class StampOutcome:
+    """What ``stamp-existing`` did to one deps file, and why.
+
+    One record per file in the directory, in walk order, so the command's table is the
+    whole story and a reader can see a layer that was skipped or refused rather than
+    finding it simply absent.
+    """
+
+    checkpoint: str
+    project: str
+    action: str
+    """``stamped``, ``already``, ``missing``, ``not a layer's provenance`` or ``refused``.
+
+    ``missing`` is separate from ``refused`` deliberately: a deps file whose checkpoint no
+    longer exists is not a *failure* of this step — there is no layer to mismatch — and
+    treating it as one would make the command exit non-zero over nothing it can act on.
+    """
+
+    origin: str
+    """``baked`` or ``stamped`` for a layer that has an identity, else ``—``."""
+
+    checkpoint_id: str
+    digest: str
+    verify: str
+    interpreter: str = ""
+    python_version: str = ""
+    """The interpreter the verify queried and the version it reported, when it booted one.
+
+    Empty for a layer this run did not boot (``already``, ``missing``), because the table
+    must show what was actually read and not imply a check that never ran.
+    """
+
+
+def unstamped_deps(deps_dir: Path, checkpoints: Sequence[str]) -> list[str]:
+    """The named layers whose provenance carries no identity, sorted.
+
+    [VANTA-WHY] ``prepare`` reports this rather than fixing it. A layer with a
+    provenance file and no ``checkpoint_id`` is a layer the suite cache cannot key on, so
+    every run of it measures instead of reusing — and the fix (a boot-verify and a stamp)
+    is deliberately *not* something ``prepare`` may do for itself, because a stamp applied
+    to a layer that changed would hand it an identity it no longer deserves. Naming the
+    layers and the command that fixes them is what keeps this from being silent.
+
+    A layer with no provenance at all is not listed: it has no record to stamp, and
+    ``prepare`` refuses it separately through :func:`missing_deps`.
+    """
+    out: list[str] = []
+    for name in checkpoints:
+        try:
+            data = json.loads(
+                deps_path(deps_dir, name).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict) or "installs" not in data:
+            continue
+        identity = data.get(CHECKPOINT_ID_KEY)
+        if not (isinstance(identity, str) and identity):
+            out.append(name)
+    return sorted(out)
+
+
+def stamp_existing(
+    deps_dir: Path,
+    *,
+    disk_mb: int = BAKE_DISK_MB,
+    interpreters: Optional[Mapping[str, str]] = None,
+) -> list[StampOutcome]:
+    """Give every unstamped layer an identity, without re-baking it (M3 item U3).
+
+    [VANTA-WHY] The layers this fixes were baked before the identity existed, so their
+    provenance has no ``checkpoint_id`` and the suite cache reads ``off:unknown_checkpoint``
+    for each of them. A re-bake would fix that and also re-derive the layer, which is
+    minutes per layer and changes nothing about the environment. This writes the identity
+    where :func:`write_deps` writes it, in the same shape, so from here on a layer's
+    identity is fixed — and a *later* re-bake of it still gets a fresh one, because this
+    run records :data:`STAMPED_EXISTING_KEY` and a bake never does.
+
+    The stamp is computed over the layer's provenance with that marker in it, through the
+    same :func:`stamp_provenance`, so ``checkpoint_id`` is
+    ``sha256("<baked_at>\\x00<digest>")`` exactly as a bake's is — and ``digest`` is the
+    digest of what the file now holds.
+
+    Refuses a layer whose boot-verify (:func:`compare_layer`) disagrees with its recorded
+    installs, and keeps going: one layer that changed is that layer's problem, and the
+    others still deserve an identity. A refused layer is left byte-for-byte as it was, so
+    ``prepare`` keeps warning about it and its cache stays off.
+
+    ``interpreters`` maps a project to the interpreter its suite runs
+    (``test_cmd[0]``). When given, a layer whose project's interpreter is not
+    :data:`LAYER_INTERPRETER` — or whose project is absent from the map — is refused
+    rather than verified through an interpreter the suite may never use. ``None`` skips
+    the guard, which is how the tests exercise the boot-verify in isolation.
+    """
+    outcomes: list[StampOutcome] = []
+    for path in layer_deps_files(deps_dir):
+        checkpoint = path.stem
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            outcomes.append(
+                StampOutcome(
+                    checkpoint, "", "not a layer's provenance", "—", "", "",
+                    f"unreadable: {exc}",
+                )
+            )
+            continue
+        if not isinstance(data, dict) or "installs" not in data:
+            outcomes.append(
+                StampOutcome(
+                    checkpoint, "", "not a layer's provenance", "—", "", "",
+                    "no installs key: this is not dependency provenance",
+                )
+            )
+            continue
+        project = str(data.get("project") or "")
+        existing = data.get(CHECKPOINT_ID_KEY)
+        if isinstance(existing, str) and existing:
+            outcomes.append(
+                StampOutcome(
+                    checkpoint, project, "already",
+                    "stamped" if was_stamped_existing(data) else "baked",
+                    existing, provenance_digest(data),
+                    "identity already recorded; left untouched",
+                )
+            )
+            continue
+        if not layer_exists(checkpoint):
+            outcomes.append(
+                StampOutcome(
+                    checkpoint, project, "missing", "—", "", "",
+                    f"no checkpoint named {checkpoint}",
+                )
+            )
+            continue
+        if interpreters is not None:
+            expected = interpreters.get(project)
+            if expected != LAYER_INTERPRETER:
+                recorded = f"``{expected}``" if expected else "nothing"
+                outcomes.append(
+                    StampOutcome(
+                        checkpoint, project, "refused", "—", "", "",
+                        "cannot verify through the interpreter the suite runs: the split "
+                        f"records {recorded} for {project or '(no project)'}, and this "
+                        f"step queries only ``{LAYER_INTERPRETER}`` rather than guessing",
+                    )
+                )
+                continue
+        result = boot_layer_probe(checkpoint, disk_mb=disk_mb)
+        verify = compare_layer(result, installs=tuple(data.get("installs") or ()))
+        if not verify.ok:
+            outcomes.append(
+                StampOutcome(
+                    checkpoint, project, "refused", "—", "", "", verify.detail,
+                    verify.interpreter, verify.version,
+                )
+            )
+            continue
+        stamped = dict(data)
+        stamped[STAMPED_EXISTING_KEY] = True
+        stamped = stamp_provenance(stamped, previous=None)
+        path.write_text(
+            json.dumps(stamped, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        outcomes.append(
+            StampOutcome(
+                checkpoint, project, "stamped", "stamped",
+                stamped[CHECKPOINT_ID_KEY], provenance_digest(stamped), verify.detail,
+                verify.interpreter, verify.version,
+            )
+        )
+    return outcomes
 
 
 def layer_pin(deps: Mapping[str, Any], name: str) -> Optional[str]:

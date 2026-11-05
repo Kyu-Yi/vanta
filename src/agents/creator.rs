@@ -307,14 +307,28 @@ pub async fn creator_generate_patch(
 // If no ===FILE: markers are present, the whole patch_text is treated as a
 // single-file patch and returned under the first entry in files_touched (or
 // "source.txt" if files_touched is empty).
+//
+// [VANTA-WHY] Q1 — a marker line is recognised at ANY indentation, because the
+// Creator prompt itself shows the markers FOUR SPACE indented (see
+// `CREATOR_SYSTEM_PROMPT`). Matching them only at column 0 (the old
+// `strip_prefix`) turned an indented multi-block patch into either "patch
+// changed nothing" (every marker indented -> an empty map) or, worse, a SILENTLY
+// WRONG patch (the first marker written at column 0 and later ones indented, so
+// the later files' bodies were appended onto the first file's block). The count
+// of markers that needed trimming is returned alongside the map and rides the
+// run's record; the file CONTENT is still taken verbatim, because only the
+// marker line is a marker.
 // ============================================================================
 pub fn split_multi_file_patch(
     patch_text: &str,
     files_touched: &[String],
-) -> std::collections::HashMap<String, String> {
+) -> (std::collections::HashMap<String, String>, u32) {
     use std::collections::HashMap;
 
     let mut result = HashMap::new();
+    // How many marker lines carried leading whitespace and had to be trimmed to
+    // be recognised. Zero means every marker was already at column 0.
+    let mut markers_trimmed: u32 = 0;
 
     // Check for multi-file markers
     if patch_text.contains("===FILE:") {
@@ -322,7 +336,11 @@ pub fn split_multi_file_patch(
         let mut current_content = String::new();
 
         for line in patch_text.lines() {
-            if let Some(rest) = line.strip_prefix("===FILE:") {
+            let trimmed_line = line.trim_start();
+            if let Some(rest) = trimmed_line.strip_prefix("===FILE:") {
+                if trimmed_line.len() != line.len() {
+                    markers_trimmed += 1;
+                }
                 // Save previous file
                 if let Some(p) = current_path.take() {
                     result.insert(p, current_content.trim_end().to_string());
@@ -330,6 +348,7 @@ pub fn split_multi_file_patch(
                 }
                 current_path = Some(rest.trim_end_matches("===").trim().to_string());
             } else if current_path.is_some() {
+                // Content is the line as emitted — never trimmed.
                 current_content.push_str(line);
                 current_content.push('\n');
             }
@@ -344,7 +363,7 @@ pub fn split_multi_file_patch(
         result.insert(path, patch_text.to_string());
     }
 
-    result
+    (result, markers_trimmed)
 }
 
 /// Parse a standard git diff (with `diff --git a/x b/y`, `--- a/x`, `+++ b/y`
@@ -423,21 +442,61 @@ mod tests {
     fn test_split_single_file() {
         let patch = "def add(a, b):\n    return a + b\n";
         let files = vec!["cart.py".to_string()];
-        let result = split_multi_file_patch(patch, &files);
+        let (result, trimmed) = split_multi_file_patch(patch, &files);
         assert_eq!(result.len(), 1);
         assert!(result.contains_key("cart.py"));
+        assert_eq!(trimmed, 0);
     }
 
     #[test]
     fn test_split_multi_file() {
         let patch = "===FILE: a.py===\ndef a(): pass\n===FILE: b.py===\ndef b(): pass\n";
         let files = vec!["a.py".to_string(), "b.py".to_string()];
-        let result = split_multi_file_patch(patch, &files);
+        let (result, trimmed) = split_multi_file_patch(patch, &files);
         assert_eq!(result.len(), 2);
         assert!(result.contains_key("a.py"));
         assert!(result.contains_key("b.py"));
         assert!(result["a.py"].contains("def a()"));
         assert!(result["b.py"].contains("def b()"));
+        assert_eq!(trimmed, 0, "column-0 markers need no trimming");
+    }
+
+    /// [VANTA-WHY] Q1 — the Creator prompt shows the `===FILE:` markers FOUR
+    /// SPACE indented, so a patch that copies the prompt's shape must split into
+    /// its files exactly as a column-0 patch does. Before this fix the indented
+    /// markers were not recognised: every marker indented produced an EMPTY map
+    /// ("patch changed nothing"), and a first marker at column 0 with later ones
+    /// indented produced a silently wrong patch.
+    #[test]
+    fn an_indented_marker_from_the_prompt_still_splits_the_patch() {
+        // The exact shape `CREATOR_SYSTEM_PROMPT` documents, four spaces deep.
+        let patch = "    ===FILE: a.py===\n    def a(): pass\n    ===FILE: b.py===\n    def b(): pass\n";
+        let files = vec!["a.py".to_string(), "b.py".to_string()];
+        let (result, trimmed) = split_multi_file_patch(patch, &files);
+        assert_eq!(result.len(), 2, "both indented markers must be recognised");
+        assert!(result.contains_key("a.py"));
+        assert!(result.contains_key("b.py"));
+        assert!(result["a.py"].contains("def a()"));
+        assert!(result["b.py"].contains("def b()"));
+        assert_eq!(trimmed, 2, "both markers needed trimming");
+    }
+
+    /// A first marker at column 0 and a later one indented must NOT merge the
+    /// later file's body onto the first — the silently-wrong-patch shape.
+    #[test]
+    fn a_later_indented_marker_does_not_merge_into_the_first_block() {
+        let patch = "===FILE: a.py===\ndef a(): pass\n  ===FILE: b.py===\ndef b(): pass\n";
+        let files = vec!["a.py".to_string(), "b.py".to_string()];
+        let (result, trimmed) = split_multi_file_patch(patch, &files);
+        assert_eq!(result.len(), 2, "the indented second marker must still split");
+        assert!(result.contains_key("a.py"));
+        assert!(result.contains_key("b.py"));
+        assert!(
+            !result["a.py"].contains("def b()"),
+            "b.py's body must not be folded into a.py: {:?}",
+            result["a.py"]
+        );
+        assert_eq!(trimmed, 1, "only the one indented marker needed trimming");
     }
 
     /// [VANTA-WHY] M3 item 9 fold-in — the prompt the driver hashes must be the

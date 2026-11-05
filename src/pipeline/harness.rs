@@ -18,11 +18,14 @@ use std::process::Stdio;
 use std::sync::RwLock;
 
 use futures::future::join_all;
+use serde::{Deserialize, Serialize};
 
 use crate::agents::attacker::GeneratedTest;
 use crate::agents::creator::SourceFile;
 use crate::core::TestResult;
 use crate::pipeline::candidate::TestCommand;
+use crate::pipeline::safe_path::confined_join;
+use crate::pipeline::suite_cache;
 use crate::sandbox::{Backend, ExecutionResult};
 
 // ============================================================================
@@ -245,6 +248,14 @@ pub async fn run_single_test_with_timeout(
 // [VANTA-WHY] Per-test IDs, not one aggregate verdict: "pass on original, fail
 // on patch" is a regression; "already failing on original" is not (the patch
 // did not break it). A single pass/fail bit cannot express that difference.
+//
+// [VANTA-WHY] M3 item S1 — the serde derives are what let this whole report be
+// stored and served by `suite_cache`: a native run is a pure function of its
+// key, so the report that came out of it IS the cached value. Hand-rolling the
+// payload would be a second shape that could drift from the struct (a field
+// added here and forgotten there would be silently absent from every cached
+// report); deriving it means the compiler keeps the two the same.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeSuiteReport {
     /// nodeid → outcome. Empty when the suite could not be run at all.
     pub tests: Vec<(String, TestResult)>,
@@ -302,6 +313,11 @@ pub struct NativeSuiteReport {
 /// `ImportError while importing test module …` text. Naming it here is what
 /// turns "0 tests" from a dead end into a pointer at the module that broke the
 /// session, without a second sandbox boot.
+///
+/// [VANTA-WHY] M3 item S1 — derived for the same reason as `NativeSuiteReport`:
+/// an in-session run's collection census rides the cached report, so the two
+/// types have to be storable together.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CollectionFailure {
     /// Collectors whose `outcome` is neither `passed` nor `skipped`: a module
     /// that failed to import, or any future outcome this reader does not
@@ -507,6 +523,90 @@ pub async fn run_native_suite(
     };
     sb.destroy();
     report
+}
+
+/// [`run_native_suite`] behind the content-keyed cache (M3 item S1).
+///
+/// [VANTA-WHY] The in-session native gate runs the SAME bytes twice per attempt —
+/// `native_original` against `native_patched` — and `native_original` is a
+/// function of the BUG alone, yet a Phase-3 arm-and-seed grid re-measured it once
+/// per arm, per seed, per attempt and per review round. `origin` names who asked
+/// (the session, attempt and side), so a served entry can be traced back to the
+/// row that produced it, which is what makes the reuse auditable rather than
+/// merely fast.
+///
+/// Four rules, in the order they matter:
+///
+///   * **A key is the input, so a hit is the same experiment.** The key carries
+///     the tree, the command, the env, the checkpoint and the WALL-CLOCK CAP
+///     (a run's timeout is a function of the cap, so a cap left out of the key
+///     would let one arm's kill be inherited as a fact about the tree), and the
+///     sandbox kind that ACTUALLY ran (M3 item U4): `auto` resolves through the
+///     shuru boot test, so the same request is two experiments on two machines,
+///     and a subprocess suite must never answer a shuru run.
+///   * **A bad entry is never used.** `plan_native_suite` already refuses a
+///     mismatched file; a payload that THIS build cannot decode is refused here
+///     too, and the fresh run overwrites it.
+///   * **An unmeasured run is never cached.** A report with `ran: false` or
+///     `timed_out: true` measured nothing, so it is neither written here nor
+///     served by `plan_native_suite` (M3 item U1) — a cached emptiness would
+///     read as "no regressions" forever.
+///   * **A dirty build is not cached at all.** See `suite_cache`'s module note:
+///     `VANTA_BUILD_COMMIT` cannot separate two development builds of one commit,
+///     so reuse is off and the reason lands on the row. An UNIDENTIFIED layer
+///     (M3 item U3, no `VANTA_SHURU_CHECKPOINT_ID`) is off for the same shape of
+///     reason: a name a re-bake reuses is not an identity, so `plan.write` is
+///     false and the row says `off:unknown_checkpoint`.
+pub async fn run_native_suite_cached(
+    source: &str,
+    test_cmd: &TestCommand,
+    timeout_secs: Option<u64>,
+    backend: &str,
+    origin: &str,
+) -> (NativeSuiteReport, suite_cache::CacheNote) {
+    let cap = timeout_secs.unwrap_or_else(test_timeout_secs);
+    let key = suite_cache::native_key(source, test_cmd, cap, backend);
+    let plan = suite_cache::plan_native_suite(&key);
+    let mut note = plan.note.clone();
+    if let Some(payload) = &plan.reuse {
+        match serde_json::from_value::<NativeSuiteReport>(payload.clone()) {
+            Ok(report) => return (report, note),
+            // The entry is intact by `suite_cache`'s rules but this build cannot
+            // read it: a corrupt-for-us entry. Run fresh and overwrite it.
+            Err(_) => {
+                note.state = "unreadable".to_string();
+                note.would_hit = true;
+            }
+        }
+    }
+    let report = run_native_suite(source, test_cmd, Some(cap)).await;
+    // [VANTA-WHY] M3 item U1 — ONLY A MEASUREMENT IS CACHED. `not_run`,
+    // `failed_run` and `timed_out_run` all carry `ran: false`, and one of them
+    // inside the cache is served forever after as an empty suite, which
+    // `native_gate_vacuous` then reads as "the patch broke nothing". The write
+    // is therefore gated on the run having actually happened, not merely on the
+    // entry's absence. A plain miss writes the entry and a corrupt-for-us one is
+    // repaired; a `--no-cache` call replaces the entry it could not use, which is
+    // what `DISABLE_ENV` and the flag's own help promise (M3 item U2). A dirty
+    // build still writes nothing — `plan.write` stays false for it, because its
+    // key is not trusted to describe the binary that ran.
+    let measured = report_is_measured(&report);
+    if measured && (plan.write || note.state == "unreadable") {
+        if let Ok(payload) = serde_json::to_value(&report) {
+            let _ = suite_cache::write_entry(&key.hex, &key.material, &payload, origin);
+        }
+    }
+    (report, note)
+}
+
+/// Is this report a MEASUREMENT, i.e. may it be written to the suite cache?
+///
+/// [VANTA-WHY] M3 item U1. Pure over the report so the rule can be tested
+/// without a sandbox: the write gate is the only thing standing between a
+/// transient failure (no backend, a killed run) and an entry that would answer
+/// every future lookup with an empty suite.
+fn report_is_measured(report: &NativeSuiteReport) -> bool {
+    report.ran && !report.timed_out
 }
 
 /// Parse a pytest JSON report into per-test outcomes.
@@ -1083,7 +1183,12 @@ pub fn write_source_files(
     source_concat: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for (path, content) in parse_source_files(source_concat)? {
-        let out = root.join(&path);
+        // [VANTA-WHY] T1 — the `# FILE:` header carries a path the patch chose
+        // (via the apply's own map), and `root.join(path)` is a WRITE. Confine
+        // it: an absolute or escaping path cannot reach here through the apply,
+        // but the concatenation is also read back from a snapshot on the rerun
+        // path, so this is the lock on the tree the tests actually run in.
+        let out = confined_join(root, &path)?;
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1108,7 +1213,11 @@ pub fn write_tree_snapshot(
 
     let file_count = files.len();
     for (path, content) in &files {
-        let out = snapshot_root.join(path);
+        // [VANTA-WHY] T1 — CodeRabbit's flagged writer: `snapshot_root.join(path)`
+        // took the path from the concatenation verbatim and wrote it on the host.
+        // Confined like every other write; the root is created just above, so the
+        // containment check can resolve it.
+        let out = confined_join(snapshot_root, path)?;
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -2445,11 +2554,12 @@ mod tests {
         native_outcome, native_regressions, native_results_index, native_suite_collapsed,
         native_tree_with_original_tests,
         native_vacuous_reason, new_diagnostics, parse_mypy_line, parse_native_report,
-        parse_pytest_report_detailed, parse_ruff_line, project_package, prune_keeps, report_tests,
+        parse_pytest_report_detailed, parse_ruff_line, project_package, prune_keeps,
+        report_is_measured, report_tests,
         ruff_is_error_class, run_single_test, run_tests_parallel, seed_and_write,
         seed_and_write_from, seed_method, seed_root, seed_sandbox_from, seed_source_and_conftest,
         set_seed_root,
-        static_tool_runner, write_source_files,
+        static_tool_runner, write_source_files, write_tree_snapshot,
     };
     use crate::agents::attacker::GeneratedTest;
     use crate::core::{TestIntent, TestResult};
@@ -2503,8 +2613,153 @@ mod tests {
         );
     }
 
+    // ---- M3 item T1: a write site may not leave the tree root ----------------
+
+    /// [VANTA-WHY] M3 item T1. The `# FILE:` header carries a path the patch
+    /// chose, and `write_source_files` writes it on the host. A `..` component
+    /// must be refused as `unsafe_path`, and NOTHING may appear next to the tree.
+    #[test]
+    fn write_source_files_refuses_a_parent_escape_and_writes_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+
+        let err = write_source_files(&root, "# FILE: ../escape.py\nevil = True\n")
+            .expect_err("a parent escape must be refused");
+
+        assert!(err.to_string().starts_with("unsafe_path"), "got: {err}");
+        assert!(
+            !base.path().join("escape.py").exists(),
+            "nothing may be written outside the tree root"
+        );
+        assert!(
+            root.read_dir().unwrap().next().is_none(),
+            "nothing at all is written when the patch is refused"
+        );
+    }
+
+    /// [VANTA-WHY] M3 item T1 — the same rule for an absolute path.
+    #[test]
+    fn write_source_files_refuses_an_absolute_path_and_writes_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let outside = base.path().join("outside.py");
+        let source = format!("# FILE: {}\nevil = True\n", outside.display());
+
+        let err = write_source_files(&root, &source).expect_err("an absolute path must be refused");
+
+        assert!(err.to_string().starts_with("unsafe_path"), "got: {err}");
+        assert!(
+            !outside.exists(),
+            "nothing may be written outside the tree root"
+        );
+    }
+
+    /// [VANTA-WHY] M3 item T1. A path that stays lexically inside the root but
+    /// RESOLVES — through a symlink that already exists on disk — to somewhere
+    /// outside must be refused, and the file it would have written must not
+    /// exist. Only a resolve-then-contains check can catch this: every lexical
+    /// check passes, because `link/evil.py` has no `..` and is not absolute.
+    #[test]
+    fn write_source_files_refuses_a_symlink_escape_and_writes_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        let err = write_source_files(&root, "# FILE: link/evil.py\nevil = True\n")
+            .expect_err("a symlink escape must be refused");
+
+        assert!(err.to_string().starts_with("unsafe_path"), "got: {err}");
+        assert!(
+            !outside.join("evil.py").exists(),
+            "nothing may be written through an escaping symlink"
+        );
+    }
+
+    /// [VANTA-WHY] M3 item T1 — the writer CodeRabbit flagged. The snapshot
+    /// writer must refuse an absolute path exactly as `write_source_files` does,
+    /// and write no manifest or file for it.
+    #[test]
+    fn write_tree_snapshot_refuses_an_absolute_path_and_writes_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("snap");
+        let outside = base.path().join("outside.py");
+        let source = format!("# FILE: {}\nevil = True\n", outside.display());
+
+        let err =
+            write_tree_snapshot(&root, &source).expect_err("an absolute path must be refused");
+
+        assert!(err.to_string().starts_with("unsafe_path"), "got: {err}");
+        assert!(
+            !outside.exists(),
+            "nothing may be written outside the tree root"
+        );
+    }
+
+    /// W1 — the three `#[tokio::test]`s below run real pytest through the
+    /// harness's own sandbox, so they need a working backend. They exercise the
+    /// harness's test-running SEMANTICS (report parsing, the generated-test
+    /// command, the repo-`addopts` neutralisation), not the sandbox boundary, and
+    /// in the base environment (no `VANTA_SANDBOX_BACKEND`) `auto` used to degrade
+    /// to the host silently — which is exactly the fallback W1 removes: an `auto`
+    /// run with no bootable shuru now REFUSES. So these tests ask for the host
+    /// backend BY NAME for the duration of the test and restore the caller's value
+    /// on `drop` (a panicking assert included), so no later test can inherit a
+    /// backend the test did not ask for and none passes by silently changing
+    /// backend.
+    ///
+    /// M3 item X4 — that guard also holds the crate-wide `test_env` lock, because
+    /// these tests spawn real pytest subprocesses that inherit the whole
+    /// environment: for as long as the guard is alive no sibling test can write
+    /// the environment the subprocess is about to read.
+    struct ExplicitHostBackend {
+        previous: Option<std::ffi::OsString>,
+        // M3 item X4 — the crate-wide environment lock, held for the guard's whole
+        // life so the forced backend, the environment every spawned pytest
+        // inherits and the restore on drop all happen while no other test can
+        // write the environment. Never read: it is the proof the test owns it.
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl ExplicitHostBackend {
+        fn enter() -> Self {
+            let lock = crate::test_env::lock();
+            let previous = std::env::var_os("VANTA_SANDBOX_BACKEND");
+            // SAFETY: M3 item X4 — the `test_env` lock taken above is the crate's
+            // one token for writing the environment, so no other test can read or
+            // write it while this guard is alive, and the previous value is
+            // restored on drop (a panicking assert included).
+            unsafe {
+                std::env::set_var("VANTA_SANDBOX_BACKEND", "subprocess");
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ExplicitHostBackend {
+        fn drop(&mut self) {
+            // SAFETY: as `enter` — the `test_env` guard this struct holds is still
+            // alive here (fields drop after `Drop::drop` returns), so the restore
+            // is inside the same protected region.
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var("VANTA_SANDBOX_BACKEND", value),
+                    None => std::env::remove_var("VANTA_SANDBOX_BACKEND"),
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn baseline_and_patched_paths_match_on_identical_source() {
+        let _host = ExplicitHostBackend::enter();
         let source = "# FILE: calc.py\ndef add(a, b):\n    return a + b\n";
         let test_cmd = TestCommand::default();
         let tests = vec![
@@ -2540,6 +2795,7 @@ mod tests {
 
     #[tokio::test]
     async fn semantic_patch_reports_assertion_failures_not_static_errors() {
+        let _host = ExplicitHostBackend::enter();
         let patched_source = "# FILE: calc.py\ndef add(a, b):\n    return a - b\n";
         let test_cmd = TestCommand::default();
         let test = generated_test("test_behavior_preservation", "assert add(2, 3) == 5");
@@ -2566,6 +2822,7 @@ mod tests {
     // and pins that the generated-test command neutralizes it so the test is graded.
     #[tokio::test]
     async fn a_repo_conftest_only_addopts_does_not_stop_the_generated_test() {
+        let _host = ExplicitHostBackend::enter();
         let source = concat!(
             "# FILE: setup.cfg\n",
             "[tool:pytest]\n",
@@ -2677,6 +2934,26 @@ mod tests {
         assert!(
             index.get("absent::t").is_none(),
             "a nodeid the report does not list must not be invented"
+        );
+    }
+
+    /// M3 item U1 — only a MEASUREMENT may be cached. `not_run`, `failed_run`
+    /// and `timed_out_run` all describe a suite that said nothing, so writing one
+    /// would leave an entry that every later lookup serves as "no regressions".
+    #[test]
+    fn only_a_measurement_is_written_to_the_cache() {
+        assert!(!report_is_measured(&NativeSuiteReport::not_run()));
+        assert!(!report_is_measured(&NativeSuiteReport::failed_run(
+            Some(1),
+            "boom".to_string()
+        )));
+        assert!(!report_is_measured(&NativeSuiteReport::timed_out_run(
+            None,
+            "killed".to_string()
+        )));
+        assert!(
+            report_is_measured(&native_report(&[("a::t", TestResult::Passed)])),
+            "a report that parsed is a measurement"
         );
     }
 

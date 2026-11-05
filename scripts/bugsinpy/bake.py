@@ -970,7 +970,7 @@ than measured, and the assumption is wrong on this toolchain. ``<stdint.h>`` is 
 standard header — glibc's, with no ``namespace std`` block and no ``__cplusplus``
 guarded one — and C++'s ``std::uint16_t`` comes from libstdc++'s ``<cstdint>``, which
 is where ``c_compatibility``'s ``stdint.h`` wrapper is *not*. Measured on ``pandas/1``'s
-own dependency layer (``runs/bugsinpy/bake-logs/vanta-bi-pandas-1.log``): the ``.cxx``
+own dependency layer (``runs/bugsinpy/bake-logs/*/vanta-bi-pandas-1.log``): the ``.cxx``
 compile line carried this flag — ``g++ -Wno-unused-result
 … -Wno-error=declaration-missing-parameter-type -D_GNU_SOURCE -include stdint.h -fPIC
 -DPOCKETFFT_PTHREADS … -c scipy/fft/_pocketfft/pypocketfft.cxx`` — and the compile died
@@ -1069,7 +1069,7 @@ numpy's own C sources (:data:`_ERA_GNU_SOURCE`). ``CXXFLAGS`` is not an answer e
 ``customize_compiler`` never reads it (:data:`_ERA_STDINT_INCLUDE`). What is left is
 the one position that is *only* ever a C++ compile: the driver word itself, which is
 the whole of the difference between the ``gcc`` line and the ``g++`` line in one log
-(``runs/bugsinpy/bake-logs/vanta-bi-pandas-1.log``). Every C++ compile in the layer
+(``runs/bugsinpy/bake-logs/*/vanta-bi-pandas-1.log``). Every C++ compile in the layer
 comes from there — ``numpy.distutils``' ``CXX``, plain ``distutils``' recorded value —
 and no C compile reads it at all, so a file named by ``CXX`` that prepends the flag is
 the scoped injection the flag needs.
@@ -1136,7 +1136,7 @@ unsigned type", commit ``2a7bb4596f566a34fd53932af0ef53b956459d25``) — while t
 source declares its own view of that struct's field as ``char *tags;``
 (``ft2font.cpp:208`` and ``:326``) and fills it from the outline
 (``tags = outline.tags + first;``, ``:230`` and ``:346``). Measured on the layer
-(``runs/bugsinpy/bake-logs/vanta-bi-pandas-1.log``), the compile ended
+(``runs/bugsinpy/bake-logs/*/vanta-bi-pandas-1.log``), the compile ended
 
 ``src/ft2font.cpp:230:29: error: invalid conversion from 'unsigned char*' to 'char*'
 [-fpermissive]`` (and ``:346:29``, the same two lines) … ``error: command 'gcc' failed
@@ -12947,28 +12947,23 @@ def last_error_line(output: str) -> str:
     return "(no output)"
 
 
+def bake_logs_dir(root: Path, *, when: Optional[datetime] = None) -> Path:
+    """This bake's own log folder: ``<root>/bake-logs/<UTC stamp>`` (§8.6's log rule).
+
+    [VANTA-WHY] A folder per run rather than one shared folder emptied each time: the
+    run that just failed is the one whose log is worth reading, and a later bake must
+    not be able to delete it. The stamp is UTC seconds (``20261106T041530Z``) — sortable
+    and filesystem-safe, no ``:`` — so the folder a bake wrote to is also its position in
+    the sequence. ``when`` is the run's start; two runs started in the same second share
+    a folder, so the stamp names the run's start and is not the folder's identity.
+    """
+    moment = when if when is not None else datetime.now(timezone.utc)
+    return root / "bake-logs" / moment.strftime("%Y%m%dT%H%M%SZ")
+
+
 def bake_log_path(logs_dir: Path, name: str) -> Path:
     """Where one layer's full build log goes: ``<logs_dir>/<layer>.log``."""
     return logs_dir / f"{name}.log"
-
-
-def clear_bake_logs(logs_dir: Path) -> int:
-    """Empty the bake-logs directory, returning how many files it held.
-
-    [VANTA-WHY] Emptied rather than accumulated: the summary prints this directory as
-    *this* bake's logs, and a layer that is not in this run's plan must not be able to
-    leave a file there that reads as though this run wrote it. The directory is the
-    harness's own scratch output (``runs/bugsinpy/bake-logs``) and never a source of
-    truth — the layer's checkpoint and its deps JSON are — so nothing is lost by
-    replacing it per bake.
-    """
-    if not logs_dir.is_dir():
-        return 0
-    removed = 0
-    for path in logs_dir.glob("*.log"):
-        path.unlink()
-        removed += 1
-    return removed
 
 
 def write_bake_log(logs_dir: Path, name: str, result: ExecResult) -> Path:
@@ -13079,13 +13074,15 @@ def run_bake_actions(
     run, and what is being reported is this run.
 
     ``logs_dir`` is where each attempted layer's **whole** output is kept while the run
-    happens (:func:`write_bake_log`), emptied first (:func:`clear_bake_logs`) and
-    reported line by line through ``log``. It is what makes the one-line error in the
-    failure report enough: the line says what happened, the file holds the two hundred
-    lines above it. ``None`` writes nothing, which is what a structural test wants. A
-    layer the gate refused keeps that same file, with the verdict appended to the
-    output the install produced (:func:`_with_gate_verdict`) — the log of a refused
-    layer is the only place its ``pip check`` reading and its install are recorded.
+    happens (:func:`write_bake_log`) and reported line by line through ``log``. Nothing
+    in it is deleted: :func:`cmd_bake` hands each run its own folder
+    (:func:`bake_logs_dir`), so a log left by an earlier bake — or by a layer this run
+    does not build — stays readable. It is what makes the one-line error in the failure
+    report enough: the line says what happened, the file holds the two hundred lines
+    above it. ``None`` writes nothing, which is what a structural test wants. A layer the
+    gate refused keeps that same file, with the verdict appended to the output the
+    install produced (:func:`_with_gate_verdict`) — the log of a refused layer is the
+    only place its ``pip check`` reading and its install are recorded.
 
     ``own_pins`` and ``record`` are §3.2's own-pin gate. ``own_pins`` maps a layer's name
     to the canonical names it installs as **BugsInPy's own** pins
@@ -13170,7 +13167,6 @@ def run_bake_actions(
     tree_names = tree_provided or {}
     logs: dict[str, Path] = {}
     if logs_dir is not None:
-        clear_bake_logs(logs_dir)
         log(f"[logs] this bake's build logs: {logs_dir}")
 
     for action in delete_order(actions, children):

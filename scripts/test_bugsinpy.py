@@ -40,6 +40,7 @@ import zipfile
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -12128,7 +12129,9 @@ class TestRunBakeActions:
 
         Whole, not a tail, and written for a layer whether it succeeded or failed —
         the layers that failed are the ones whose logs are worth reading, and the last
-        bake's three failures left no log at all between them.
+        bake's three failures left no log at all between them. An unrelated log in the
+        folder is left where it is: §8.6 gives each run its own folder
+        (:func:`bake_logs_dir`), so nothing is deleted to keep this run's logs clear.
         """
         logs = tmp_path / "bake-logs"
         logs.mkdir()
@@ -12158,7 +12161,7 @@ class TestRunBakeActions:
             log=logged.append,
             logs_dir=logs,
         )
-        assert not stale.exists(), "this bake's logs, and only this bake's"
+        assert stale.exists(), "an earlier bake's log is never wiped"
         for name in (PY38, "vanta-bi-Demo-1"):
             path = bake_mod.bake_log_path(logs, name)
             assert path.exists(), name
@@ -12323,12 +12326,15 @@ class TestBakeLogProvenance:
         # Shuru's line by itself is not an error line at all.
         assert bake_mod.last_error_line("shuru: checkpoint 'x' saved\n") == "(no output)"
 
-    def test_a_layers_log_is_written_whole_and_an_old_one_is_cleared(self, tmp_path):
+    def test_a_layers_log_is_written_whole_and_an_old_one_is_kept(self, tmp_path):
         """The one-line error in the summary is a pointer, so the file has to be there.
 
         Whole and not a tail: the reason a layer failed is usually not near the end of
         its log — pip's error is followed by shuru's ``checkpoint … saved``, and a
-        compiler's ``fatal error`` by the rest of the recipe.
+        compiler's ``fatal error`` by the rest of the recipe. And an earlier bake's log
+        is *kept*: §8.6 gives each run its own folder (:func:`bake_logs_dir`), so
+        nothing has to be — or is — deleted for this run's logs to be unambiguous, and
+        the failed run's log stays readable.
         """
         logs = tmp_path / "bake-logs"
         logs.mkdir()
@@ -12336,10 +12342,6 @@ class TestBakeLogProvenance:
         stale.write_text("a previous bake's layer", encoding="utf-8")
         kept = logs / "notes.txt"
         kept.write_text("not a log this harness writes", encoding="utf-8")
-        assert bake_mod.clear_bake_logs(logs) == 1
-        assert not stale.exists(), "this bake's logs, and only this bake's"
-        assert kept.exists()
-        assert bake_mod.clear_bake_logs(tmp_path / "absent") == 0
 
         result = bake_mod.ExecResult(
             stdout="first line\n", stderr="ERROR: it did not install\n", exit_code=1,
@@ -12348,6 +12350,22 @@ class TestBakeLogProvenance:
         path = bake_mod.write_bake_log(logs, "vanta-bi-Demo-1", result)
         assert path == bake_mod.bake_log_path(logs, "vanta-bi-Demo-1")
         assert path.read_text(encoding="utf-8") == "first line\nERROR: it did not install\n"
+        assert stale.read_text(encoding="utf-8") == "a previous bake's layer"
+        assert kept.read_text(encoding="utf-8") == "not a log this harness writes"
+
+    def test_each_bake_gets_its_own_timestamped_log_folder(self, tmp_path):
+        """§8.6: a folder per run, so a later bake cannot wipe the failed one's logs."""
+        first = bake_mod.bake_logs_dir(
+            tmp_path, when=datetime(2026, 11, 6, 4, 15, 30, tzinfo=timezone.utc)
+        )
+        second = bake_mod.bake_logs_dir(
+            tmp_path, when=datetime(2026, 11, 6, 4, 16, 0, tzinfo=timezone.utc)
+        )
+        assert first == tmp_path / "bake-logs" / "20261106T041530Z"
+        assert second == tmp_path / "bake-logs" / "20261106T041600Z"
+        assert first != second, "two runs never share a folder"
+        # Sortable, and filesystem-safe: no ``:`` that a portability-minded reader trips on.
+        assert ":" not in first.name
 
     def test_a_layer_not_reached_is_not_called_done(self):
         actions = bake_mod.plan_layers(

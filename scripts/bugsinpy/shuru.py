@@ -292,7 +292,8 @@ VM_SIZING_PREFIX = "vanta bake VM:"
 """What :func:`vm_sizing_guard` prints, which is what makes the sizing a *record*.
 
 The boot prelude's output is the layer's own captured output, so the line reaches
-``runs/bugsinpy/bake-logs/<layer>.log`` without any recipe having to know the VM's size.
+``runs/bugsinpy/bake-logs/<stamp>/<layer>.log`` without any recipe having to know the
+VM's size.
 """
 
 

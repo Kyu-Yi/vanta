@@ -648,10 +648,11 @@ def cmd_bake(args: argparse.Namespace) -> int:
     ``--preflight-only`` stops after it, and does not need ``--yes`` — the preflight
     builds nothing, and the pins it classifies are the same ones either way.
 
-    Every layer the build attempts leaves its whole output in
-    ``runs/bugsinpy/bake-logs/<layer>.log`` (emptied at the start of each bake), and
-    each failed layer's one-line entry in the failure report names its own error and
-    points at that file.
+    Every layer the build attempts leaves its whole output in this run's own
+    ``runs/bugsinpy/bake-logs/<UTC stamp>/<layer>.log`` (:func:`bake.bake_logs_dir`),
+    which is never emptied — an earlier bake's logs, the failed ones especially, stay
+    readable — and each failed layer's one-line entry in the failure report names its
+    own error and points at that file.
     """
     split = load_split(args.split.resolve())
     pythons = parse_pythons(args.pythons, split)
@@ -815,11 +816,11 @@ def cmd_bake(args: argparse.Namespace) -> int:
     for action in actions:
         print(f"  {action.describe()}", flush=True)
 
-    # Every layer's whole build log is written here by run_bake_actions, and the
-    # directory is emptied first, so what it holds is always this bake's logs and a
-    # layer that failed can be read in full rather than through the one error line the
-    # summary prints.
-    logs_dir = RUNS_DIR / "bake-logs"
+    # Every layer's whole build log is written here by run_bake_actions. This run gets
+    # its own timestamped folder (bake.bake_logs_dir) and nothing in it is ever deleted,
+    # so a layer that failed can be read in full and an earlier bake's logs — the failed
+    # ones especially — are never wiped by this one.
+    logs_dir = bake_mod.bake_logs_dir(RUNS_DIR)
     # §3.2's own-pin gate needs to know which pins are BugsInPy's own for the layer
     # being built, and to write back what the layer's own ``pip check`` found. Both are
     # per checkpoint and both come from the provenance this run just wrote.

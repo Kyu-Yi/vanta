@@ -18586,6 +18586,95 @@ class TestSetupPyFStrings:
         assert "install_requires: not declared in setup.py" in notes
 
 
+class TestSetupPyFormatCalls:
+    """The third spelling: ``"numpy >= {v}".format(v=…)`` over a module constant (§8.6).
+
+    pandas/121, 138 and 144 stayed flagged on ``'numpy >= {numpy_ver}'`` after the
+    f-string spelling was resolved: their ``setup.py`` at ``ad4c4d5`` writes
+    ``min_numpy_ver = "1.13.3"`` and spells the requirement
+    ``"numpy >= {numpy_ver}".format(numpy_ver=min_numpy_ver)``, which ``ast`` sees as a
+    ``Call`` on a string constant and the literal readers therefore never saw as a
+    requirement. Resolved the same way — statically, from the AST — and flagged when it
+    cannot be, never truncated to the template.
+    """
+
+    def test_a_format_call_over_a_module_level_string_constant_is_resolved(self):
+        """pandas/121's declaration, verbatim: the argument name is not the constant's."""
+        setup = (
+            "min_numpy_ver = '1.13.3'\n"
+            "setuptools_kwargs = {\n"
+            "    'install_requires': [\n"
+            "        'python-dateutil >= 2.6.1',\n"
+            "        'pytz >= 2017.2',\n"
+            "        'numpy >= {numpy_ver}'.format(numpy_ver=min_numpy_ver),\n"
+            "    ],\n"
+            "}\n"
+            "setup(name='pandas', **setuptools_kwargs)\n"
+        )
+        refs, _ = setup_py_refs(setup, {}, [])
+        assert [ref.spec for ref in refs] == [
+            "python-dateutil >= 2.6.1",
+            "pytz >= 2017.2",
+            "numpy >= 1.13.3",
+        ]
+        assert refs[-1].name == "numpy"
+        assert refs[-1].source == "install_requires (setup.py) line 6"
+
+    def test_a_string_literal_keyword_is_resolved_too(self):
+        setup = "setup(name='X', install_requires=['numpy >= {v}'.format(v='1.13.3')])\n"
+        refs, _ = setup_py_refs(setup, {}, [])
+        assert [ref.spec for ref in refs] == ["numpy >= 1.13.3"]
+
+    def test_a_module_level_template_constant_is_resolved_too(self):
+        setup = (
+            "TEMPLATE = 'numpy >= {v}'\n"
+            "VER = '1.13.3'\n"
+            "setup(name='X', install_requires=[TEMPLATE.format(v=VER)])\n"
+        )
+        refs, _ = setup_py_refs(setup, {}, [])
+        assert [ref.spec for ref in refs] == ["numpy >= 1.13.3"]
+
+    def test_an_argument_that_is_not_a_module_level_constant_is_flagged(self):
+        """§8.6: a declaration that does not resolve to a literal fails closed."""
+        setup = (
+            "def vers():\n"
+            "    return '1.13.3'\n"
+            "setup(name='X', install_requires=['numpy >= {v}'.format(v=vers())])\n"
+        )
+        with pytest.raises(bake_mod.BakeError, match="str.format call"):
+            setup_py_refs(setup, {}, [])
+
+    def test_a_positional_or_auto_numbered_field_is_flagged(self):
+        for call in ("'numpy >= {}'.format('1.13.3')", "'numpy >= {0}'.format('1.13.3')"):
+            setup = f"setup(name='X', install_requires=[{call}])\n"
+            with pytest.raises(bake_mod.BakeError, match="str.format call"):
+                setup_py_refs(setup, {}, [])
+
+    def test_a_conversion_or_a_format_spec_is_flagged(self):
+        for call in (
+            "'numpy >= {v!r}'.format(v='1.13.3')",
+            "'numpy >= {v:>8}'.format(v='1.13.3')",
+        ):
+            setup = f"setup(name='X', install_requires=[{call}])\n"
+            with pytest.raises(bake_mod.BakeError, match="str.format call"):
+                setup_py_refs(setup, {}, [])
+
+    def test_a_field_with_no_matching_keyword_is_flagged(self):
+        setup = "setup(name='X', install_requires=['numpy >= {v}'.format(w='1.13.3')])\n"
+        with pytest.raises(bake_mod.BakeError, match="str.format call"):
+            setup_py_refs(setup, {}, [])
+
+    def test_a_template_that_is_not_a_literal_is_flagged(self):
+        """The receiver is not a string this reader can see, so the call is refused."""
+        setup = (
+            "def template():\n"
+            "    return 'numpy >= {v}'\n"
+            "setup(name='X', install_requires=[template().format(v='1.13.3')])\n"
+        )
+        with pytest.raises(bake_mod.BakeError, match="str.format call"):
+            setup_py_refs(setup, {}, [])
+
+
 def setup_py_refs(setup_py: str, files: dict, notes: list) -> tuple:
     """``bake_mod.setup_py_refs`` with a dict standing in for the buggy commit."""
     return bake_mod.setup_py_refs(setup_py, files.get, notes)

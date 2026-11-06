@@ -49,6 +49,7 @@ import io
 import json
 import re
 import shlex
+import string
 import tarfile
 import tomllib
 import urllib.error
@@ -2214,13 +2215,89 @@ def _joined_str_value(node: ast.JoinedStr, constants: Mapping[str, str]) -> Opti
     return "".join(parts)
 
 
-def _fold_string_constants(node: ast.expr, constants: Mapping[str, str]) -> ast.expr:
-    """``node`` with every *resolvable* f-string replaced by the string it builds.
+FORMAT_METHOD = "format"
+"""The one method :func:`_format_call_value` folds — ``"…".format(…)``."""
 
-    An f-string whose interpolation cannot be resolved is left as a ``JoinedStr``, so
-    the readers that run after this see it for what it is: a declaration whose only
-    literal part would be a truncation of it. :func:`_entry_refs` refuses one of those
-    by name rather than reading the truncation as a requirement (§8.6).
+
+def _format_template(node: ast.expr, constants: Mapping[str, str]) -> Optional[str]:
+    """The string a ``str.format`` *receiver* holds, or ``None`` when it is not one.
+
+    Two spellings and no more, because both are facts the AST alone carries: a string
+    literal, and a module-level ``NAME = "…"`` binding (:func:`_module_string_constants`).
+    Anything else — a name bound in a function, a concatenation, an f-string — is a
+    string this reader would have to run the file to see, and it never runs it.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return constants.get(node.id)
+    return None
+
+
+def _format_call_value(node: ast.expr, constants: Mapping[str, str]) -> Optional[str]:
+    """The string ``"numpy >= {v}".format(v=…)`` builds, or ``None`` when not read.
+
+    [VANTA-WHY] The **third** spelling of a requirement this reader has to build before
+    it can read it, after the plain literal and the f-string: pandas' ``setup.py`` at
+    ``ad4c4d5`` writes ``min_numpy_ver = "1.13.3"`` at module level and then
+
+        "numpy >= {numpy_ver}".format(numpy_ver=min_numpy_ver)
+
+    inside ``install_requires`` (§8.6). The AST sees an :class:`ast.Call` on a string
+    constant, so without this the declaration was never a literal and pandas/121, 138
+    and 144 stayed flagged on ``'numpy >= {numpy_ver}'`` while 78, 85 and 104 — whose
+    ``setup.py`` uses the f-string spelling the f-string folder already handles —
+    resolved. Only the *argument* names change between the two spellings; both name the
+    same module constant.
+
+    ``None`` is both "not a ``.format`` call" and "a ``.format`` call this reader will
+    not guess at", and the caller treats the second as a shadow: the declaration is left
+    as it is and :func:`_refuse_unresolved_templates` flags it. Refused, one field at a
+    time, are a positional or auto-numbered field (``{0}``, ``{}``), a format spec
+    (``{v:>3}``), a conversion (``{v!r}``), a field whose name is not a keyword of the
+    call, and any keyword whose value is not a module-level string constant — each of
+    them a string this reader would have to compute to see.
+    """
+    if not isinstance(node, ast.Call):
+        return None
+    func = node.func
+    if not isinstance(func, ast.Attribute) or func.attr != FORMAT_METHOD:
+        return None
+    template = _format_template(func.value, constants)
+    if template is None or node.args:
+        return None
+    named: dict[str, str] = {}
+    for keyword in node.keywords:
+        if keyword.arg is None:
+            return None
+        value = _format_template(keyword.value, constants)
+        if value is None:
+            return None
+        named[keyword.arg] = value
+    try:
+        parsed = list(string.Formatter().parse(template))
+    except ValueError:
+        return None
+    parts: list[str] = []
+    for literal, field, spec, conversion in parsed:
+        parts.append(literal)
+        if field is None:
+            continue
+        if conversion is not None or spec or not field.isidentifier() or field not in named:
+            return None
+        parts.append(named[field])
+    return "".join(parts)
+
+
+def _fold_string_constants(node: ast.expr, constants: Mapping[str, str]) -> ast.expr:
+    """``node`` with every *resolvable* f-string or ``str.format`` replaced by the
+    string it builds.
+
+    A template whose interpolation cannot be resolved is left as it is — the
+    ``JoinedStr`` or the ``Call`` — so the readers that run after this see it for what
+    it is: a declaration whose only literal part would be a truncation of it.
+    :func:`_refuse_unresolved_templates` refuses one of those by name rather than
+    reading the truncation as a requirement (§8.6).
     """
 
     if isinstance(node, ast.JoinedStr):
@@ -2228,6 +2305,9 @@ def _fold_string_constants(node: ast.expr, constants: Mapping[str, str]) -> ast.
         if resolved is not None:
             return ast.copy_location(ast.Constant(value=resolved), node)
         return node
+    formatted = _format_call_value(node, constants)
+    if formatted is not None:
+        return ast.copy_location(ast.Constant(value=formatted), node)
     for field, value in ast.iter_fields(node):
         if isinstance(value, list):
             setattr(
@@ -2380,15 +2460,31 @@ def _extras_tests_node(extras: Optional[ast.expr]) -> Optional[ast.expr]:
     return None
 
 
-def _refuse_unresolved_fstrings(node: ast.expr, *, source: str) -> None:
-    """Fail closed on a declaration carrying an f-string this reader could not fold.
+def _is_format_call(node: ast.AST) -> bool:
+    """A ``<string>.format(…)`` call this reader did not fold (see the refusal)."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == FORMAT_METHOD
+    )
+
+
+def _refuse_unresolved_templates(node: ast.expr, *, source: str) -> None:
+    """Fail closed on a declaration carrying a template this reader could not fold.
 
     [VANTA-WHY] §8.6: the pandas template is resolved statically, and a declaration
-    that does not resolve to a literal is **flagged**, never truncated. Left alone, a
-    ``JoinedStr`` shows the literal readers only its fixed parts — ``f"numpy >= {v}"``
-    reads as ``"numpy >= "`` — and a requirement built from a truncation is a
-    requirement nobody wrote. Refusing here turns that into a flag with the line
-    number, which is the honest answer, instead of a silently wrong pin.
+    that does not resolve to a literal is **flagged**, never truncated. There are two
+    ways a declaration spells a string this reader has to build before it can be read —
+    an f-string (``JoinedStr``, :func:`_joined_str_value`) and a ``str.format`` call
+    (:func:`_format_call_value`) — and each, left alone, shows the literal readers only
+    its fixed parts: ``f"numpy >= {v}"`` reads as ``"numpy >= "`` and
+    ``"numpy >= {v}".format(v=…)`` reads as ``"numpy >= {v}"``. A requirement built from
+    either is a requirement nobody wrote, so refusing here turns it into a flag with the
+    line number — the honest answer — instead of a silently wrong pin.
+
+    Read on the **folded** node, which is why a ``.format`` call still standing is
+    exactly one :func:`_format_call_value` declined: everything it could resolve is a
+    ``Constant`` by the time this walks the tree.
     """
 
     for item in ast.walk(node):
@@ -2397,6 +2493,13 @@ def _refuse_unresolved_fstrings(node: ast.expr, *, source: str) -> None:
                 f"{source} line {item.lineno}: an f-string this harness cannot resolve "
                 "to a literal (its interpolation is not a module-level string constant), "
                 "so the requirement it spells cannot be read; flag this bug (design §3.2)"
+            )
+        if _is_format_call(item):
+            raise BakeError(
+                f"{source} line {item.lineno}: a str.format call this harness cannot "
+                "resolve to a literal (a positional or auto-numbered field, a format "
+                "spec, or an argument that is not a module-level string constant), so the "
+                "requirement it spells cannot be read; flag this bug (design §3.2)"
             )
 
 
@@ -2413,7 +2516,7 @@ def _entry_refs(
     if node is None:
         notes.append(f"{source}: not declared in setup.py")
         return [], []
-    _refuse_unresolved_fstrings(node, source=source)
+    _refuse_unresolved_templates(node, source=source)
     refs: list[DepRef] = []
     skipped: list[SkippedLine] = []
     files = _file_literals(node)

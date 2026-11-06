@@ -3768,6 +3768,7 @@ def requirements_recipe(
     orphans: Sequence[str] = (),
     minor: Optional[str] = None,
     early_pins_first: bool = False,
+    hoist_pins: Sequence[str] = (),
 ) -> str:
     """Install one bug's *resolved* dependencies on top of the interpreter layer.
 
@@ -3879,16 +3880,21 @@ def requirements_recipe(
     everything the pin declared is already installed (the closure walk pinned it) and
     ``--no-deps`` costs nothing but the absent name, and **before** the orphan removal, which is the last thing before the reading.
 
-    ``early_pins_first`` is the one thing a **second** attempt may move, and §8.6 R1's
-    whole content: with it, the ``early_pins`` install above is emitted **before** the
-    build requirements' instead of after, so a build requirement's own ``setup.py``
-    finds the pins the layer already holds rather than reaching ``easy_install`` for a
-    release of the day. ``luigi/30`` measured the difference — its ``pytest-runner==
-    2.5.1``'s ``egg_info`` loaded today's ``setuptools_scm`` and died on
-    ``setuptools.sic`` while the layer's own ``setuptools-scm==3.4.1`` sat uninstalled
-    one step below. It is ``False`` by default and reaches the recipe **only** from
-    :func:`retry_plan`, after a first attempt has already failed, so every first-pass
-    recipe — and so every already-baked layer — is byte-identical.
+    ``early_pins_first`` and ``hoist_pins`` are the two things a **second** attempt may
+    change, and together §8.6 R1's whole content. With ``early_pins_first`` the
+    ``early_pins`` install above is emitted **before** the build requirements' instead of
+    after, so a *build requirement's* own ``setup.py`` finds the pins the layer already
+    holds rather than reaching ``easy_install`` for a release of the day. With
+    ``hoist_pins`` those pins get a finished install step of their own immediately before
+    the early block, which is the half the first one cannot do: ``luigi/30``'s fetch
+    happens **inside** the early block — its ``pytest-runner==2.5.1``'s ``egg_info``
+    loaded today's ``setuptools_scm`` from ``.eggs`` and died on ``setuptools.sic`` —
+    and the block is a single ``pip -r`` call, so its own
+    ``setuptools-scm==3.4.1`` is still uninstalled when that metadata is prepared
+    whichever line of the block it sits on. Both are ``False``/empty by default and
+    reach the recipe **only** from :func:`retry_plan`, after a first attempt has already
+    failed, so every first-pass recipe — and so every already-baked layer — is
+    byte-identical.
     """
     no_deps = [spec.strip() for spec in no_deps_pins if spec.strip()]
     no_deps_set = set(no_deps)
@@ -3960,6 +3966,30 @@ def requirements_recipe(
         if early
         else []
     )
+    hoist = [spec.strip() for spec in hoist_pins if spec.strip()]
+    if hoist:
+        # §8.6 R1's retry, and only ever on a *second* attempt: the failing pass's own log
+        # shows easy_install reaching for a distribution one of `early_pins` already
+        # satisfies (`luigi/30`: `setuptools_scm`, which the layer's own
+        # `setuptools-scm==3.4.1` answers). Installing that pin ahead of the block is not
+        # enough to put it there in time — the block is one `pip -r` call, and pip
+        # prepares every requirement's metadata before it installs any of them — so it
+        # gets a finished install step of its own, immediately before the block, and
+        # nothing is removed from the block it came from (pip reports the second mention
+        # as already satisfied). Nothing is added and no version changes: these specs are
+        # in `early_pins` already (:class:`HoistedPin`).
+        early_block = [
+            "cat > /tmp/hoist-req.txt <<'VANTA_HOIST_REQUIRES'",
+            "\n".join(hoist),
+            "VANTA_HOIST_REQUIRES",
+            # The same flags as the early block it precedes, and for the same reasons:
+            # it is a dependency install, it must run against what the layer already has
+            # rather than an isolated copy of the day's PyPI, and it must be held to the
+            # layer's whole pin list.
+            "python -m pip install --no-cache-dir "
+            f"{held}--no-build-isolation {LEGACY_RESOLVER_FLAG} -r /tmp/hoist-req.txt",
+            _no_isolated_build_env("the hoisted build-requirement install"),
+        ] + early_block
     if early_pins_first:
         # §8.6 R1's one retry, and only ever on a *second* attempt: a build
         # requirement's own `setup.py` runs before the early pins when the first pass
@@ -7549,6 +7579,78 @@ def easy_install_fetches(output: str) -> tuple[str, ...]:
     )
 
 
+EGG_BUILD_DIR_MARKER = "/.eggs/"
+"""The path segment ``easy_install`` installs a fetched build requirement into.
+
+[VANTA-WHY] The **second** reading of a fetch, and the one ``luigi/30`` needs: that
+layer's log holds no :data:`EASY_INSTALL_MARKERS` line at all — ``easy_install``'s own
+``Searching for …`` output never reached pip's stream — and the only evidence the fetch
+happened is the traceback frame that ran out of the fetched release,
+``File "/tmp/pip-install-jwj5ruzh/pytest-runner/.eggs/setuptools_scm-10.3.4-py3.8.egg/
+setuptools_scm/_integration/setuptools.py", line 25``. ``.eggs`` is setuptools' per-build
+scratch directory, created **inside** the build's own directory, so this reading is
+evidence of a fetch that failed the build rather than of an environment the layer kept:
+it is read by §8.6 R1's retry (:func:`hoisted_pins`) and deliberately not by the
+post-install gate (:func:`easy_install_fetches`).
+"""
+
+EGG_DIST_SUFFIX = ".egg"
+"""How the fetched distribution's own file ends there — ``setuptools_scm-10.3.4-py3.8.egg``."""
+
+SEARCHING_PREFIX = "Searching for "
+"""The marker half that names the distribution ``easy_install`` looked for."""
+
+BEST_MATCH_PREFIX = "Best match: "
+"""The marker half that names the release it settled on, ``Best match: cffi 2.1.1``."""
+
+
+def _marker_spelling(line: str) -> str:
+    """The distribution a ``Searching for …``/``Best match: …`` line names, or ``""``.
+
+    The first word after the marker, because both lines put it there: ``Searching for
+    cffi`` and ``Best match: cffi 2.1.1``. Nothing else on the line is read — the version
+    is not this rule's business, since §8.6 R1 only reorders pins the layer already has.
+    """
+    for prefix in EASY_INSTALL_MARKERS:
+        if line.startswith(prefix):
+            rest = line[len(prefix):].strip()
+            return rest.split()[0] if rest else ""
+    return ""
+
+
+def easy_install_fetch_evidence(output: str) -> tuple[tuple[str, str], ...]:
+    """``(the distribution a fetch named, the log line that named it)``, in log order.
+
+    Two readings of one event, because a failed build's log carries whichever one the
+    failing step produced: ``easy_install``'s own ``Searching for …``/``Best match: …``
+    line (:data:`EASY_INSTALL_MARKERS` — the shape ``fastapi/1``'s build produced) and the
+    ``.eggs/<name>-<version>…egg`` path of a traceback frame inside the fetched release
+    (:data:`EGG_BUILD_DIR_MARKER` — the shape ``luigi/30``'s produced). The evidence is the
+    numbered line, in the same ``build log line N: …`` spelling
+    :func:`failed_build_line` uses, so a reader can open the failing pass's own log and
+    find it.
+
+    Empty means the log names no fetch at all, and that is §8.6 R1's fail-closed answer:
+    no evidence, no hoist, no retry (:func:`hoisted_pins`).
+    """
+    out: list[tuple[str, str]] = []
+    for index, raw in enumerate(output.replace("\r", "\n").splitlines(), start=1):
+        line = raw.strip()
+        evidence = f"build log line {index}: {line}"
+        spelling = _marker_spelling(line)
+        if spelling:
+            out.append((spelling, evidence))
+            continue
+        for token in line.replace("\\", "/").split():
+            marker = token.find(EGG_BUILD_DIR_MARKER)
+            if marker < 0:
+                continue
+            egg = token[marker + len(EGG_BUILD_DIR_MARKER):].split("/", 1)[0]
+            if egg.endswith(EGG_DIST_SUFFIX) and egg[: -len(EGG_DIST_SUFFIX)]:
+                out.append((egg[: -len(EGG_DIST_SUFFIX)], evidence))
+    return tuple(out)
+
+
 def easy_install_failure(lines: Sequence[str]) -> ExecResult:
     """A failed build's result, synthesised from an ``easy_install`` fetch (§3.2).
 
@@ -9524,6 +9626,90 @@ class RetryMaterial:
 
 
 @dataclass(frozen=True)
+class HoistedPin:
+    """An early pin §8.6 R1's retry installs ahead of the early block's other pins.
+
+    [VANTA-WHY] What R1 used to do — move the whole early block before the build
+    requirements — was measured against ``luigi/30``'s second attempt and does **not**
+    answer its failure: the fetch happens *inside* the early block, because that block is
+    one ``pip -r`` call and pip prepares every requirement's metadata before it installs
+    any of them (measured in the same log, where the toolchain block reads ``Collecting
+    pip``/``Collecting setuptools``/… and only then ``Installing collected packages``).
+    So the pin that satisfies the fetched distribution has to be installed by a step of
+    its own that has already finished, which is what the hoist is. Nothing is added and
+    no version changes: ``pin`` is a spec the early list already holds, ``fetched`` is the
+    distribution the log shows ``easy_install`` reaching for, and ``evidence`` is the
+    numbered line that shows it (:func:`easy_install_fetch_evidence`).
+    """
+
+    name: str
+    pin: str
+    fetched: str
+    evidence: str
+
+    def as_dict(self) -> dict[str, str]:
+        """The record the layer's own provenance keeps, in :func:`record_retry`'s shape."""
+        return {
+            "name": self.name,
+            "pin": self.pin,
+            "fetched": self.fetched,
+            "evidence": self.evidence,
+        }
+
+
+def _egg_name_candidates(stem: str) -> tuple[str, ...]:
+    """The spellings a ``<name>-<version>[-<build tag>]`` egg stem could be naming.
+
+    Longest first, and never the empty string: the split is ambiguous from the right —
+    ``setuptools_scm-10.3.4-py3.8`` could name ``setuptools_scm`` or
+    ``setuptools_scm-10.3.4-py3.8`` — and only the caller knows which of them this layer
+    holds. Handing every spelling back and letting the match against the layer's own pins
+    decide is what keeps the reading honest: nothing is guessed from the stem alone.
+    """
+    candidates: list[str] = []
+    head = stem
+    while head:
+        candidates.append(head)
+        head, sep, _ = head.rpartition("-")
+        if not sep:
+            break
+    return tuple(candidates)
+
+
+def hoisted_pins(output: str, *, early_pins: Sequence[str]) -> tuple[HoistedPin, ...]:
+    """The early pins §8.6 R1's retry installs first, from the failed pass's own log.
+
+    Only pins **already in** ``early_pins`` are ever returned, at the exact spec that list
+    already holds and in the order it already had, so the rule can neither add a pin nor
+    change one (:class:`HoistedPin`). A fetch whose distribution no early pin satisfies
+    returns nothing, which leaves the layer with no retry at all — R1's fail-closed
+    answer, and the same answer a log that names no fetch gives.
+    """
+    pins: dict[str, str] = {}
+    order: dict[str, int] = {}
+    for index, spec in enumerate(early_pins):
+        parts = _pinned_parts(spec)
+        if parts is None:
+            continue
+        name = canonicalize_name(parts[0])
+        if name not in pins:
+            pins[name] = spec
+            order[name] = index
+    if not pins:
+        return ()
+    found: dict[str, HoistedPin] = {}
+    for spelling, evidence in easy_install_fetch_evidence(output):
+        for candidate in _egg_name_candidates(spelling):
+            name = canonicalize_name(candidate)
+            if name in pins and name not in found:
+                found[name] = HoistedPin(
+                    name=name, pin=pins[name], fetched=spelling, evidence=evidence
+                )
+                break
+    return tuple(found[name] for name in sorted(found, key=lambda name: order[name]))
+
+
+@dataclass(frozen=True)
 class RetryPlan:
     """One per-bug layer's single second attempt (§8.6 R1 and R2(ii)).
 
@@ -9532,19 +9718,26 @@ class RetryPlan:
     rule existed. Under **R2(ii)** it is the first-pass recipe with the pins the retry
     dropped removed — from the main pass, from the early pass or from the ``--no-deps``
     pass, whichever held them — and ``drops`` is what it removed and why. Under **R1**
-    nothing is dropped (``drops`` is empty) and the only change is the ordering: the
-    early pins installed before the build requirements, which is what ``why`` says. In
-    both cases ``drops`` and ``why`` reach the layer's provenance and the run's summary.
+    nothing is dropped (``drops`` is empty) and the two changes are the ordering ones: the
+    early pins installed before the build requirements, and, ahead of the early block, its
+    own install of the pins ``hoist`` names. In both cases ``drops``, ``hoist`` and ``why``
+    reach the layer's provenance and the run's summary.
     """
 
     script: str
     drops: tuple[DroppedPin, ...]
+    hoist: tuple[HoistedPin, ...] = ()
     rule: str = RETRY_RULE_DROP
     why: str = ""
 
     def describe(self) -> list[str]:
-        """One line per drop, in the shape the bake's log and summary both print."""
+        """One line per hoist and per drop, in the shape the log prints."""
         lines = [
+            f"hoisting {item.pin} ahead of the early block — the log shows easy_install "
+            f"reaching for {item.fetched} ({item.evidence})"
+            for item in self.hoist
+        ]
+        lines += [
             f"dropping {drop.pin} — {drop.reason}; "
             + (drop.import_note or "nothing in either tree imports it")
             for drop in self.drops
@@ -9580,11 +9773,15 @@ def retry_plan(deps: "BugDeps", output: str) -> Optional[RetryPlan]:
       re-resolution). ``None`` when the answer is not a drop: a name that is not a pin of
       this layer, one the safeguard protects, or one the graded tests reach — each a
       flag, not a drop (:func:`retry_drops`).
-    * **nothing named** — §8.6 R1's case, and only when the log's last word is a build
-      requirement's own ``setup.py egg_info`` (:func:`failed_build_requirement_metadata`)
-      *and* this layer has early pins to move. Nothing is dropped; the recipe is the first
-      pass with ``early_pins_first`` set, so the pins the build requirement reached past
-      are installed before it.
+    * **nothing named, an ``egg_info`` crash** — §8.6 R1, and only when the log's last word
+      is a build requirement's own ``setup.py egg_info``
+      (:func:`failed_build_requirement_metadata`) *and* the log names a fetch one of this
+      layer's own early pins satisfies (:func:`hoisted_pins`). Nothing is dropped and
+      nothing is added; the recipe is the first pass with ``early_pins_first`` set and with
+      the fetched distribution's pin installed ahead of the early block by a step of its
+      own (:class:`HoistedPin`). A log that names **no** fetch — or names one no early pin
+      satisfies — answers ``None`` here: with nothing to hoist there is nothing a second
+      attempt could do differently, and the layer keeps its first-pass classification.
     """
     material = deps.retry
     if material is None:
@@ -9620,26 +9817,34 @@ def retry_plan(deps: "BugDeps", output: str) -> Optional[RetryPlan]:
             ),
             drops=drops,
         )
-    if not deps.early_pins or not failed_build_requirement_metadata(output):
-        return None
-    return RetryPlan(
-        script=requirements_recipe(
-            deps.installs,
-            build_pins=deps.build_pins,
-            early_pins=deps.early_pins,
-            no_deps_pins=deps.no_deps_pins,
-            orphans=deps.orphans,
-            minor=material.minor,
-            early_pins_first=True,
-        ),
-        drops=(),
-        rule=RETRY_RULE_EARLY,
-        why=(
-            "the first pass died in a build requirement's setup.py egg_info with the "
-            "early pins absent (§8.6 R1); the layer was rebuilt once with the early pins "
-            "installed before the build requirements"
-        ),
-    )
+    if deps.early_pins and failed_build_requirement_metadata(output):
+        hoist = hoisted_pins(output, early_pins=deps.early_pins)
+        if hoist:
+            return RetryPlan(
+                script=requirements_recipe(
+                    deps.installs,
+                    build_pins=deps.build_pins,
+                    early_pins=deps.early_pins,
+                    no_deps_pins=deps.no_deps_pins,
+                    orphans=deps.orphans,
+                    minor=material.minor,
+                    early_pins_first=True,
+                    hoist_pins=tuple(item.pin for item in hoist),
+                ),
+                drops=(),
+                hoist=hoist,
+                rule=RETRY_RULE_EARLY,
+                why=(
+                    "the first pass died in a build requirement's setup.py egg_info "
+                    "(§8.6 R1), where setuptools' easy_install reached for "
+                    + ", ".join(item.fetched for item in hoist)
+                    + " because nothing installed yet satisfied it; the layer was rebuilt "
+                    "once with the early block's own "
+                    + ", ".join(item.pin for item in hoist)
+                    + " installed ahead of the block, and before the build requirements"
+                ),
+            )
+    return None
 
 
 def exact_version(spec: str, source: str) -> Optional[str]:
@@ -12055,8 +12260,11 @@ def record_retry(deps_dir: Path, checkpoint: str, plan: RetryPlan) -> Path:
     this layer's first build failed, which rule answered it (``rule``), on what (``why``)
     and what the second attempt left out. Under **R1** nothing is dropped, so ``dropped``
     is untouched and ``retry`` alone carries the fact that the second attempt only
-    reordered the installs. Both keys together are "every drop, with its source, its
-    failure reason and its closure evidence, in the layer metadata".
+    reordered the installs — ``hoisted`` names each pin it installed ahead of the early
+    block, with the log line that named the fetch it answers (:func:`hoisted_pins`), and
+    is the empty list for an R2(ii) retry, symmetrically with ``dropped``. Both keys are
+    "every drop, with its source, its failure reason and its closure evidence, in the
+    layer metadata", and ``hoisted`` is the same account of the change that is not a drop.
 
     The identity is **re-stamped**, unlike :func:`record_pip_check`, and the difference is
     the point: ``pip_check`` is a verdict *about* a layer and :func:`provenance_digest`
@@ -12083,6 +12291,7 @@ def record_retry(deps_dir: Path, checkpoint: str, plan: RetryPlan) -> Path:
             + " (§8.6 R2(ii)); the layer was rebuilt once without them"
         ),
         "dropped": [drop.as_dict() for drop in plan.drops],
+        "hoisted": [item.as_dict() for item in plan.hoist],
     }
     path = deps_path(deps_dir, checkpoint)
     path.write_text(

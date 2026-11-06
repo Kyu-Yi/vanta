@@ -17614,15 +17614,32 @@ both and its per-name lines name each. Reproduced from the run's log, not invent
 """
 
 _LUIGI_30_BUILD_LOG = (
-    "  ERROR: Command errored out with exit status 1: python setup.py egg_info\n"
-    "      ImportError: cannot import name 'sic' from 'setuptools'\n"
-    "shuru: checkpoint 'vanta-bi-luigi-30' saved\n"
+    "Collecting pytest-runner==2.5.1\n"
+    "  Downloading pytest-runner-2.5.1.zip (11 kB)\n"
+    "  Preparing metadata (setup.py): started\n"
+    "  Preparing metadata (setup.py): finished with status 'error'\n"
+    "    File \"/tmp/pip-install-jwj5ruzh/pytest-runner/setup.py\", line 53, in <module>\n"
+    "      setuptools.setup(**setup_params)\n"
+    "    File \"/tmp/pip-install-jwj5ruzh/pytest-runner/.eggs/"
+    "setuptools_scm-10.3.4-py3.8.egg/setuptools_scm/_integration/version_inference.py\", "
+    "line 18, in <module>\n"
+    "      from setuptools import sic as setuptools_sic\n"
+    "  ImportError: cannot import name 'sic' from 'setuptools'\n"
+    "ERROR: Command errored out with exit status 1: python setup.py egg_info "
+    "Check the logs for full command output.\n"
 )
 """``luigi/30``'s failure: a build *requirement*'s ``egg_info``, and pip names no pin.
 
 The load-bearing negative for §8.6's R2(ii): :func:`bake.failed_builds` finds no
-``Failed to build …`` line, so the retry answers ``None`` and the ordinary failure
+``Failed to build …`` line, so the retry answers ``None`` there and the ordinary failure
 path is left alone — this is R1's case and not this rule's.
+
+It is also R1's one *positive* piece of evidence, and the reason the rule cannot be read
+from :data:`bake.EASY_INSTALL_MARKERS` alone: the fetch's only trace in the real log is
+the traceback frame that ran out of the fetched release, under the build's own
+``.eggs/`` directory. Reproduced from the run's log (``pytest-runner``'s own ``setup.py``
+frame, the ``.eggs/setuptools_scm-10.3.4-py3.8.egg`` frame, the ``ImportError`` and pip's
+``egg_info`` summary line), not invented.
 """
 
 
@@ -18067,13 +18084,14 @@ class TestTheRetryOnAnUnbuildablePin:
     _R1_BUILD = ("pytest-runner==2.5.1",)
     _R1_EARLY = ("setuptools-scm==3.4.1",)
 
-    def _recipe(self, *, early_pins_first: bool) -> str:
+    def _recipe(self, *, early_pins_first: bool, hoist_pins=()) -> str:
         return bake_mod.requirements_recipe(
             self.INSTALLS,
             build_pins=self._R1_BUILD,
             early_pins=self._R1_EARLY,
             minor="3.8",
             early_pins_first=early_pins_first,
+            hoist_pins=hoist_pins,
         )
 
     def test_the_default_recipe_installs_the_early_pins_after_the_build_requirements(self):
@@ -18087,14 +18105,86 @@ class TestTheRetryOnAnUnbuildablePin:
         assert retry.index("/tmp/early-req.txt") < retry.index("/tmp/build-req.txt")
         assert sorted(retry.splitlines()) == sorted(first.splitlines())
 
+    def test_the_hoist_is_a_finished_install_step_of_its_own_before_the_early_block(self):
+        """The fetched pin is installed by a step that has already ended, ahead of the
+        block it came from — and it is *additive*: everything else is line-for-line the
+        retry it was before the hoist existed."""
+        first = self._recipe(early_pins_first=True)
+        hoisted = self._recipe(
+            early_pins_first=True, hoist_pins=("setuptools-scm==3.4.1",)
+        )
+        before = first.splitlines()
+        after = hoisted.splitlines()
+        start = after.index("cat > /tmp/hoist-req.txt <<'VANTA_HOIST_REQUIRES'")
+        block = after[start : start + 5]
+        assert block[0] == "cat > /tmp/hoist-req.txt <<'VANTA_HOIST_REQUIRES'"
+        assert block[1] == "setuptools-scm==3.4.1", "the pin, at the version it already had"
+        assert block[2] == "VANTA_HOIST_REQUIRES"
+        assert "hoist-req.txt" in block[3] and "--no-build-isolation" in block[3]
+        assert block[4].startswith("for d in /tmp/pip-build-env-*")
+        assert hoisted.index("/tmp/hoist-req.txt") < hoisted.index("/tmp/early-req.txt")
+        # Nothing was removed and nothing else moved: delete the hoist block and the
+        # retry reads exactly as it did before the rule existed.
+        assert after[:start] + after[start + 5 :] == before
+
+    # ---- R1's fetch evidence: the two readings of one fetch -----------------
+    def test_the_egg_directory_names_the_distribution_easy_install_fetched(self):
+        """``luigi/30``'s shape: no marker line at all, only the ``.eggs`` traceback."""
+        assert bake_mod.easy_install_fetches(_LUIGI_30_BUILD_LOG) == ()
+        evidence = bake_mod.easy_install_fetch_evidence(_LUIGI_30_BUILD_LOG)
+        assert [spelling for spelling, _ in evidence] == ["setuptools_scm-10.3.4-py3.8"]
+        assert evidence[0][1].startswith("build log line ")
+        assert ".eggs/setuptools_scm-10.3.4-py3.8.egg/" in evidence[0][1]
+
+    def test_a_marker_line_names_the_distribution_too(self):
+        """``fastapi/1``'s shape, so one rule reads both logs."""
+        evidence = bake_mod.easy_install_fetch_evidence(
+            "Searching for cffi\nBest match: cffi 2.1.1\n"
+        )
+        assert [spelling for spelling, _ in evidence] == ["cffi", "cffi"]
+
+    def test_a_log_that_names_no_fetch_has_no_evidence(self):
+        assert bake_mod.easy_install_fetch_evidence(_PANDAS_7_BUILD_LOG) == ()
+        assert bake_mod.easy_install_fetch_evidence("") == ()
+
+    def test_the_hoist_is_the_early_pin_the_fetched_name_satisfies(self):
+        hoist = bake_mod.hoisted_pins(
+            _LUIGI_30_BUILD_LOG, early_pins=self._R1_EARLY
+        )
+        assert [item.pin for item in hoist] == ["setuptools-scm==3.4.1"]
+        assert hoist[0].name == "setuptools-scm"
+        assert hoist[0].fetched == "setuptools_scm-10.3.4-py3.8"
+        assert hoist[0].evidence.startswith("build log line ")
+
+    def test_a_fetch_no_early_pin_satisfies_hoists_nothing(self):
+        """Nothing to reorder is nothing to retry: the layer fails closed."""
+        assert (
+            bake_mod.hoisted_pins(_LUIGI_30_BUILD_LOG, early_pins=("six==1.13.0",)) == ()
+        )
+
+    def test_the_hoist_keeps_the_early_lists_own_order(self):
+        """The log's order does not decide: the hoist keeps the early list's order, so a
+        second attempt's script is deterministic and a reader can compare it by hand."""
+        output = (
+            "  File \"/tmp/b/x/.eggs/alpha-1.0-py3.8.egg/alpha/a.py\", line 1\n"
+            "  File \"/tmp/b/x/.eggs/beta-2.0-py3.8.egg/beta/b.py\", line 1\n"
+        )
+        hoist = bake_mod.hoisted_pins(
+            output, early_pins=("beta==2.0", "alpha==1.0")
+        )
+        assert [item.pin for item in hoist] == ["beta==2.0", "alpha==1.0"]
+
     def test_a_build_requirement_egg_info_failure_retries_with_the_early_pins_first(self):
         deps = self._deps(build_pins=self._R1_BUILD, early_pins=self._R1_EARLY)
         plan = bake_mod.retry_plan(deps, _LUIGI_30_BUILD_LOG)
         assert plan is not None
         assert plan.drops == ()
+        assert [item.pin for item in plan.hoist] == ["setuptools-scm==3.4.1"]
         assert plan.rule == bake_mod.RETRY_RULE_EARLY
         assert plan.describe()
-        assert plan.script == self._recipe(early_pins_first=True)
+        assert plan.script == self._recipe(
+            early_pins_first=True, hoist_pins=("setuptools-scm==3.4.1",)
+        )
 
     def test_a_layer_with_no_early_pins_never_gets_the_r1_retry(self):
         deps = self._deps(build_pins=self._R1_BUILD)
@@ -18103,6 +18193,18 @@ class TestTheRetryOnAnUnbuildablePin:
     def test_a_log_that_is_not_an_egg_info_crash_never_gets_the_r1_retry(self):
         deps = self._deps(early_pins=self._R1_EARLY)
         assert bake_mod.retry_plan(deps, "some other failure\n") is None
+
+    def test_an_egg_info_crash_that_names_no_fetch_gets_no_retry(self):
+        """Fail closed: with no fetch in the log there is nothing a retry could do."""
+        deps = self._deps(early_pins=self._R1_EARLY)
+        assert (
+            bake_mod.retry_plan(
+                deps,
+                "ERROR: Command errored out with exit status 1: python setup.py "
+                "egg_info\n",
+            )
+            is None
+        )
 
     def test_record_retry_records_the_reordering_without_a_drop(self, tmp_path):
         deps = self._deps(early_pins=self._R1_EARLY)
@@ -18114,6 +18216,17 @@ class TestTheRetryOnAnUnbuildablePin:
         assert after["retry"]["used"] is True
         assert after["retry"]["rule"] == bake_mod.RETRY_RULE_EARLY
         assert after["retry"]["dropped"] == []
+        assert after["retry"]["hoisted"] == [
+            {
+                "name": "setuptools-scm",
+                "pin": "setuptools-scm==3.4.1",
+                "fetched": "setuptools_scm-10.3.4-py3.8",
+                "evidence": plan.hoist[0].evidence,
+            }
+        ]
+        assert "easy_install reached for setuptools_scm-10.3.4-py3.8" in (
+            after["retry"]["reason"]
+        )
         # R1 drops nothing, so ``dropped`` is exactly what the first pass left there.
         assert after["dropped"] == before.get("dropped", [])
         # The retry record is decisive material too, so the identity moves.

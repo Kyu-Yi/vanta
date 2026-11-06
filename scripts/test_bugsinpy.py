@@ -17642,6 +17642,40 @@ frame, the ``.eggs/setuptools_scm-10.3.4-py3.8.egg`` frame, the ``ImportError`` 
 ``egg_info`` summary line), not invented.
 """
 
+_PANDAS_66_BUILD_LOG = (
+    "+ python -m pip install --no-cache-dir -c /tmp/constraints.txt "
+    "--no-build-isolation --use-deprecated=legacy-resolver -r /tmp/req.txt\n"
+    "WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, "
+    "status=None)) after connection broken by 'ProtocolError('Connection aborted.', "
+    "RemoteDisconnected('Remote end closed connection without response'))': "
+    "/simple/cycler/\n"
+    "ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE. "
+    "If you have updated the package versions, please update the hashes. Otherwise, "
+    "examine the package contents carefully; someone may have tampered with them.\n"
+    "    matplotlib==3.1.3 from https://files.pythonhosted.org/packages/be/74/"
+    "24d058c17b155d131359f1cd01e120b3954686bf8b7853172b279237e1dc/"
+    "matplotlib-3.1.3.tar.gz#sha256="
+    "db3121f12fb9b99f105d1413aebaeb3d943f269f3d262b45586d12765866f0c6 "
+    "(from -c /tmp/constraints.txt (line 41)):\n"
+    "        Expected sha256 "
+    "db3121f12fb9b99f105d1413aebaeb3d943f269f3d262b45586d12765866f0c6\n"
+    "             Got        "
+    "a126ab08efbd1508221af0aa54bdac70f782587567710a5d54e4a6c9c2795bb9\n"
+)
+"""``pandas/66``'s failure: a *download* whose bytes were not the ones the index names.
+
+The index's own link advertises ``db3121…`` (PyPI's recorded sdist hash) and the body
+that arrived hashed to ``a126ab08…``, one line under a ``RemoteDisconnected`` on a
+different index page — a transfer cut short, not a package whose bytes changed. The
+harness writes no hashes (:data:`bake.CONSTRAINTS_FILE` holds ``name==version`` lines
+only), so the ``#sha256=`` fragment is the index's. Reproduced from the run's log, and it
+is why the mismatch is not a pin to drop and not an ordering to fix.
+
+``retry_plan`` reaches it through §8.6 **R4**: :func:`bake.failed_builds` is empty here
+(nothing reached the wheel stage) and the log is not an ``egg_info`` crash, so neither
+R2(ii) nor R1 answers it.
+"""
+
 
 def _carrier_wheel(*, entry_points: str | None = None) -> bytes:
     """One wheel in memory: a ``METADATA``, and an ``entry_points.txt`` when asked for.
@@ -17898,6 +17932,15 @@ class TestTheRetryOnAnUnbuildablePin:
             reason="its sdist failed to build in this image during the first pass",
         )
         return bake_mod.RetryPlan(script=script, drops=(drop,))
+
+    def _transient_plan(self, script: str = "retry recipe") -> bake_mod.RetryPlan:
+        return bake_mod.RetryPlan(
+            script=script,
+            drops=(),
+            rule=bake_mod.RETRY_RULE_TRANSIENT,
+            why="re-fetched",
+            transient=bake_mod.transient_download_failure(_PANDAS_66_BUILD_LOG),
+        )
 
     def _deps(self, *, retry=True, provenance=None, **kwargs) -> bake_mod.BugDeps:
         material = (
@@ -18232,11 +18275,90 @@ class TestTheRetryOnAnUnbuildablePin:
         # The retry record is decisive material too, so the identity moves.
         assert after["checkpoint_id"] != before["checkpoint_id"]
 
+    # ---- R4: a download that did not match the hash the index named -------
+    def test_the_mismatch_block_names_the_package_and_both_hashes(self):
+        """``pandas/66``'s shape: the index's own ``#sha256=`` link, the body arriving."""
+        transient = bake_mod.transient_download_failure(_PANDAS_66_BUILD_LOG)
+        assert transient is not None
+        assert transient.spec == "matplotlib==3.1.3"
+        assert transient.expected.startswith("db3121f1")
+        assert transient.got.startswith("a126ab08")
+        assert transient.aborted is True, "the RemoteDisconnected corroborates a cut transfer"
+        assert transient.evidence.startswith("build log line ")
+        assert "THESE PACKAGES DO NOT MATCH THE HASHES" in transient.evidence
+        assert "re-fetch" in transient.describe()
+        assert transient.as_dict()["connection_broken"] is True
+
+    def test_a_log_with_no_mismatch_is_not_this_rule(self):
+        """The three other logs reach their own rules: R2(ii) and R1 named nothing here."""
+        assert bake_mod.transient_download_failure("") is None
+        assert bake_mod.transient_download_failure(_PANDAS_7_BUILD_LOG) is None
+        assert bake_mod.transient_download_failure(_LUIGI_30_BUILD_LOG) is None
+
+    def test_a_mismatch_block_that_names_no_package_is_not_this_rule(self):
+        """Fail closed: a mismatch that names nothing gives no package to re-fetch."""
+        output = (
+            "ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE.\n"
+        )
+        assert bake_mod.transient_download_failure(output) is None
+
+    def test_the_retry_for_a_transient_download_is_the_first_pass_unchanged(self):
+        """§8.6 R4 drops nothing, reorders nothing, and re-runs the identical recipe: the
+        bytes were wrong, not the layer. ``--no-cache-dir`` is what makes it a re-fetch."""
+        deps = self._deps()
+        plan = bake_mod.retry_plan(deps, _PANDAS_66_BUILD_LOG)
+        assert plan is not None
+        assert plan.rule == bake_mod.RETRY_RULE_TRANSIENT
+        assert plan.drops == ()
+        assert plan.hoist == ()
+        assert plan.transient is not None
+        assert plan.script == bake_mod.requirements_recipe(self.INSTALLS, minor="3.8")
+        assert plan.describe()
+
+    def test_each_rule_reads_its_own_log_and_not_the_others(self):
+        """The order is R2(ii) then R1 then R4, and each log reaches exactly its own."""
+        pandas_66 = self._deps()
+        assert (
+            bake_mod.retry_plan(pandas_66, _PANDAS_7_BUILD_LOG).rule
+            == bake_mod.RETRY_RULE_DROP
+        )
+        r1 = self._deps(build_pins=self._R1_BUILD, early_pins=self._R1_EARLY)
+        assert (
+            bake_mod.retry_plan(r1, _LUIGI_30_BUILD_LOG).rule
+            == bake_mod.RETRY_RULE_EARLY
+        )
+        assert (
+            bake_mod.retry_plan(pandas_66, _PANDAS_66_BUILD_LOG).rule
+            == bake_mod.RETRY_RULE_TRANSIENT
+        )
+
+    def test_record_retry_writes_the_transient_download(self, tmp_path):
+        deps = self._deps()
+        bake_mod.write_deps(tmp_path, deps)
+        before = bake_mod.load_deps(tmp_path, deps.checkpoint)
+        plan = bake_mod.retry_plan(deps, _PANDAS_66_BUILD_LOG)
+        bake_mod.record_retry(tmp_path, deps.checkpoint, plan)
+        after = bake_mod.load_deps(tmp_path, deps.checkpoint)
+        assert after["retry"]["rule"] == bake_mod.RETRY_RULE_TRANSIENT
+        assert after["retry"]["transient"]["spec"] == "matplotlib==3.1.3"
+        assert after["retry"]["transient"]["connection_broken"] is True
+        assert after["dropped"] == before.get("dropped", [])
+        # The retry record is decisive material too, so the identity moves.
+        assert after["checkpoint_id"] != before["checkpoint_id"]
+
     # ---- run_bake_actions: the retry, and failing closed -----------------
     CHILDREN = {"vanta-bi-Demo-1": PY38}
 
     def _retry_run(
-        self, *, retry, record_drops=None, first_error, second_ok, projects=None, **kwargs
+        self,
+        *,
+        retry,
+        record_drops=None,
+        first_error,
+        second_ok,
+        second_error=None,
+        projects=None,
+        **kwargs,
     ):
         existing = {PY38}
         projects = [] if projects is None else projects
@@ -18257,7 +18379,14 @@ class TestTheRetryOnAnUnbuildablePin:
                 )
             if name == "vanta-bi-Demo-1" and not second_ok:
                 return bake_mod.ExecResult(
-                    stdout="ERROR: retry blew up\n", stderr="", exit_code=1, timed_out=False
+                    stdout=(
+                        second_error
+                        if second_error is not None
+                        else "ERROR: retry blew up\n"
+                    ),
+                    stderr="",
+                    exit_code=1,
+                    timed_out=False,
                 )
             return bake_mod.ExecResult(
                 stdout="ok", stderr="", exit_code=0, timed_out=False
@@ -18346,6 +18475,36 @@ class TestTheRetryOnAnUnbuildablePin:
         message = str(excinfo.value)
         assert f"first-pass build log: {first}" in message
         assert f"retry build log: {second}" in message
+
+    def test_a_transient_download_is_retried_once_and_can_build(self):
+        """The R4 retry runs the identical recipe again; a clean second fetch bakes."""
+        plan = self._transient_plan()
+        summary, projects, logged = self._retry_run(
+            retry=lambda name, built: plan if name == "vanta-bi-Demo-1" else None,
+            first_error=_PANDAS_66_BUILD_LOG,
+            second_ok=True,
+        )
+        attempts = [script for name, script in projects if name == "vanta-bi-Demo-1"]
+        assert attempts == ["recipe for vanta-bi-Demo-1", "retry recipe"]
+        assert any("retry: re-fetching" in line for line in logged)
+        assert "[done] vanta-bi-Demo-1" in summary
+
+    def test_a_second_mismatch_is_a_possible_integrity_problem(self):
+        """Hash checking is never weakened: a second mismatch fails closed and the report
+        asks a person to look at the index rather than calling it another cut transfer."""
+        plan = self._transient_plan()
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._retry_run(
+                retry=lambda name, built: plan if name == "vanta-bi-Demo-1" else None,
+                first_error=_PANDAS_66_BUILD_LOG,
+                second_ok=False,
+                second_error=_PANDAS_66_BUILD_LOG,
+            )
+        message = str(excinfo.value)
+        assert "[FAILED] vanta-bi-Demo-1" in message
+        assert "possible integrity problem" in message
+        assert "matplotlib==3.1.3" in message
+        assert "not a transient download" in message
 
     def test_without_a_retry_callable_a_failed_layer_is_not_retried(self):
         """A caller that attaches no retry — every run before this rule — builds once."""

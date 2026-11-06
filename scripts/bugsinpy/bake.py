@@ -6865,6 +6865,47 @@ RETRY_RULE_DROP = "R2(ii)"
 RETRY_RULE_EARLY = "R1"
 """§8.6 R1's name, so the ``retry`` record says the second attempt only *reordered*."""
 
+RETRY_RULE_TRANSIENT = "R4"
+"""§8.6 R4's name, so the ``retry`` record says the second attempt only *re-fetched*.
+
+[VANTA-WHY] A third failure shape reaches neither R1 nor R2(ii), and it is the one where
+the layer is not at fault at all: the bytes pip received were not the bytes the index
+advertised. Measured on ``pandas/66`` — ``matplotlib==3.1.3``'s sdist arrived with
+``a126ab08…`` where the index's link says ``db3121…``, one line under ``ProtocolError
+('Connection aborted.', RemoteDisconnected('Remote end closed connection without
+response'))``. There is no pin to drop (nothing built wrong) and no ordering to change
+(nothing ran out of order); the transfer was cut short. The first pass is untouched, the
+retry re-runs the layer's own recipe **unchanged** — every install carries
+``--no-cache-dir``, so the bytes are fetched again and checked against the same hash — and
+a **second** mismatch is reported as a possible integrity problem rather than a second
+transient failure, and the layer fails closed. Hash checking is never weakened: the retry
+is the *same* check run again.
+"""
+
+HASH_MISMATCH_MARKER = "THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE"
+"""How pip opens the line that says a received body is not the one the index's hash names.
+
+The marker pip writes for a download its hash comparison refused; the requirement and both
+hashes are on the indented lines beneath it (:func:`transient_download_failure`). It is
+R4's trigger, and it is deliberately **not** read as a drop: the pin the body belonged to is
+one the layer wants.
+"""
+
+HASH_EXPECTED_PREFIX = "Expected sha256 "
+"""How the block's second line names the hash the index advertised."""
+
+HASH_GOT_PREFIX = "Got"
+"""How the block's third line names the hash the received body produced."""
+
+TRANSIENT_ABORT_MARKERS = ("ProtocolError", "RemoteDisconnected", "Connection reset")
+"""A transfer that was cut short, named on the same log as pip's own ``Retrying`` warning.
+
+Corroborating evidence and not a gate: the mismatch is the fact this rule answers, and a
+*first* mismatch is retried whether or not a broken connection is named above it (§8.6 R4).
+The distinction that matters — an interrupted transfer versus a package whose bytes really
+changed — is drawn by the retry, never by this reading.
+"""
+
 PREFLIGHT_CLASS_LETTERS: Mapping[str, str] = {
     INSTALLABLE_WHEEL: "a",
     SDIST_ONLY: "b",
@@ -9535,6 +9576,97 @@ def failed_build_line(output: str, name: str) -> str:
     return summary
 
 
+@dataclass(frozen=True)
+class TransientDownload:
+    """One download pip received that did not match the hash its index advertised (§8.6 R4).
+
+    ``spec`` is the requirement pip printed (``matplotlib==3.1.3``), ``expected`` the hash
+    the index's own link carries and ``got`` the one the received body produced, and
+    ``aborted`` whether a broken connection is named on the same log. The two hashes are
+    the whole *evidence*, and they are deliberately not the whole *verdict*: a body that
+    differs from its advertised hash is either a transfer that was cut short or a package
+    whose bytes changed, and only re-fetching the bytes tells the two apart — which is the
+    retry, and why a first mismatch retries while a second is an integrity problem.
+    """
+
+    spec: str
+    expected: str
+    got: str
+    aborted: bool
+    evidence: str
+
+    def describe(self) -> str:
+        """The one sentence the run's log and the layer's record both print."""
+        cause = (
+            "a connection break is named on the same log"
+            if self.aborted
+            else "nothing on the log explains a truncated body"
+        )
+        return (
+            f"pip received a body for {self.spec} that did not match the hash the index "
+            f"advertised (expected {self.expected or '?'}, got {self.got or '?'}; {cause}) "
+            "— a download to re-fetch, not a pin this layer can drop (§8.6 R4)"
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        """The record's own shape, so the metadata is a fact and not a sentence."""
+        return {
+            "spec": self.spec,
+            "expected_sha256": self.expected,
+            "got_sha256": self.got,
+            "connection_broken": self.aborted,
+            "evidence": self.evidence,
+        }
+
+
+def transient_download_failure(output: str) -> Optional[TransientDownload]:
+    """The last download pip refused for a mismatched hash, or ``None`` (§8.6 R4).
+
+    pip writes :data:`HASH_MISMATCH_MARKER`, then an indented block naming the requirement
+    and both hashes; this reads that block and takes the **last** one, like
+    :func:`failed_builds` and for the same reason — a log holding more than one attempt
+    answers with the last. The requirement line is the first non-empty line under the
+    marker and the text before its `` from `` is the spec; the two hashes are the lines
+    that start with :data:`HASH_EXPECTED_PREFIX` and :data:`HASH_GOT_PREFIX`.
+
+    A marker line with no requirement under it answers ``None`` rather than a guess: this
+    rule changes nothing and drops nothing, so a block it cannot read is a block a second
+    attempt could do nothing differently about, and the layer keeps its first-pass
+    classification. The one thing that is *not* required is the connection break
+    (:data:`TRANSIENT_ABORT_MARKERS`): it is recorded when present and never gates the
+    retry, because the mismatch itself is the case and the retry is what separates an
+    interrupted transfer from a changed package.
+    """
+    lines = [raw.strip() for raw in output.replace("\r", "\n").splitlines()]
+    aborted = any(marker in output for marker in TRANSIENT_ABORT_MARKERS)
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index]
+        if not line.startswith(ERROR_LINE_PREFIXES) or HASH_MISMATCH_MARKER not in line:
+            continue
+        spec = expected = got = ""
+        for rest in lines[index + 1 :]:
+            if not rest:
+                if spec:
+                    break
+                continue
+            if not spec:
+                spec = rest.split(" from ", 1)[0].strip()
+            elif rest.startswith(HASH_EXPECTED_PREFIX):
+                expected = rest[len(HASH_EXPECTED_PREFIX) :].strip()
+            elif rest.startswith(HASH_GOT_PREFIX):
+                got = rest[len(HASH_GOT_PREFIX) :].strip()
+        if not spec:
+            return None
+        return TransientDownload(
+            spec=spec,
+            expected=expected,
+            got=got,
+            aborted=aborted,
+            evidence=f"build log line {index + 1}: {line}",
+        )
+    return None
+
+
 def retry_drops(
     output: str,
     *,
@@ -9711,17 +9843,20 @@ def hoisted_pins(output: str, *, early_pins: Sequence[str]) -> tuple[HoistedPin,
 
 @dataclass(frozen=True)
 class RetryPlan:
-    """One per-bug layer's single second attempt (§8.6 R1 and R2(ii)).
+    """One per-bug layer's single second attempt (§8.6 R1, R2(ii) and R4).
 
     ``script`` is the recipe the second attempt runs, and only a build that has already
-    failed reaches here: the first pass is byte-identical to what it was before either
-    rule existed. Under **R2(ii)** it is the first-pass recipe with the pins the retry
-    dropped removed — from the main pass, from the early pass or from the ``--no-deps``
-    pass, whichever held them — and ``drops`` is what it removed and why. Under **R1**
-    nothing is dropped (``drops`` is empty) and the two changes are the ordering ones: the
-    early pins installed before the build requirements, and, ahead of the early block, its
-    own install of the pins ``hoist`` names. In both cases ``drops``, ``hoist`` and ``why``
-    reach the layer's provenance and the run's summary.
+    failed reaches here: the first pass is byte-identical to what it was before any rule
+    existed. Under **R2(ii)** it is the first-pass recipe with the pins the retry dropped
+    removed — from the main pass, from the early pass or from the ``--no-deps`` pass,
+    whichever held them — and ``drops`` is what it removed and why. Under **R1** nothing is
+    dropped (``drops`` is empty) and the two changes are the ordering ones: the early pins
+    installed before the build requirements, and, ahead of the early block, its own install
+    of the pins ``hoist`` names. Under **R4** nothing is dropped and nothing is reordered
+    (``drops`` and ``hoist`` are both empty): the script is the first pass **unchanged**,
+    re-run, and ``transient`` is the mismatch that made it worth re-fetching. In every case
+    ``drops``, ``hoist``, ``transient`` and ``why`` reach the layer's provenance and the
+    run's summary.
     """
 
     script: str
@@ -9729,10 +9864,16 @@ class RetryPlan:
     hoist: tuple[HoistedPin, ...] = ()
     rule: str = RETRY_RULE_DROP
     why: str = ""
+    transient: Optional[TransientDownload] = None
 
     def describe(self) -> list[str]:
-        """One line per hoist and per drop, in the shape the log prints."""
-        lines = [
+        """One line per hoist, per drop and per re-fetch, in the shape the log prints."""
+        lines = (
+            [f"re-fetching — {self.transient.describe()}"]
+            if self.transient is not None
+            else []
+        )
+        lines += [
             f"hoisting {item.pin} ahead of the early block — the log shows easy_install "
             f"reaching for {item.fetched} ({item.evidence})"
             for item in self.hoist
@@ -9761,11 +9902,11 @@ def _declared_sources(deps: "BugDeps") -> dict[str, tuple[str, ...]]:
 
 
 def retry_plan(deps: "BugDeps", output: str) -> Optional[RetryPlan]:
-    """The one retry a per-bug layer whose build *failed* is allowed (§8.6 R1, R2(ii)).
+    """The one retry a per-bug layer whose build *failed* is allowed (§8.6 R1, R2(ii), R4).
 
-    ``None`` for every layer neither rule reaches: one with no material (an interpreter
-    layer, or a caller that did not attach it), and every log that is not one of the two
-    rules' cases. The two are told apart by :func:`failed_builds` and never overlap:
+    ``None`` for every layer none of the rules reaches: one with no material (an interpreter
+    layer, or a caller that did not attach it), and every log that is not one of the three
+    rules' cases. The order is the rules' own, and it matters:
 
     * **a distribution named** (:func:`failed_builds` is non-empty) — §8.6 R2(ii). The
       recipe is re-rendered from the layer's own pin lists with the dropped pins removed
@@ -9780,8 +9921,18 @@ def retry_plan(deps: "BugDeps", output: str) -> Optional[RetryPlan]:
       nothing is added; the recipe is the first pass with ``early_pins_first`` set and with
       the fetched distribution's pin installed ahead of the early block by a step of its
       own (:class:`HoistedPin`). A log that names **no** fetch — or names one no early pin
-      satisfies — answers ``None`` here: with nothing to hoist there is nothing a second
-      attempt could do differently, and the layer keeps its first-pass classification.
+      satisfies — answers ``None`` here and falls through to R4, which will also answer
+      ``None`` unless the log *also* carries a hash mismatch: with nothing to hoist and
+      nothing mismatched there is nothing a second attempt could do differently, and the
+      layer keeps its first-pass classification.
+    * **a hash mismatch** (:func:`transient_download_failure` is not ``None``) — §8.6 R4,
+      and the **fallback of last resort**. Nothing is dropped and nothing is reordered:
+      the recipe is the **first pass unchanged**, re-run, so ``--no-cache-dir`` fetches the
+      bytes again and the same hash check runs on them. It is asked last because the other
+      two rules' retries re-run the recipe too and so re-fetch as well — a pass that both
+      dropped an unbuildable pin and met a corrupted download is answered by the one retry
+      that does both — while this rule is the one that changes nothing, and belongs where
+      changing nothing is the only thing left to try.
     """
     material = deps.retry
     if material is None:
@@ -9844,6 +9995,31 @@ def retry_plan(deps: "BugDeps", output: str) -> Optional[RetryPlan]:
                     + " installed ahead of the block, and before the build requirements"
                 ),
             )
+    transient = transient_download_failure(output)
+    if transient is not None:
+        # §8.6 R4: the same recipe, re-run. Not a single byte changes — which is the point,
+        # because nothing about the layer was wrong; the bytes that arrived were. Every
+        # install carries --no-cache-dir, so running it again fetches them afresh and checks
+        # them against the same advertised sha256 (hash checking is never weakened).
+        return RetryPlan(
+            script=requirements_recipe(
+                deps.installs,
+                build_pins=deps.build_pins,
+                early_pins=deps.early_pins,
+                no_deps_pins=deps.no_deps_pins,
+                orphans=deps.orphans,
+                minor=material.minor,
+            ),
+            drops=(),
+            rule=RETRY_RULE_TRANSIENT,
+            why=(
+                "the first pass received a body that did not match the hash its index "
+                "advertised, so the layer was re-fetched once with its own recipe "
+                "unchanged (§8.6 R4); "
+                + transient.describe()
+            ),
+            transient=transient,
+        )
     return None
 
 
@@ -12262,9 +12438,13 @@ def record_retry(deps_dir: Path, checkpoint: str, plan: RetryPlan) -> Path:
     is untouched and ``retry`` alone carries the fact that the second attempt only
     reordered the installs — ``hoisted`` names each pin it installed ahead of the early
     block, with the log line that named the fetch it answers (:func:`hoisted_pins`), and
-    is the empty list for an R2(ii) retry, symmetrically with ``dropped``. Both keys are
-    "every drop, with its source, its failure reason and its closure evidence, in the
-    layer metadata", and ``hoisted`` is the same account of the change that is not a drop.
+    is the empty list for an R2(ii) retry, symmetrically with ``dropped``. Under **R4**
+    nothing is dropped or reordered either and ``dropped``/``hoisted`` are both empty; the
+    fact the record adds is ``transient`` — the requirement, the two hashes and the log
+    line — which is the failure *class* the run's summary names and the metadata keeps.
+    Every key together are "every drop, with its source, its failure reason and its closure
+    evidence, in the layer metadata", and ``hoisted`` and ``transient`` are the same
+    account of the two changes that are not drops.
 
     The identity is **re-stamped**, unlike :func:`record_pip_check`, and the difference is
     the point: ``pip_check`` is a verdict *about* a layer and :func:`provenance_digest`
@@ -12273,7 +12453,9 @@ def record_retry(deps_dir: Path, checkpoint: str, plan: RetryPlan) -> Path:
     whose identity does not describe it, and two layers that resolved the same first-pass
     pins would share a key while holding different environments. R1 re-stamps for the same
     reason: ``retry`` is decisive too, and the second attempt's ordering is not the
-    first's.
+    first's. R4 re-stamps for the third: ``retry`` is decisive there too, and two layers
+    whose first pass resolved the same pins can differ in whether the bytes had to be
+    fetched twice.
     """
 
     data = load_deps(deps_dir, checkpoint)
@@ -12292,6 +12474,7 @@ def record_retry(deps_dir: Path, checkpoint: str, plan: RetryPlan) -> Path:
         ),
         "dropped": [drop.as_dict() for drop in plan.drops],
         "hoisted": [item.as_dict() for item in plan.hoist],
+        "transient": plan.transient.as_dict() if plan.transient is not None else None,
     }
     path = deps_path(deps_dir, checkpoint)
     path.write_text(
@@ -13558,6 +13741,7 @@ def run_bake_actions(
     logs: dict[str, Path] = {}
     retry_results: dict[str, ExecResult] = {}
     retry_logs: dict[str, Path] = {}
+    retry_integrity: dict[str, TransientDownload] = {}
     if logs_dir is not None:
         log(f"[logs] this bake's build logs: {logs_dir}")
 
@@ -13606,6 +13790,20 @@ def run_bake_actions(
                         f"[{action.name}] retry failed — the layer fails closed and is "
                         "classified exactly as a first-pass failure is"
                     )
+                    # §8.6 R4: if the *retry* also received a body that did not match its
+                    # advertised hash, this is no longer a transient download — the bytes
+                    # disagreed with the index twice, and the second reading is an
+                    # integrity problem rather than another interrupted transfer. Named
+                    # here rather than left to the reader to notice, because it is the one
+                    # failure of these rules that asks a *person* to look at the index.
+                    again = transient_download_failure(retried.stdout + retried.stderr)
+                    if again is not None:
+                        retry_integrity[action.name] = again
+                        log(
+                            f"[{action.name}] the retry also failed its hash check on "
+                            f"{again.spec} — recorded as a possible integrity problem, not "
+                            "a transient download (§8.6 R4)"
+                        )
                     if logs_dir is not None:
                         retry_logs[action.name] = write_bake_log(
                             logs_dir, f"{action.name}.retry", retried
@@ -13695,6 +13893,7 @@ def run_bake_actions(
             _failure_report(
                 failed, results, summary, logs,
                 retries=retry_results, retry_logs=retry_logs,
+                integrity=retry_integrity,
             )
         )
     return summary
@@ -13707,6 +13906,7 @@ def _failure_report(
     logs: Optional[Mapping[str, Path]] = None,
     retries: Optional[Mapping[str, ExecResult]] = None,
     retry_logs: Optional[Mapping[str, Path]] = None,
+    integrity: Optional[Mapping[str, TransientDownload]] = None,
 ) -> str:
     """Every failed layer's own error line, where its log is, then the summary.
 
@@ -13727,6 +13927,12 @@ def _failure_report(
     is exactly what ``pandas/7`` and ``luigi/30`` looked like. ``retries`` and
     ``retry_logs`` are the run's record of which layers were retried and where each
     attempt's output went; a layer absent from them behaves exactly as before.
+
+    ``integrity`` is §8.6 R4's second half: a layer whose retry received a body that
+    disagreed with its index's hash *again*. That is not another transient download — the
+    same bytes failed the same check twice — so it is named as a possible integrity
+    problem, which is a statement a person has to act on and the one outcome of these
+    rules that is not resolved by the harness.
     """
     lines = [f"{len(failed)} layer(s) failed to bake:"]
     for name in failed:
@@ -13745,6 +13951,13 @@ def _failure_report(
         retry_path = (retry_logs or {}).get(name)
         if retry_path is not None:
             lines.append(f"    retry build log: {retry_path}")
+        again = (integrity or {}).get(name)
+        if again is not None:
+            lines.append(
+                f"    the retry also failed its hash check on {again.spec} "
+                f"({again.evidence}) — a possible integrity problem, not a transient "
+                "download (§8.6 R4)"
+            )
     lines.append("")
     lines.append(summary)
     return "\n".join(lines)

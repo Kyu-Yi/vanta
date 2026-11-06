@@ -484,6 +484,45 @@ class UndatableRef(BakeError):
         self.ref = ref
 
 
+class UnknownDeclarations(BakeError):
+    """One release whose declarations no reading reaches: a **known** unknown.
+
+    [VANTA-WHY] A distinct type, because "nobody could read this release's declarations"
+    and "reading them failed" are answered differently by §8.6 R2(ii)'s ``--no-deps``
+    closure (:func:`no_deps_dependents`). :func:`declared_requires` reads the version JSON,
+    the PEP 658 sidecar, the wheel and the sdist's own ``install_requires`` in turn, and a
+    release none of the four reaches is a fact about the release — PyPI carries no
+    ``requires_dist`` for it and nothing else to read it from (``httpcore==0.3.0`` is the
+    pin this is for) — which is :data:`CASE_UNKNOWN` and must be left in place rather than
+    guessed at, with the strict freeze gate as the backstop. A read that *errored* (a
+    network fault, a timeout, a body that is not the JSON it should be) is the other case
+    and fails the layer closed. It still *is* a :class:`BakeError`, so every existing
+    ``except BakeError`` reads it as before.
+    """
+
+
+class UnmovableDependent(BakeError):
+    """One pin §8.6 R2(ii)'s ``--no-deps`` closure has to move and may not.
+
+    [VANTA-WHY] A distinct type, because :func:`no_deps_dependents` has to answer two
+    questions the same way *within* a reading and differently *between* readings, and only
+    a type lets the caller tell which one it hit. Within a reading a release whose
+    declarations could not be **read** (a network fault, a timeout, a body that is not the
+    JSON it should be — the ``ERROR`` case, as against the known unknown
+    :class:`UnknownDeclarations`) means the closure cannot be closed against a picture it
+    only half holds, so the pin is named here rather than silently skipped: the first pass
+    flags the bug on it (D4) and the retry refuses to render a second attempt (D2). Carries
+    the ``spec`` it could not account for and the ``why``, which is the pair a refusal
+    record and the run's summary both need. It still *is* a :class:`BakeError`, so every
+    existing ``except BakeError`` reads it as before.
+    """
+
+    def __init__(self, spec: str, why: str) -> None:
+        super().__init__(f"{spec} cannot be moved out of the resolving pass: {why}")
+        self.spec = spec
+        self.why = why
+
+
 @dataclass(frozen=True)
 class PytestPin:
     pytest: str
@@ -6406,7 +6445,7 @@ def declared_requires(
         from_sdist = read_sdist(sdist)
         if from_sdist is not None:
             return tuple(from_sdist)
-    raise BakeError(
+    raise UnknownDeclarations(
         f"PyPI carries no 'requires_dist' for {name}=={version}, and neither a wheel "
         "nor a PEP 658 sidecar to read it from, and the sdist's setup.py does not "
         "declare install_requires as literals, so what it declares is unknown"
@@ -9750,10 +9789,16 @@ class RetryMaterial:
     requirements. A retry that rebuilt them would be a second answer to a question
     resolution had already answered, which is the one thing the layer's record exists to
     prevent.
+
+    ``metadata_of`` is the reader the first pass's ``--no-deps`` closure was answered
+    with (:func:`no_deps_dependents`), carried for the same reason: the retry has to
+    re-close the set over the pins that survive the drop, and reading the releases'
+    declarations a second way would be the second reading this record exists to avoid.
     """
 
     audit: Callable[[str], ImportAudit]
     safeguard: Safeguard
+    metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]]
     minor: str
 
 
@@ -9857,6 +9902,19 @@ class RetryPlan:
     re-run, and ``transient`` is the mismatch that made it worth re-fetching. In every case
     ``drops``, ``hoist``, ``transient`` and ``why`` reach the layer's provenance and the
     run's summary.
+
+    ``refused`` is the one shape that is not a retry at all: §8.6 R2(ii) can be asked to
+    re-render a layer whose ``--no-deps`` set it *cannot* close, and the honest answer is
+    that no second attempt may be rendered. ``None`` is the ordinary answer; a non-empty
+    tuple is the refusal itself, one ``(spec, why)`` pair per dependent that caused it,
+    because the two causes name different things and both have to reach the record:
+    a dependent whose own declarations could not be **read** (:class:`UnmovableDependent`,
+    a network fault — the closure would be drawn against a half-read picture), and a
+    dependent the safeguard **protects** (:func:`pin_safeguard` — moving it out of the
+    resolving pass is not the closure's to decide). Then ``script`` is empty and is never
+    run (:func:`run_bake_actions` logs ``describe`` and leaves the layer with its
+    first-pass classification), and each pair is the fact a reader needs to tell this
+    layer apart from one no rule reached.
     """
 
     script: str
@@ -9865,6 +9923,7 @@ class RetryPlan:
     rule: str = RETRY_RULE_DROP
     why: str = ""
     transient: Optional[TransientDownload] = None
+    refused: Optional[tuple[tuple[str, str], ...]] = None
 
     def describe(self) -> list[str]:
         """One line per hoist, per drop and per re-fetch, in the shape the log prints."""
@@ -9882,6 +9941,10 @@ class RetryPlan:
             f"dropping {drop.pin} — {drop.reason}; "
             + (drop.import_note or "nothing in either tree imports it")
             for drop in self.drops
+        ]
+        lines += [
+            f"refusing to retry — {spec} cannot be moved out of the resolving pass: {why}"
+            for spec, why in (self.refused or ())
         ]
         if self.why:
             lines.append(self.why)
@@ -9947,9 +10010,10 @@ def retry_plan(deps: "BugDeps", output: str) -> Optional[RetryPlan]:
         )
         if not drops:
             return None
-        gone = {drop.name for drop in drops}
+        gone = {canonicalize_name(drop.name) for drop in drops}
 
-        def kept(specs: Sequence[str]) -> tuple[str, ...]:
+        def surviving(specs: Sequence[str]) -> tuple[str, ...]:
+            """The layer's pins with the retry's dropped ones removed."""
             out = []
             for spec in specs:
                 parts = _pinned_parts(spec)
@@ -9957,12 +10021,65 @@ def retry_plan(deps: "BugDeps", output: str) -> Optional[RetryPlan]:
                     out.append(spec)
             return tuple(out)
 
+        installs = surviving(deps.installs)
+        build_pins = surviving(deps.build_pins)
+        early_pins = surviving(deps.early_pins)
+        kept_no_deps = surviving(deps.no_deps_pins)
+        # D3: the retry **moves**, it does not merely drop. A pin the main pass keeps but
+        # whose own release declares a name that pass installs nothing for makes pip
+        # resolve that name itself, at the newest release of the day — exactly what the
+        # failing first pass did, and the whole reason §3.2's absent-name rule exists — so
+        # it would fail again. ``absent`` is the names the retry's main pass installs
+        # nothing for: the pins just dropped, and the names the layer's own ``--no-deps``
+        # pass already holds (its pins leave the resolving pass too). The closure is
+        # transitive, so ``mpl-toolkits-clifford`` moves with ``clifford`` moves with the
+        # dropped ``h5py``, and it is the *same* reader the first pass used, so the two
+        # passes cannot answer differently.
+        absent = [
+            *(canonicalize_name(drop.name) for drop in drops),
+            *(
+                _pinned_parts(spec)[0]
+                for spec in kept_no_deps
+                if _pinned_parts(spec) is not None
+            ),
+        ]
+        try:
+            moved = no_deps_dependents(
+                installs, absent, metadata_of=material.metadata_of
+            )
+        except UnmovableDependent as exc:
+            # D2/D4: a read that errored means the closure would be drawn against a
+            # picture it only half holds, so no second attempt may be rendered at all.
+            return RetryPlan(script="", drops=drops, refused=((exc.spec, exc.why),))
+        # D2/D5(b): a dependent the safeguard protects may not leave the resolving pass on
+        # the closure's word alone, so a move it refuses is not a move — the layer fails
+        # closed, and the refusal names the dependent and the reason.
+        refused: list[tuple[str, str]] = []
+        for spec in moved:
+            name, version = _pinned_parts(spec)
+            canonical = canonicalize_name(name)
+            why = material.safeguard(canonical, version, material.audit(canonical))
+            if why is not None:
+                refused.append((spec, why))
+        if refused:
+            return RetryPlan(script="", drops=drops, refused=tuple(refused))
+        no_deps_pins = list(kept_no_deps)
+        moved_names = {
+            canonicalize_name(_pinned_parts(spec)[0])
+            for spec in kept_no_deps
+            if _pinned_parts(spec) is not None
+        }
+        for spec in moved:
+            canonical = canonicalize_name(_pinned_parts(spec)[0])
+            if canonical not in moved_names:
+                moved_names.add(canonical)
+                no_deps_pins.append(spec)
         return RetryPlan(
             script=requirements_recipe(
-                kept(deps.installs),
-                build_pins=kept(deps.build_pins),
-                early_pins=kept(deps.early_pins),
-                no_deps_pins=kept(deps.no_deps_pins),
+                installs,
+                build_pins=build_pins,
+                early_pins=early_pins,
+                no_deps_pins=tuple(no_deps_pins),
                 orphans=deps.orphans,
                 minor=material.minor,
             ),
@@ -10595,6 +10712,38 @@ def _declared_requirement(
         if canonicalize_name(requirement.name) == canonicalize_name(name):
             return requirement.specifier
     return None
+
+
+def _declares_absent(
+    requires: Sequence[str], names: Container[str]
+) -> tuple[bool, bool]:
+    """``(mentions, real)`` for one release's declarations against a set of names.
+
+    Two readings of the same document, because :func:`no_deps_dependents` needs both.
+    ``mentions`` is the marker-blind one (:func:`_declared_requirement`): the release
+    names one of ``names`` at all, whatever marker guards it. ``real`` is the stricter
+    one: it names one of them **outside** an ``extra`` marker, so a declaration like
+    ``pytest>=5; extra == 'test'`` mentions pytest without being a requirement of the
+    release as this layer installs it. A declaration that merely *mentions* a name is why
+    the pin moves out of the resolving pass — pip would still try to resolve what it names
+    — while only a declaration that *really* needs one means the pin's own name has to be
+    honoured by everything else, and so only a real one is added to the propagating set.
+    Platform and version markers (``uvloop; sys_platform != 'win32'``) are real: they
+    guard *when* a requirement applies, not whether it is one at all.
+    """
+    mentions = real = False
+    for raw in requires:
+        try:
+            requirement = Requirement(raw)
+        except InvalidRequirement:
+            continue
+        if canonicalize_name(requirement.name) not in names:
+            continue
+        mentions = True
+        marker = requirement.marker
+        if marker is None or "extra" not in str(marker):
+            real = True
+    return mentions, real
 
 
 def newest_accepting_pytest(
@@ -11592,30 +11741,63 @@ def no_deps_dependents(
     than the result of two calls — belongs in the pass once.
 
     A pin is a dependent when its **own** release's ``requires_dist`` names one of the
-    names (:func:`_declared_requirement`), read at the version ``installs`` carries. A
-    release whose metadata cannot be read is skipped rather than guessed at: the walk
-    already recorded that release's declarations, and inventing a dependency here would
-    be the second reader the rest of this module exists to avoid.
+    names (:func:`_declares_absent`), read at the version ``installs`` carries — and the
+    set is **closed transitively**, because moving a dependent out of the main pass makes
+    *its* name a name the main pass installs nothing for. Measured on ``pandas/7``'s
+    retry: dropping the unbuildable ``h5py==2.10.0`` leaves ``clifford==1.3.1``
+    (which declares it) in the moved set, and ``mpl-toolkits-clifford==0.0.3``
+    (which declares ``clifford``) has to move with it, or pip resolves the whole chain
+    itself when the main pass reaches it — the unpinned ``h5py 3.11.0`` the retry log
+    shows. So each moved pin whose declaration is a *real* requirement, and not one gated
+    behind an ``extra`` marker, joins the names and the walk runs to a fixpoint.
+
+    A release whose metadata is a **known** unknown — :class:`UnknownDeclarations`, the
+    release PyPI carries no readable declarations for — is left where it is: moving it
+    would be guessing, and the strict freeze gate (:func:`unpinned_freeze`) is the
+    backstop that fails the layer if that release turns out to declare an absent name. A
+    read that *errored* is the other case and is not answered here at all: it raises
+    :class:`UnmovableDependent`, naming the pin it could not read and why, so the caller
+    fails the layer closed (the first pass's flag, the retry's refusal) rather than
+    resolving against a half-read picture.
     """
     names = {canonicalize_name(name) for name in absent}
     if not names:
         return ()
-    out: list[str] = []
+    specs: dict[str, str] = {}
+    order: list[str] = []
     for spec in installs:
         parts = _pinned_parts(spec)
         if parts is None:
             continue
-        name, version = parts
-        try:
-            requires, _requires_python = metadata_of(name, version)
-        except BakeError:
-            continue
-        if any(
-            _declared_requirement(requires, absent_name) is not None
-            for absent_name in names
-        ):
-            out.append(spec)
-    return tuple(out)
+        name = canonicalize_name(parts[0])
+        if name not in specs:
+            specs[name] = spec
+            order.append(name)
+    moved: dict[str, str] = {}
+    changed = True
+    while changed:
+        changed = False
+        for name in order:
+            if name in moved:
+                continue
+            spec = specs[name]
+            package, version = _pinned_parts(spec)
+            try:
+                requires, _requires_python = metadata_of(package, version)
+            except UnknownDeclarations:
+                continue
+            except BakeError as exc:
+                raise UnmovableDependent(
+                    spec, f"what it declares could not be read ({exc})"
+                ) from exc
+            mentions, real = _declares_absent(requires, names)
+            if not mentions:
+                continue
+            moved[name] = spec
+            if real:
+                names.add(name)
+            changed = True
+    return tuple(moved[name] for name in order if name in moved)
 
 
 def deps_provenance(
@@ -12195,14 +12377,23 @@ def resolve_bug_deps(
         # (:func:`requirements_recipe`), which is what stops pip resolving it at all;
         # ``pip check`` then reports that name and nothing else, which is what the gate
         # tolerates by name (:data:`CASE_DROPPED_DEPENDENCY`, :data:`CASE_TREE_PROVIDED`).
-        no_deps = no_deps_dependents(
-            installs,
-            (
-                *(record.name for record in dropped),
-                *(record.name for record in tree_satisfied_pins),
-            ),
-            metadata_of=metadata_of,
-        )
+        try:
+            no_deps = no_deps_dependents(
+                installs,
+                (
+                    *(record.name for record in dropped),
+                    *(record.name for record in tree_satisfied_pins),
+                ),
+                metadata_of=metadata_of,
+            )
+        except BakeError as exc:
+            # D4: a read that *errored* is not answered by skipping the pin — the pass
+            # would then be built from a half-read picture — so the bug is flagged closed
+            # here, exactly as any other layer this run could not resolve. A release that
+            # is a *known* unknown is not this case: :func:`no_deps_dependents` leaves it
+            # where it is and the strict freeze gate is the backstop.
+            flagged.append(FlaggedBug(key=key, reason=f"{type(exc).__name__}: {exc}"))
+            continue
         # §3.2's marker rule over the pinned releases' own build declarations, which is
         # this rule's early-pass half: a ``[build-system].requires`` entry that does not
         # hold on this image is not something the build orders anything for. The dropped
@@ -12252,7 +12443,12 @@ def resolve_bug_deps(
                 # this layer was resolved with, carried rather than rebuilt when a build
                 # fails: the auditor reads both trees, and a second one built at retry
                 # time would be a second answer to a question already answered here.
-                retry=RetryMaterial(audit=audit, safeguard=safeguard, minor=minor),
+                retry=RetryMaterial(
+                    audit=audit,
+                    safeguard=safeguard,
+                    metadata_of=metadata_of,
+                    minor=minor,
+                ),
             )
         )
     return out, flagged
@@ -12446,6 +12642,14 @@ def record_retry(deps_dir: Path, checkpoint: str, plan: RetryPlan) -> Path:
     evidence, in the layer metadata", and ``hoisted`` and ``transient`` are the same
     account of the two changes that are not drops.
 
+    [VANTA-WHY] A **refused** plan is the one case that is not a retry at all (§8.6 R2(ii),
+    D2): the ``--no-deps`` set could not be closed, so no second attempt was rendered and
+    nothing was dropped. The record is still written, because the layer must be
+    distinguishable from one no rule reached: ``used`` is ``False``, ``refused`` names each
+    dependent and the reason it could not leave the resolving pass, and
+    ``dropped``/``hoisted``/``transient`` keep their empty shapes so a reader sees the same
+    record with the same meaning.
+
     The identity is **re-stamped**, unlike :func:`record_pip_check`, and the difference is
     the point: ``pip_check`` is a verdict *about* a layer and :func:`provenance_digest`
     excludes it, whereas these drops change which pins the layer holds — ``dropped`` is
@@ -12459,6 +12663,29 @@ def record_retry(deps_dir: Path, checkpoint: str, plan: RetryPlan) -> Path:
     """
 
     data = load_deps(deps_dir, checkpoint)
+    if plan.refused is not None:
+        # D2/D5: a refusal is not a retry. Nothing was dropped and no second attempt ran,
+        # so ``dropped`` at the top level is untouched; what this failed layer's record
+        # gains is that the retry the rule offered was refused, and on what.
+        data[RETRY_KEY] = {
+            "used": False,
+            "rule": plan.rule,
+            "reason": "the retry was refused — "
+            + "; ".join(
+                f"{spec} cannot be moved out of the resolving pass: {why}"
+                for spec, why in plan.refused
+            ),
+            "dropped": [],
+            "hoisted": [],
+            "transient": None,
+            "refused": [{"spec": spec, "why": why} for spec, why in plan.refused],
+        }
+        path = deps_path(deps_dir, checkpoint)
+        path.write_text(
+            json.dumps(stamp_provenance(data), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        return path
     records = data.get("dropped")
     dropped = list(records) if isinstance(records, list) else []
     dropped.extend(drop.as_dict() for drop in plan.drops)
@@ -13742,6 +13969,7 @@ def run_bake_actions(
     retry_results: dict[str, ExecResult] = {}
     retry_logs: dict[str, Path] = {}
     retry_integrity: dict[str, TransientDownload] = {}
+    refusals: dict[str, RetryPlan] = {}
     if logs_dir is not None:
         log(f"[logs] this bake's build logs: {logs_dir}")
 
@@ -13768,50 +13996,64 @@ def run_bake_actions(
             if plan is not None:
                 for line in plan.describe():
                     log(f"[{action.name}] retry: {line}")
-                retried = build(action.name, plan.script, action.base)
-                if retried.ok:
-                    dropped_names[action.name] = (
-                        *dropped_names.get(action.name, ()),
-                        *(drop.name for drop in plan.drops),
-                    )
+                if plan.refused is not None:
+                    # D2: a dependent the closure cannot move is **not** a retry. No
+                    # second attempt is rendered — ``script`` is empty and is never run
+                    # — the layer keeps its first-pass classification on the ordinary
+                    # failure path below, and the refusal, each dependent and its
+                    # reason, is what the layer's provenance and the run's report carry
+                    # instead. The line above already named it through ``describe``.
+                    refusals[action.name] = plan
                     if record_drops is not None:
                         record_drops(action.name, plan)
-                    built = retried
                 else:
-                    # Fail closed: the layer is classified exactly as a first-pass
-                    # failure is. The retry's own output is the diagnosis — it is the
-                    # attempt that decided this layer's fate, and the first pass's log
-                    # usually ends in the failure the retry was answering — so it is
-                    # written *beside* the first pass's file and reported in place of
-                    # it, while the first pass's file is kept and named too
-                    # (:func:`retry_log_path`, :func:`_failure_report`).
-                    retry_results[action.name] = retried
-                    log(
-                        f"[{action.name}] retry failed — the layer fails closed and is "
-                        "classified exactly as a first-pass failure is"
-                    )
-                    # §8.6 R4: if the *retry* also received a body that did not match its
-                    # advertised hash, this is no longer a transient download — the bytes
-                    # disagreed with the index twice, and the second reading is an
-                    # integrity problem rather than another interrupted transfer. Named
-                    # here rather than left to the reader to notice, because it is the one
-                    # failure of these rules that asks a *person* to look at the index.
-                    again = transient_download_failure(retried.stdout + retried.stderr)
-                    if again is not None:
-                        retry_integrity[action.name] = again
+                    retried = build(action.name, plan.script, action.base)
+                    if retried.ok:
+                        dropped_names[action.name] = (
+                            *dropped_names.get(action.name, ()),
+                            *(drop.name for drop in plan.drops),
+                        )
+                        if record_drops is not None:
+                            record_drops(action.name, plan)
+                        built = retried
+                    else:
+                        # Fail closed: the layer is classified exactly as a first-pass
+                        # failure is. The retry's own output is the diagnosis — it is the
+                        # attempt that decided this layer's fate, and the first pass's log
+                        # usually ends in the failure the retry was answering — so it is
+                        # written *beside* the first pass's file and reported in place of
+                        # it, while the first pass's file is kept and named too
+                        # (:func:`retry_log_path`, :func:`_failure_report`).
+                        retry_results[action.name] = retried
                         log(
-                            f"[{action.name}] the retry also failed its hash check on "
-                            f"{again.spec} — recorded as a possible integrity problem, not "
-                            "a transient download (§8.6 R4)"
+                            f"[{action.name}] retry failed — the layer fails closed and is "
+                            "classified exactly as a first-pass failure is"
                         )
-                    if logs_dir is not None:
-                        retry_logs[action.name] = write_bake_log(
-                            logs_dir, f"{action.name}.retry", retried
+                        # §8.6 R4: if the *retry* also received a body that did not match
+                        # its advertised hash, this is no longer a transient download —
+                        # the bytes disagreed with the index twice, and the second reading
+                        # is an integrity problem rather than another interrupted
+                        # transfer. Named here rather than left to the reader to notice,
+                        # because it is the one failure of these rules that asks a
+                        # *person* to look at the index.
+                        again = transient_download_failure(
+                            retried.stdout + retried.stderr
                         )
-                        log(
-                            f"[{action.name}] retry build log: "
-                            f"{retry_logs[action.name]}"
-                        )
+                        if again is not None:
+                            retry_integrity[action.name] = again
+                            log(
+                                f"[{action.name}] the retry also failed its hash check on "
+                                f"{again.spec} — recorded as a possible integrity problem, "
+                                "not a transient download (§8.6 R4)"
+                            )
+                        if logs_dir is not None:
+                            retry_logs[action.name] = write_bake_log(
+                                logs_dir, f"{action.name}.retry", retried
+                            )
+                            log(
+                                f"[{action.name}] retry build log: "
+                                f"{retry_logs[action.name]}"
+                            )
         result = built
         verdict: Optional[ExecResult] = None
         if built.ok:
@@ -13893,7 +14135,7 @@ def run_bake_actions(
             _failure_report(
                 failed, results, summary, logs,
                 retries=retry_results, retry_logs=retry_logs,
-                integrity=retry_integrity,
+                integrity=retry_integrity, refusals=refusals,
             )
         )
     return summary
@@ -13907,6 +14149,7 @@ def _failure_report(
     retries: Optional[Mapping[str, ExecResult]] = None,
     retry_logs: Optional[Mapping[str, Path]] = None,
     integrity: Optional[Mapping[str, TransientDownload]] = None,
+    refusals: Optional[Mapping[str, RetryPlan]] = None,
 ) -> str:
     """Every failed layer's own error line, where its log is, then the summary.
 
@@ -13933,6 +14176,13 @@ def _failure_report(
     same bytes failed the same check twice — so it is named as a possible integrity
     problem, which is a statement a person has to act on and the one outcome of these
     rules that is not resolved by the harness.
+
+    ``refusals`` is §8.6 R2(ii)'s other outcome: a layer whose ``--no-deps`` set the rule
+    *could not* close, so no second attempt was rendered at all (:class:`RetryPlan`'s
+    ``refused``, D2). The layer is reported with its ordinary first-pass error like any
+    other failure, and the refusal is named under it — each dependent and the reason it
+    could not be moved — because that is the fact that tells this layer apart from one no
+    rule reached. A layer absent from it behaves exactly as before.
     """
     lines = [f"{len(failed)} layer(s) failed to bake:"]
     for name in failed:
@@ -13958,6 +14208,13 @@ def _failure_report(
                 f"({again.evidence}) — a possible integrity problem, not a transient "
                 "download (§8.6 R4)"
             )
+        refusal = (refusals or {}).get(name)
+        if refusal is not None:
+            for spec, why in refusal.refused or ():
+                lines.append(
+                    f"    refused a retry — {spec} cannot be moved out of the "
+                    f"resolving pass: {why} (§8.6 R2(ii))"
+                )
     lines.append("")
     lines.append(summary)
     return "\n".join(lines)

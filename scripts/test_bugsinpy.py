@@ -15766,16 +15766,38 @@ class TestTheAbsentNamePass:
         ("fastparquet", "0.4.0"): ("pandas>=0.19",),
         ("numpy", "1.18.4"): ("six",),
         ("both", "1.0"): ("cryptography>=2.8", "pandas>=0.25"),
+        # §8.6 R2(ii)'s measured cascade: dropping ``h5py`` leaves ``clifford`` (which
+        # declares it) to be moved, and ``mpl-toolkits-clifford`` (which declares
+        # ``clifford``) has to move with it, or pip resolves the whole chain itself.
+        ("clifford", "1.3.1"): ("h5py",),
+        ("mpl-toolkits-clifford", "0.0.3"): ("clifford",),
+        ("h5py", "2.10.0"): (),
     }
     """What each release declares, sparse: a name not here is a release nothing was read
     for, which is the case :func:`bake_mod.no_deps_dependents` skips rather than guesses
     at."""
 
+    CASCADE_INSTALLS = (
+        "h5py==2.10.0",
+        "clifford==1.3.1",
+        "mpl-toolkits-clifford==0.0.3",
+        "numpy==1.18.4",
+    )
+    """``pandas/7``'s shape at the retry: the unbuildable ``h5py`` is dropped and the two
+    pins that declare it, directly and through each other, move with it."""
+
     def _metadata_of(self, name: str, version: str):
         declared = self.DECLARES.get((name, version))
         if declared is None:
-            raise bake_mod.BakeError(f"no metadata for {name}=={version}")
+            # A *known* unknown: the release PyPI carries no readable declarations for
+            # (§3.2's ``CASE_UNKNOWN``). The closure leaves it in place rather than
+            # guessing, and the strict freeze gate is the backstop.
+            raise bake_mod.UnknownDeclarations(f"no metadata for {name}=={version}")
         return (declared, None)
+
+    def _error_reader(self, name: str, version: str):
+        """A reader that *errors* — a network fault, not a release that has no metadata."""
+        raise bake_mod.BakeError(f"could not read {name}=={version}: connection reset")
 
     # ---- which pins are moved out of the main pass -------------------------
     def test_the_pins_that_declare_an_absent_name_are_the_only_ones_moved(self):
@@ -15830,7 +15852,12 @@ class TestTheAbsentNamePass:
         ), "a dropped name nothing declares moves no pin"
 
     def test_a_release_nothing_could_be_read_for_is_not_guessed_at(self):
-        """The reader's contract, not a silent pass: an unreadable release moves nothing."""
+        """A **known** unknown (``UnknownDeclarations``) moves nothing, and is not failed.
+
+        PyPI carries no readable declarations for this release — it is a fact about the
+        release, not a failed read — so the closure leaves it in place and the strict
+        freeze gate is the backstop (D4).
+        """
         assert (
             bake_mod.no_deps_dependents(
                 ("unknown-pin==1.0", "pyopenssl==19.1.0"),
@@ -15839,6 +15866,36 @@ class TestTheAbsentNamePass:
             )
             == ("pyopenssl==19.1.0",)
         )
+
+    def test_a_read_that_errored_names_the_pin_and_fails_the_layer(self):
+        """A read that *errored* is not a known unknown: it raises, naming the pin (D4).
+
+        A network fault leaves the closure drawn against a picture it only half holds, so
+        the pin it could not read is named here — the first pass flags the bug on it and
+        the retry refuses to render a second attempt — rather than silently skipped.
+        """
+        with pytest.raises(bake_mod.UnmovableDependent) as caught:
+            bake_mod.no_deps_dependents(
+                ("unknown-pin==1.0", "pyopenssl==19.1.0"),
+                ("cryptography",),
+                metadata_of=self._error_reader,
+            )
+        assert caught.value.spec == "unknown-pin==1.0"
+        assert "could not be read" in caught.value.why
+
+    def test_the_closure_is_transitive_over_the_pins_it_moves(self):
+        """``pandas/7``: dropping ``h5py`` moves ``clifford`` moves ``mpl-toolkits-clifford``.
+
+        Moving a dependent out of the main pass makes *its* name a name the main pass
+        installs nothing for, so the walk runs to a fixpoint (D3): nothing left in the
+        main pass declares a name pip would otherwise choose a version for.
+        """
+        assert bake_mod.no_deps_dependents(
+            self.CASCADE_INSTALLS, ("h5py",), metadata_of=self._metadata_of
+        ) == (
+            "clifford==1.3.1",
+            "mpl-toolkits-clifford==0.0.3",
+        ), "numpy is read and declares no such name, so it stays in the main pass"
 
     # ---- the recipe --------------------------------------------------------
     def test_the_moved_pins_are_installed_no_deps_and_leave_the_main_pass(self):
@@ -17488,6 +17545,12 @@ class TestTheNarrowDateRuleDrop:
                 bake_mod.dep_ref("mysql", "import closure: test/_mysqldb_test.py line 20"),
             ),
             releases=releases,
+            # The drop is what this test measures, and its presence sends the first-pass
+            # ``--no-deps`` walk over ``installs`` — every pin's own declarations, not only
+            # the dropped name's. ``decorator==4.4.0`` declares nothing; the shared fixture
+            # reader knows only ``moto``/``plugin``, so it would answer with a read error,
+            # which the walk now fails the layer closed on rather than silently skipping.
+            metadata_of=lambda name, version: ((), None),
         )
         assert flagged == []
         record = layers[0].provenance["dropped"][0]
@@ -17942,25 +18005,53 @@ class TestTheRetryOnAnUnbuildablePin:
             transient=bake_mod.transient_download_failure(_PANDAS_66_BUILD_LOG),
         )
 
-    def _deps(self, *, retry=True, provenance=None, **kwargs) -> bake_mod.BugDeps:
+    def _declares_nothing(self, name: str, version: str):
+        """The ordinary reader: these releases declare nothing that moves the closure."""
+        return ((), None)
+
+    def _cascade_metadata(self, name: str, version: str):
+        """``pandas/7``'s retry: ``clifford`` declares the dropped ``h5py``, and
+        ``mpl-toolkits-clifford`` declares ``clifford``."""
+        declared = {
+            ("clifford", "1.3.1"): ("h5py",),
+            ("mpl-toolkits-clifford", "0.0.3"): ("clifford",),
+        }.get((name, version), ())
+        return (declared, None)
+
+    def _deps(
+        self,
+        *,
+        retry=True,
+        provenance=None,
+        installs=None,
+        metadata_of=None,
+        safeguard=None,
+        **kwargs,
+    ) -> bake_mod.BugDeps:
         material = (
             bake_mod.RetryMaterial(
                 audit=self._audit(),
-                safeguard=bake_mod.pin_safeguard(protected_names={}),
+                safeguard=safeguard
+                if safeguard is not None
+                else bake_mod.pin_safeguard(protected_names={}),
+                metadata_of=metadata_of
+                if metadata_of is not None
+                else self._declares_nothing,
                 minor="3.8",
             )
             if retry
             else None
         )
+        pins = self.INSTALLS if installs is None else installs
         return bake_mod.BugDeps(
             entry={"project": "pandas", "bug_id": 7},
             checkpoint="vanta-bi-pandas-7",
-            installs=self.INSTALLS,
+            installs=pins,
             provenance=(
                 provenance
                 if provenance is not None
                 else {
-                    "installs": list(self.INSTALLS),
+                    "installs": list(pins),
                     "dependencies": [
                         {"name": name, "sources": list(sources)}
                         for name, sources in self.DECLARED.items()
@@ -18093,6 +18184,99 @@ class TestTheRetryOnAnUnbuildablePin:
         )
         assert "h5py==2.10.0" in first_pass
         assert "h5py==2.10.0" not in plan.script
+
+    # ---- D3: a moved dependent takes its own dependents with it ----------
+    CASCADE_INSTALLS = (
+        "numpy==1.18.1",
+        "h5py==2.10.0",
+        "clifford==1.3.1",
+        "mpl-toolkits-clifford==0.0.3",
+        "python-dateutil==2.8.1",
+    )
+
+    def test_a_moved_dependent_takes_its_own_dependents_with_it(self):
+        """``pandas/7``: the retry **moves**, it does not merely drop (D3).
+
+        Dropping ``h5py`` leaves ``clifford`` (which declares it) in the main pass, so
+        ``clifford`` moves too — and ``mpl-toolkits-clifford`` (which declares
+        ``clifford``) moves with it, or pip resolves the whole chain itself at the newest
+        release of the day. Nothing left in the main pass declares a name pip would choose
+        a version for.
+        """
+        deps = self._deps(
+            installs=self.CASCADE_INSTALLS, metadata_of=self._cascade_metadata
+        )
+        plan = bake_mod.retry_plan(deps, "Failed to build h5py\n")
+        assert plan is not None
+        assert plan.refused is None
+        assert [drop.pin for drop in plan.drops] == ["h5py==2.10.0"]
+        main = (
+            plan.script.split("<<'VANTA_REQUIREMENTS'\n", 1)[1]
+            .split("\nVANTA_REQUIREMENTS", 1)[0]
+        )
+        assert main.splitlines() == ["numpy==1.18.1", "python-dateutil==2.8.1"]
+        no_deps = plan.script.split("<<'VANTA_NO_DEPS'\n", 1)[1]
+        assert no_deps.startswith("clifford==1.3.1\nmpl-toolkits-clifford==0.0.3\n")
+        assert plan.script == bake_mod.requirements_recipe(
+            (
+                "numpy==1.18.1",
+                "clifford==1.3.1",
+                "mpl-toolkits-clifford==0.0.3",
+                "python-dateutil==2.8.1",
+            ),
+            no_deps_pins=("clifford==1.3.1", "mpl-toolkits-clifford==0.0.3"),
+            minor="3.8",
+        )
+
+    def test_a_protected_dependent_makes_the_retry_refuse(self):
+        """A dependent the safeguard protects may not leave the resolving pass (D2/D5b)."""
+        safeguard = bake_mod.pin_safeguard(
+            protected_names={
+                bake_mod.canonicalize_name("clifford"): "a pytest plugin"
+            }
+        )
+        deps = self._deps(
+            installs=("h5py==2.10.0", "clifford==1.3.1"),
+            metadata_of=self._cascade_metadata,
+            safeguard=safeguard,
+        )
+        plan = bake_mod.retry_plan(deps, "Failed to build h5py\n")
+        assert plan is not None
+        assert plan.script == "", "nothing may be built when the closure cannot be closed"
+        assert plan.refused == (("clifford==1.3.1", "a pytest plugin"),)
+        assert any("refusing to retry" in line for line in plan.describe())
+
+    def test_a_known_unknown_pin_leaves_the_retry_intact(self):
+        """A release PyPI cannot be read for is left in place and does not fail the layer
+        (D4): the closure skips it, and the strict freeze gate is the backstop."""
+        def reader(name, version):
+            if (name, version) == ("httpcore", "0.3.0"):
+                raise bake_mod.UnknownDeclarations(f"no metadata for {name}=={version}")
+            return ((), None)
+
+        deps = self._deps(
+            installs=("h5py==2.10.0", "httpcore==0.3.0"), metadata_of=reader
+        )
+        plan = bake_mod.retry_plan(deps, "Failed to build h5py\n")
+        assert plan is not None
+        assert plan.refused is None
+        assert "httpcore==0.3.0" in plan.script
+
+    def test_an_errored_read_makes_the_retry_refuse(self):
+        """A read that *errored* fails the layer closed, naming the pin it could not read
+        (D2/D4), rather than being skipped like a known unknown."""
+        def reader(name, version):
+            raise bake_mod.BakeError(f"could not read {name}=={version}: connection reset")
+
+        deps = self._deps(
+            installs=("h5py==2.10.0", "clifford==1.3.1"), metadata_of=reader
+        )
+        plan = bake_mod.retry_plan(deps, "Failed to build h5py\n")
+        assert plan is not None
+        assert plan.script == ""
+        assert plan.refused is not None
+        assert [spec for spec, _why in plan.refused] == ["clifford==1.3.1"]
+        assert "could not be read" in plan.refused[0][1]
 
     # ---- record_retry: the drop reaches the layer's provenance -----------
     def test_record_retry_writes_the_drops_and_the_retry_into_the_layer(self, tmp_path):
@@ -18346,6 +18530,26 @@ class TestTheRetryOnAnUnbuildablePin:
         # The retry record is decisive material too, so the identity moves.
         assert after["checkpoint_id"] != before["checkpoint_id"]
 
+    def test_record_retry_writes_a_refusal_without_claiming_a_drop(self, tmp_path):
+        """D2/D5: a refused plan is recorded as a refusal — ``used`` is ``False``, nothing
+        is dropped, and the dependent and the reason are named."""
+        deps = self._deps()
+        bake_mod.write_deps(tmp_path, deps)
+        before = bake_mod.load_deps(tmp_path, deps.checkpoint)
+        plan = bake_mod.RetryPlan(
+            script="",
+            drops=(),
+            refused=(("clifford==1.3.1", "a pytest plugin"),),
+        )
+        bake_mod.record_retry(tmp_path, deps.checkpoint, plan)
+        after = bake_mod.load_deps(tmp_path, deps.checkpoint)
+        assert after["retry"]["used"] is False
+        assert after["retry"]["refused"] == [
+            {"spec": "clifford==1.3.1", "why": "a pytest plugin"}
+        ]
+        assert after["retry"]["dropped"] == []
+        assert after.get("dropped", []) == before.get("dropped", [])
+
     # ---- run_bake_actions: the retry, and failing closed -----------------
     CHILDREN = {"vanta-bi-Demo-1": PY38}
 
@@ -18452,6 +18656,36 @@ class TestTheRetryOnAnUnbuildablePin:
         assert "ERROR: Failed building wheel for h5py" not in message, (
             "the first pass's error is what the retry was answering, not why it failed"
         )
+        assert "[FAILED] vanta-bi-Demo-1" in message
+
+    def test_a_refused_retry_builds_no_second_attempt_and_names_the_refusal(self):
+        """D2: a refusal renders no script, so **no** second build runs; the layer keeps
+        its first-pass classification and the report names the refusal."""
+        refusal = bake_mod.RetryPlan(
+            script="",
+            drops=(),
+            refused=(("clifford==1.3.1", "a pytest plugin"),),
+        )
+        recorded: list[tuple[str, object]] = []
+        attempts: list[tuple[str, str]] = []
+
+        def retry(name, built):
+            return refusal if name == "vanta-bi-Demo-1" else None
+
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._retry_run(
+                retry=retry,
+                record_drops=lambda name, value: recorded.append((name, value)),
+                first_error=_PANDAS_7_BUILD_LOG,
+                second_ok=False,
+                projects=attempts,
+            )
+        built = [script for name, script in attempts if name == "vanta-bi-Demo-1"]
+        assert built == ["recipe for vanta-bi-Demo-1"], "no second attempt is rendered"
+        assert recorded == [("vanta-bi-Demo-1", refusal)], "the refusal is recorded"
+        message = str(excinfo.value)
+        assert "refused a retry" in message
+        assert "clifford==1.3.1" in message and "a pytest plugin" in message
         assert "[FAILED] vanta-bi-Demo-1" in message
 
     def test_a_failed_retry_writes_its_own_log_beside_the_first_pass(self, tmp_path):

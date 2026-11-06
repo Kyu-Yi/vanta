@@ -12077,19 +12077,31 @@ class TestRunBakeActions:
             "vanta-bi-Demo-2"
         )
 
-    def test_the_summary_names_what_was_rebuilt_skipped_and_failed(self):
+    def test_the_summary_says_the_outcome_not_the_plan_it_was_written_from(self):
+        """The words after the state are what happened, never the plan's reason.
+
+        ``[done] … — not baked yet`` was the measured complaint: the state word and
+        the plan's reason said opposite things on one line. The plan's wording
+        (``not baked yet``, ``--force: replaced``, ``delete+rebuild``) belongs in the
+        ``bake plan`` block; the summary is the record of the run.
+        """
         recorder = self.Recorder(present={PY38, "vanta-bi-Demo-1", "vanta-bi-Demo-2"})
         summary = self._run(_layers(PY38, "vanta-bi-Demo-1"), recorder, force=True)
-        assert "[done] vanta-bi-Demo-1: delete+rebuild" in summary
+        assert "[done] vanta-bi-Demo-1: rebuilt" in summary
         # A stale child is *deleted*, which is not the same statement as "skipped".
-        assert "[deleted] vanta-bi-Demo-2: delete" in summary
-        assert "[done] vanta-bugsinpy-py3.8" in summary
+        assert "[deleted] vanta-bi-Demo-2: deleted" in summary
+        assert "[done] vanta-bugsinpy-py3.8: rebuilt" in summary
+        # Nothing the plan said about what it *would* do survives into the record.
+        assert "not baked yet" not in summary
+        assert "--force" not in summary
+        assert "delete+rebuild" not in summary
 
     def test_without_force_a_baked_layer_is_not_touched(self):
         recorder = self.Recorder(present={PY38, "vanta-bi-Demo-1"})
         summary = self._run(_layers(PY38, "vanta-bi-Demo-1"), recorder, force=False)
         assert recorder.calls == []
         assert summary.count("[skipped]") == 2
+        assert "[skipped] vanta-bi-Demo-1: already baked" in summary
 
     def test_the_run_logs_each_built_layers_own_build_environment(self):
         logged: list[str] = []

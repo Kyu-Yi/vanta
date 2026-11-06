@@ -12976,6 +12976,18 @@ def summarise(
     have been attempted and to have returned, ``not started`` is its own label, and a
     delete-only action says ``deleted`` instead of hiding behind ``skipped``.
 
+    [VANTA-WHY] The second half of that fix is the wording *after* the colon. It used
+    to be :meth:`LayerAction.describe`, which is the **plan's** sentence: a finished
+    build read ``[done] … — not baked yet`` and a rebuild read ``… — --force: replaced
+    (an existing layer is deleted first)``, each of them a statement about a plan the
+    line's own ``[done]`` had already contradicted. So the summary says the outcome
+    instead of repeating the plan's reason — ``built``/``rebuilt``, ``already baked``,
+    ``deleted``, ``not started``, ``build failed`` — and the plan's own wording stays
+    where it belongs, in the ``bake plan`` block :func:`plan_layers`' callers print.
+    The delete-only action is the one the state word does not explain on its own, and
+    its *why* (a stale child of a rebuilt base) is the one thing the summary no longer
+    repeats; it is in the plan block, and in the action's own ``reason`` field.
+
     ``attempted`` is *which* build actions were reached, in order. ``None`` means
     "not recorded — treat every planned build as attempted", which is what a caller
     summarising a plan rather than a run is asking for.
@@ -12985,14 +12997,16 @@ def summarise(
     lines = ["bake summary:"]
     for action in actions:
         if action.name in failed_set:
-            state = "FAILED"
-        elif action.build:
-            state = "done" if reached is None or action.name in reached else "not started"
-        elif action.delete:
-            state = "deleted"
+            state, outcome = "FAILED", "build failed"
+        elif not action.build:
+            state, outcome = (
+                ("deleted", "deleted") if action.delete else ("skipped", "already baked")
+            )
+        elif reached is None or action.name in reached:
+            state, outcome = "done", "rebuilt" if action.delete else "built"
         else:
-            state = "skipped"
-        lines.append(f"  [{state}] {action.describe()}")
+            state, outcome = "not started", "not started"
+        lines.append(f"  [{state}] {action.name}: {outcome}")
     if failed:
         lines.append(_failed_footer(failed, survived))
     return "\n".join(lines)

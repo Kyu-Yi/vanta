@@ -13012,6 +13012,21 @@ def bake_log_path(logs_dir: Path, name: str) -> Path:
     return logs_dir / f"{name}.log"
 
 
+def retry_log_path(logs_dir: Path, name: str) -> Path:
+    """Where a **failed** retry's own output goes: ``<logs_dir>/<layer>.retry.log``.
+
+    [VANTA-WHY] A layer whose first pass failed and whose one retry also failed used to
+    write the first pass's log and nothing else: the retry's own output — the second
+    install pass, with the pins it dropped or hoisted — was discarded, so the failure
+    report cited the first pass's error and the retry's was unrecoverable (measured on
+    ``pandas/7``, ``luigi/30``, ``luigi/19``). Kept **beside** the first pass's file
+    rather than over it, because both are the layer's evidence and they are different
+    attempts (§8.6 R2(ii), R1). Named through :func:`bake_log_path` so there is one
+    naming rule and one writer for both files.
+    """
+    return bake_log_path(logs_dir, f"{name}.retry")
+
+
 def write_bake_log(logs_dir: Path, name: str, result: ExecResult) -> Path:
     """Write one layer's whole build output under its own name, and say where.
 
@@ -13196,7 +13211,10 @@ def run_bake_actions(
     builds the first time never reaches any of this. Only when the plan's own second build
     *succeeds* does the run carry on: a layer whose retry also fails takes the same failure
     path it would have taken without the rule, so it fails **closed** and is classified as
-    before.
+    before — but its **retry's own output is written beside the first pass's log**
+    (:func:`retry_log_path`) and the failure report cites the retry's error, not the first
+    pass's. Both files are the layer's evidence and the two attempts differ; keeping only
+    the first pass's log made the retry's failure unrecoverable.
 
     The dropped names join this layer's :data:`CASE_DROPPED_DEPENDENCY` and
     :data:`CASE_TREE_PROVIDED` set before the gates run, because the layer that will now
@@ -13212,6 +13230,8 @@ def run_bake_actions(
     dropped_names = dict(dropped or {})
     tree_names = tree_provided or {}
     logs: dict[str, Path] = {}
+    retry_results: dict[str, ExecResult] = {}
+    retry_logs: dict[str, Path] = {}
     if logs_dir is not None:
         log(f"[logs] this bake's build logs: {logs_dir}")
 
@@ -13248,14 +13268,26 @@ def run_bake_actions(
                         record_drops(action.name, plan)
                     built = retried
                 else:
-                    # ``built`` stays the *first* attempt's result, and deliberately:
-                    # that is the log whose summary line names the pins the retry
-                    # dropped, so the failure report keeps the diagnosis rather than
-                    # replacing it with the second failure. The layer fails closed.
+                    # Fail closed: the layer is classified exactly as a first-pass
+                    # failure is. The retry's own output is the diagnosis — it is the
+                    # attempt that decided this layer's fate, and the first pass's log
+                    # usually ends in the failure the retry was answering — so it is
+                    # written *beside* the first pass's file and reported in place of
+                    # it, while the first pass's file is kept and named too
+                    # (:func:`retry_log_path`, :func:`_failure_report`).
+                    retry_results[action.name] = retried
                     log(
                         f"[{action.name}] retry failed — the layer fails closed and is "
                         "classified exactly as a first-pass failure is"
                     )
+                    if logs_dir is not None:
+                        retry_logs[action.name] = write_bake_log(
+                            logs_dir, f"{action.name}.retry", retried
+                        )
+                        log(
+                            f"[{action.name}] retry build log: "
+                            f"{retry_logs[action.name]}"
+                        )
         result = built
         verdict: Optional[ExecResult] = None
         if built.ok:
@@ -13333,7 +13365,12 @@ def run_bake_actions(
         actions, failed=failed, attempted=attempted, survived=survived
     )
     if failed:
-        raise BakeError(_failure_report(failed, results, summary, logs))
+        raise BakeError(
+            _failure_report(
+                failed, results, summary, logs,
+                retries=retry_results, retry_logs=retry_logs,
+            )
+        )
     return summary
 
 
@@ -13342,6 +13379,8 @@ def _failure_report(
     results: Mapping[str, ExecResult],
     summary: str,
     logs: Optional[Mapping[str, Path]] = None,
+    retries: Optional[Mapping[str, ExecResult]] = None,
+    retry_logs: Optional[Mapping[str, Path]] = None,
 ) -> str:
     """Every failed layer's own error line, where its log is, then the summary.
 
@@ -13352,10 +13391,21 @@ def _failure_report(
     tail ended in was shuru's ``checkpoint … saved``. Each layer's whole log is on disk
     (:func:`write_bake_log`) and pointed at here, which is what makes the one-line form
     enough.
+
+    [VANTA-WHY] For a layer whose **retry** also failed, the cited line is the *retry's*
+    own error and not the first pass's (:func:`run_bake_actions`), and *both* files are
+    named — the first pass's ``.log`` and the retry's ``.retry.log``. The first pass's
+    error is the one the retry was answering (its wheels that would not build, its
+    ``egg_info`` crash), so citing it says nothing about why the retry failed; a reader
+    who saw only it would read the same diagnosis twice for two different attempts, which
+    is exactly what ``pandas/7`` and ``luigi/30`` looked like. ``retries`` and
+    ``retry_logs`` are the run's record of which layers were retried and where each
+    attempt's output went; a layer absent from them behaves exactly as before.
     """
     lines = [f"{len(failed)} layer(s) failed to bake:"]
     for name in failed:
-        result = results[name]
+        retried = (retries or {}).get(name)
+        result = retried if retried is not None else results[name]
         state = (
             "timed out" if result.timed_out else f"exit {result.exit_code}"
         )
@@ -13364,7 +13414,11 @@ def _failure_report(
         )
         path = (logs or {}).get(name)
         if path is not None:
-            lines.append(f"    full build log: {path}")
+            label = "first-pass build log" if retried is not None else "full build log"
+            lines.append(f"    {label}: {path}")
+        retry_path = (retry_logs or {}).get(name)
+        if retry_path is not None:
+            lines.append(f"    retry build log: {retry_path}")
     lines.append("")
     lines.append(summary)
     return "\n".join(lines)

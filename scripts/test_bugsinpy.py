@@ -18178,8 +18178,8 @@ class TestTheRetryOnAnUnbuildablePin:
         assert any("retry: dropping h5py==2.10.0" in line for line in logged)
         assert "[done] vanta-bi-Demo-1" in summary
 
-    def test_a_failed_retry_leaves_the_layer_failed_as_before(self):
-        """Fail closed: the first attempt's diagnosis is the report, and nothing is recorded."""
+    def test_a_failed_retry_fails_closed_and_reports_the_retry_s_own_error(self):
+        """Fail closed: the **retry's** error is the report, and nothing is recorded."""
         recorded: list[tuple[str, object]] = []
 
         def retry(name, built):
@@ -18194,9 +18194,33 @@ class TestTheRetryOnAnUnbuildablePin:
             )
         assert recorded == [], "a layer whose retry failed has no drop to record"
         message = str(excinfo.value)
-        assert "ERROR: Could not build wheels for h5py, scikit-learn" in message
-        assert "retry blew up" not in message, "the first attempt's log is the diagnosis"
+        assert "ERROR: retry blew up" in message, "the retry's own error is the diagnosis"
+        assert "ERROR: Failed building wheel for h5py" not in message, (
+            "the first pass's error is what the retry was answering, not why it failed"
+        )
         assert "[FAILED] vanta-bi-Demo-1" in message
+
+    def test_a_failed_retry_writes_its_own_log_beside_the_first_pass(self, tmp_path):
+        """Both attempts' logs are kept, and both are named in the failure report."""
+        def retry(name, built):
+            return self._drop_plan() if name == "vanta-bi-Demo-1" else None
+
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._retry_run(
+                retry=retry,
+                first_error=_PANDAS_7_BUILD_LOG,
+                second_ok=False,
+                logs_dir=tmp_path,
+            )
+        first = bake_mod.bake_log_path(tmp_path, "vanta-bi-Demo-1")
+        second = bake_mod.retry_log_path(tmp_path, "vanta-bi-Demo-1")
+        assert first.is_file(), "the first pass's log is not overwritten"
+        assert second.is_file(), "the retry's own output is written"
+        assert _PANDAS_7_BUILD_LOG in first.read_text(encoding="utf-8")
+        assert "ERROR: retry blew up" in second.read_text(encoding="utf-8")
+        message = str(excinfo.value)
+        assert f"first-pass build log: {first}" in message
+        assert f"retry build log: {second}" in message
 
     def test_without_a_retry_callable_a_failed_layer_is_not_retried(self):
         """A caller that attaches no retry — every run before this rule — builds once."""

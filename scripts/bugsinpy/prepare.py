@@ -63,9 +63,7 @@ UNDECLARED_F2P_REASON = (
     "named by run_test.sh — so BugsInPy never meant to run it and it is not part of the "
     "oracle. It is removed from FAIL_TO_PASS and from the PASS_TO_PASS suite, and it is "
     "hidden from vanta_tree so that the Creator cannot chase a test the benchmark does "
-    "not ask for. Measured cause on PySnooper/2: the fix adds the test file for a new "
-    "helper, so the test flips because the helper does not exist on the buggy source "
-    "rather than because of the bug."
+    "not ask for."
 )
 """[VANTA-WHY] A flipping test is not automatically an oracle. PySnooper/2's fix adds
 ``tests/test_utils/test_ensure_tuple.py`` for a helper the fix also adds, so the test
@@ -83,10 +81,7 @@ DEV_FIX_SELFCHECK_REASON = (
     "perfect patch would at best tie the developer fix, and every verdict, ECR and EIR on "
     "this bug would be measuring the oracle rather than Vanta. Refusing the bug here is the "
     "point — an oracle nothing can pass produces a plausible wrong label instead of an "
-    "error, which is the failure mode this gate exists for. Measured cause on PySnooper/2: "
-    "bug_patch.txt touches only pysnooper/tracer.py while the fix commit also adds "
-    "pycompat.PY2 and utils.get_shortish_repr(..., custom_repr=), so the patched tree cannot "
-    "import pysnooper and all three FAIL_TO_PASS nodeids read 'absent'."
+    "error, which is the failure mode this gate exists for."
 )
 """[VANTA-WHY] The developer fix is the harness's own ground truth for "a patch that
 fixes the bug", so it is the one candidate whose grading cannot be attributed to a model.

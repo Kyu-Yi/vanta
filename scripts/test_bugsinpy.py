@@ -26505,9 +26505,20 @@ class TestDevFixSelfCheck:
         assert "developer fix" in failure
         assert "'absent'" in failure
         assert "tests/test_demo.py::test_other" in failure
+        assert "Measured: apply_ok=" in failure, "this bug's own measurement, not another's"
 
-    def test_the_refusal_quotes_the_reason_the_rule_exists_for(self):
-        assert "PySnooper/2" in prepare_mod.DEV_FIX_SELFCHECK_REASON
+    def test_the_refusal_states_the_rule_not_one_bug_s_measured_cause(self):
+        """The reason string is quoted in every refused bug's gate row, so it has to read
+        for every bug. A bug-specific "measured cause" sentence (PySnooper/2's, which the
+        rule was written for) was quoted verbatim in an unrelated bug's row — pandas/51's.
+        The per-bug measurement is appended by ``selfcheck_dev_fix`` from that bug's own
+        oracle result; the constant itself names no bug."""
+        for constant in (
+            prepare_mod.DEV_FIX_SELFCHECK_REASON,
+            prepare_mod.UNDECLARED_F2P_REASON,
+        ):
+            assert "Measured cause" not in constant
+            assert "PySnooper" not in constant
 
     def test_the_grading_is_recorded_next_to_the_patch(self, graded, tmp_path):
         """A refused bug has to leave behind which patch it graded and what it saw."""

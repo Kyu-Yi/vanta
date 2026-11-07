@@ -1778,6 +1778,15 @@ def _queue_pipeline(
                     prep = value
                     prepared[index] = prep
                     if not prep.runnable:
+                        reasons = (
+                            "; ".join(prep.gate_failures) or "no gate reason recorded"
+                        )
+                        print(
+                            f"  [queue] NOT RUNNABLE {prep.key}: {reasons} — its rows "
+                            "are not run.",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                         continue
                     if stop_file.exists():
                         print(
@@ -1904,13 +1913,44 @@ def _queue_pipeline(
             file=sys.stderr,
         )
     unprepared = [prep for prep in preps if not prep.runnable]
+    unprepared_keys = {prep.key for prep in unprepared}
     if unprepared:
         print(
             f"\n{len(unprepared)} bug(s) did not prepare and their rows were not run: "
-            f"{[prep.key for prep in unprepared]}.",
+            f"{sorted(unprepared_keys)}.",
             file=sys.stderr,
+            flush=True,
         )
-    if failed or raised or unprepared or broken:
+    # §7.1 — every selected bug that is meant to run rows must have written at least
+    # one. A bug that prepared runnable but was never claimed (the stop file, the
+    # spend cap) leaves no outcome at all, so this row count is the only place it is
+    # caught: without it a stopped run exits 0 having silently dropped every bug after
+    # the stop. The floor is one row per selected *full* bug; a `full=False` reserve is
+    # measured only and is not expected to write rows.
+    rows_by_bug: dict[str, int] = {}
+    for record in records:
+        bug = str(record.get("bug") or "")
+        if bug:
+            rows_by_bug[bug] = rows_by_bug.get(bug, 0) + 1
+    broken_keys = {key for key, _reason in broken}
+    expected_bugs = [bug_key(entry) for entry, full in selected if full]
+    no_rows = [
+        key
+        for key in expected_bugs
+        if key not in unprepared_keys
+        and key not in broken_keys
+        and rows_by_bug.get(key, 0) == 0
+    ]
+    if no_rows:
+        print(
+            f"\nROW-COUNT FAILURE: {len(no_rows)} of {len(expected_bugs)} selected "
+            f"bug(s) wrote no row: {sorted(no_rows)}. A run must write at least one row "
+            f"per selected bug; the batch has {len(rows_by_bug)} bug(s) with rows. Do not "
+            "read this batch as complete.",
+            file=sys.stderr,
+            flush=True,
+        )
+    if failed or raised or unprepared or broken or no_rows:
         return EXIT_BUG_FAILED
     return 1 if any(outcome.code != 0 for outcome in outcomes) else EXIT_OK
 

@@ -33295,13 +33295,20 @@ def _pipeline_entry(project: str, bug_id: int, *, wave: int = 1, role: str = "pi
     }
 
 
-def _fake_prep(entry: dict, *, runnable: bool = True, issue=None) -> SimpleNamespace:
+def _append_row(batch_dir, key: str) -> None:
+    """Stand in for the row ``runner._run_task`` writes, so the pipeline's row-count
+    guard (one row per selected bug) has a row to count for a bug that ran."""
+    manifest_mod.Manifest(Path(batch_dir)).append({"key": f"#test#{key}", "bug": key})
+
+
+def _fake_prep(entry: dict, *, runnable: bool = True, issue=None, gate_failures=()) -> SimpleNamespace:
     key = f"{entry['project']}/{entry['bug_id']}"
     return SimpleNamespace(
         key=key,
         slug=key.replace("/", "-"),
         runnable=runnable,
         issue=issue,
+        gate_failures=list(gate_failures),
         wave=entry["wave"],
         checkpoint=entry["checkpoint"],
         python_version=entry["python_version"],
@@ -33402,7 +33409,11 @@ class TestPipelineQueue:
             manifest or (lambda **kwargs: {"stub": True}),
         )
         monkeypatch.setattr(run_mod.split_mod, "sha256_file", lambda path: "a" * 64)
-        monkeypatch.setattr(runner_mod, "write_batch_report", lambda *a, **k: (None, {}))
+        monkeypatch.setattr(
+            runner_mod,
+            "write_batch_report",
+            lambda _batch, records=None, **k: (None, {"runs": len(records or [])}),
+        )
         monkeypatch.setattr(runner_mod, "render_digest", lambda payload: "")
         # No host sampler thread: --prepare-jobs > 1 would otherwise really sample.
         monkeypatch.setattr(run_mod, "_start_host_sampler", lambda *a, **k: None)
@@ -33410,9 +33421,17 @@ class TestPipelineQueue:
         monkeypatch.setattr(
             run_mod, "prepare_one_bug", prepare or self._default_prepare(events)
         )
-        monkeypatch.setattr(
-            runner_mod, "_run_task", run or self._default_run(events, capture)
-        )
+        run_impl = run or self._default_run(events, capture)
+
+        def _run_with_row(*, wave, prep, stop_file, **kwargs):
+            # `runner._run_task` writes the bug's row(s) before it returns, and the
+            # pipeline's row-count guard counts them: the stub has to write too, or
+            # every successful batch would look like it dropped every bug.
+            outcome = run_impl(wave=wave, prep=prep, stop_file=stop_file, **kwargs)
+            _append_row(kwargs["batch_dir"], prep.key)
+            return outcome
+
+        monkeypatch.setattr(runner_mod, "_run_task", _run_with_row)
 
         code = run_mod._queue_pipeline(
             self._args(batch_dir, *extra),
@@ -33580,6 +33599,60 @@ class TestPipelineQueue:
         )
         assert code == run_mod.EXIT_BUG_FAILED
         assert [event for event in events if event[0] == "run"] == [("run", "A/1")]
+
+    def test_a_skipped_bug_is_named_loudly_with_its_gate_reason(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A non-runnable bug must not vanish from the log: `queue --pipeline`
+        prints the skip by name with the gate reason that caused it."""
+        split = _PipelineSplit([_pipeline_entry("A", 1), _pipeline_entry("B", 2)])
+        events: list = []
+
+        def prepare(**kwargs):
+            entry = kwargs["entry"]
+            key = f"{entry['project']}/{entry['bug_id']}"
+            events.append(("prepare", key))
+            if key == "B/2":
+                return "prep", _fake_prep(
+                    entry, runnable=False, gate_failures=["no issue source"]
+                )
+            return "prep", _fake_prep(entry)
+
+        code, _batch, _events, _capture = self._drive(
+            monkeypatch, tmp_path, split, extra=("--pipeline",),
+            prepare=prepare, events=events,
+        )
+        assert code == run_mod.EXIT_BUG_FAILED
+        err = capsys.readouterr().err
+        assert "NOT RUNNABLE B/2" in err and "no issue source" in err
+
+    def test_a_runnable_bug_that_writes_no_row_fails_the_batch(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """§7.1 — a bug that prepared runnable but was never claimed (here the stop
+        file appears mid-wave) leaves no row; the batch must fail rather than exit 0
+        having silently dropped it."""
+        split = _PipelineSplit([_pipeline_entry("A", 1), _pipeline_entry("B", 2)])
+        events: list = []
+
+        def prepare(**kwargs):
+            entry = kwargs["entry"]
+            key = f"{entry['project']}/{entry['bug_id']}"
+            events.append(("prepare", key))
+            if key == "B/2":
+                stop = runner_mod.queue_stop_path(tmp_path / "batch")
+                stop.parent.mkdir(parents=True, exist_ok=True)
+                stop.write_text("")
+            return "prep", _fake_prep(entry)
+
+        code, _batch, _events, _capture = self._drive(
+            monkeypatch, tmp_path, split, extra=("--pipeline",),
+            prepare=prepare, events=events,
+        )
+        assert code == run_mod.EXIT_BUG_FAILED
+        assert [event for event in events if event[0] == "run"] == [("run", "A/1")]
+        err = capsys.readouterr().err
+        assert "ROW-COUNT FAILURE" in err and "B/2" in err
 
     # -- --plan and the two refusals ---------------------------------------
     def test_plan_prints_the_selection_without_a_clone_or_a_binary(

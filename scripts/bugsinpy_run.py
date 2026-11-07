@@ -253,6 +253,29 @@ def cache_state_line(
     )
 
 
+def issues_dir_flag(args: argparse.Namespace) -> Optional[Path]:
+    """The ``--issues-dir`` this invocation was given, or ``None`` for the committed default.
+
+    ``None`` is not "no directory": it is "the flag was not given", and every stage then
+    reads and writes the committed ``plans/bugsinpy_issues`` exactly as before. A caller
+    that gives the flag gets a *required* directory — a report missing there is a refusal,
+    never a fall back to the default (§2.4).
+    """
+    raw = getattr(args, "issues_dir", None)
+    return None if raw is None else Path(raw)
+
+
+def prepare_issues_dir(args: argparse.Namespace) -> Path:
+    """The directory ``prepare`` freezes into and reads: ``--issues-dir``, else the default.
+
+    A held-out split passes ``--issues-dir plans/private/bugsinpy_issues`` (gitignored) so
+    its report text is frozen and verifiable without being published; the dev split omits
+    the flag and gets the committed ``plans/bugsinpy_issues`` byte-for-byte.
+    """
+    given = issues_dir_flag(args)
+    return (REPO_ROOT / issue_source.ISSUES_DIR) if given is None else given
+
+
 def prepare_one_bug(
     *,
     entry: Mapping[str, Any],
@@ -475,10 +498,14 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     batch_dir: Path = (args.batch or (RUNS_DIR / f"prepare-{utc_stamp()}")).resolve()
     batch_dir.mkdir(parents=True, exist_ok=True)
     repo_cache = RUNS_DIR / "repos"
-    # The frozen issue reports are committed (§2.4); the API cache is machine-local and
-    # stays under `runs/`, which `.gitignore` already ignores.
+    # The frozen issue reports live under the directory this invocation named: the
+    # committed `plans/bugsinpy_issues` by default (§2.4 — the dev bugs' reports are
+    # committed), or `--issues-dir` as given (a held-out run passes the gitignored
+    # `plans/private/bugsinpy_issues`, so its report text is frozen and verifiable
+    # without being published). The API cache is machine-local and stays under
+    # `runs/`, which `.gitignore` already ignores.
     issue_sources = prepare_mod.IssueSources(
-        issues_dir=REPO_ROOT / issue_source.ISSUES_DIR,
+        issues_dir=prepare_issues_dir(args),
         github_cache_dir=RUNS_DIR / "github-cache",
     )
 
@@ -1360,6 +1387,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         attempts_declaration=frozen.attempts(),
         disk_mb=args.disk_mb,
         show_hints=args.show_hints,
+        # The `--issues-dir` this invocation named, or `None` for the committed
+        # default. `run_batch` refuses the batch, by name, when a report it may read
+        # is missing there — never a fall back and never a live re-fetch (§2.4).
+        issues_dir=issues_dir_flag(args),
         plan_only=args.plan,
         max_spend_usd=max_spend_usd,
         # Item 14's per-row half. `--plan` returns from `run_batch` before the loop,
@@ -1602,8 +1633,10 @@ def _queue_pipeline(
     batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
     batch_dir.mkdir(parents=True, exist_ok=True)
     repo_cache = RUNS_DIR / "repos"
+    # The pipelined prepare freezes into (and reads from) the directory the invocation
+    # named — `--issues-dir`, or the committed default — exactly as `prepare` does.
     issue_sources = prepare_mod.IssueSources(
-        issues_dir=REPO_ROOT / issue_source.ISSUES_DIR,
+        issues_dir=prepare_issues_dir(args),
         github_cache_dir=RUNS_DIR / "github-cache",
     )
 
@@ -1680,6 +1713,9 @@ def _queue_pipeline(
         attempts_declaration=attempts_declaration,
         disk_mb=args.disk_mb,
         show_hints=args.show_hints,
+        # The `--issues-dir` this invocation named, so a `--show-hints` row of a
+        # pipelined bug reads the same frozen report its prepare stage read.
+        issues_dir=issues_dir_flag(args),
         max_spend_usd=max_spend_usd,
         spend_gate=spend_gate,
         preflight=partial(runner_mod.model_endpoint_preflight, env=invocation_env),
@@ -2071,6 +2107,10 @@ def cmd_queue(args: argparse.Namespace) -> int:
         attempts_declaration=frozen.attempts(),
         disk_mb=args.disk_mb,
         show_hints=args.show_hints,
+        # The `--issues-dir` this invocation named, or `None` for the committed
+        # default. With `--pipeline` the prepare stage froze into it; the queue
+        # refuses a bug, by name, whose report it may read is missing there.
+        issues_dir=issues_dir_flag(args),
         plan_only=args.plan,
         max_spend_usd=max_spend_usd,
         # Bound to the effective environment (item B1), as in `run`.
@@ -2776,6 +2816,19 @@ def build_parser() -> argparse.ArgumentParser:
             f"the shared budget knob (default {budget_mod.DEFAULT_PEAK_VMS})."
         ),
     )
+    prep.add_argument(
+        "--issues-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "where prepare freezes (and reads) the frozen issue reports. Flag absent "
+            "is the committed `plans/bugsinpy_issues`, byte-for-byte today's path. A "
+            "held-out split points this at a gitignored directory (e.g. "
+            "`plans/private/bugsinpy_issues`) so its report text is frozen and "
+            "hashable without being published (§2.4.2)."
+        ),
+    )
     prep.set_defaults(func=cmd_prepare)
 
     bake = sub.add_parser(
@@ -2982,6 +3035,20 @@ def build_parser() -> argparse.ArgumentParser:
             "charged --peak-vms × its VM memory. Accounting only — no VM's memory or "
             "vCPUs change; each row records the peak it actually reached so this can be "
             "tuned from real runs."
+        ),
+    )
+    run.add_argument(
+        "--issues-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "where the frozen issue reports are read from. Flag absent is the "
+            "committed `plans/bugsinpy_issues`, byte-for-byte today's path. A held-out "
+            "split points this at its gitignored freeze directory (e.g. "
+            "`plans/private/bugsinpy_issues`). When given the directory is REQUIRED: a "
+            "report missing there refuses the bug by name — the run never falls back to "
+            "the default folder and never re-fetches a report live (§2.4)."
         ),
     )
     run.set_defaults(func=cmd_run)
@@ -3199,6 +3266,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     queue.add_argument(
         "--traceback", action="store_true", help="print tracebacks (with --pipeline)"
+    )
+    queue.add_argument(
+        "--issues-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "where the frozen issue reports are read from (and, with --pipeline, "
+            "frozen into). Flag absent is the committed `plans/bugsinpy_issues`, "
+            "byte-for-byte today's path. A held-out split points this at its gitignored "
+            "freeze directory (e.g. `plans/private/bugsinpy_issues`). When given the "
+            "directory is REQUIRED: a report missing there refuses the bug by name — the "
+            "run never falls back to the default folder and never re-fetches a report "
+            "live (§2.4)."
+        ),
     )
     queue.set_defaults(func=cmd_queue)
 

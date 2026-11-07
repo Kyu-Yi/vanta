@@ -2976,6 +2976,17 @@ class Job:
     ``config_block`` is.
     """
 
+    issues_dir: Optional[Path] = None
+    """The ``--issues-dir`` this invocation named, or ``None`` for the committed default.
+
+    Carried on the job for the same reason ``config_block`` is: ``run_job`` reads it
+    to find the frozen report a ``--show-hints`` row appends, so ``run_job``'s
+    signature (which tests stub) does not have to grow a parameter for it. ``None``
+    reads ``issue_source.ISSUES_DIR`` exactly as before; a path is the ONLY
+    directory the hints may come from — a report missing there refuses the row by
+    name rather than reading the default directory or re-fetching it live (§2.4).
+    """
+
     @property
     def key(self) -> str:
         return job_key(
@@ -3058,25 +3069,84 @@ def python_version_of(paths: BatchPaths, checkpoint: str, disk_mb: int) -> str:
     return version
 
 
-def issue_text_for(prep: prepare_mod.BugPrep, *, show_hints: bool) -> str:
+def require_frozen_issues(
+    preps: Sequence[prepare_mod.BugPrep], *, issues_dir: Optional[Path]
+) -> None:
+    """Refuse the batch, by name, when a report it may read is missing under ``--issues-dir``.
+
+    [VANTA-WHY] ``--issues-dir`` asserts where the frozen reports live. When it is
+    given, that directory is the ONLY place a report may come from: a report missing
+    there means the invocation's premise is false — the held-out texts were never
+    frozen, or frozen somewhere else — and reading the default ``plans/bugsinpy_issues/``
+    instead, or resolving one live from the API, would put text nobody has reviewed on
+    the path to a prompt (§2.4). So it stops the batch before the first job is claimed
+    rather than degrading to a prompt without the text it was asked to send.
+
+    ``None`` (the flag was not given) checks nothing: the default directory is the
+    committed one and a missing report there is the pre-existing behaviour, which
+    ``--issues-dir`` deliberately does not change.
+    """
+    if issues_dir is None:
+        return
+    missing = [
+        f"{prep.bug.project}/{prep.bug.bug_id}"
+        for prep in preps
+        if issue_source.load_or_none(issues_dir, prep.bug.project, prep.bug.bug_id)
+        is None
+    ]
+    if missing:
+        raise RunnerError(
+            f"--issues-dir {issues_dir} holds no frozen issue report for "
+            f"{', '.join(missing)}. A run never falls back to "
+            f"{issue_source.ISSUES_DIR} and never re-fetches a report live: freeze "
+            "them first with `python3 scripts/bugsinpy_run.py prepare --issues-dir "
+            f"{issues_dir} …`."
+        )
+
+
+def issue_text_for(
+    prep: prepare_mod.BugPrep,
+    *,
+    show_hints: bool,
+    issues_dir: Optional[Path] = None,
+) -> str:
     """The exact text written to ``issues/<slug>.txt``: the content, and the hints if asked.
 
     [VANTA-WHY] With ``show_hints`` off — the default, and every row of the main evaluation —
     the answer is ``prep.issue.text`` and nothing else: that string *is* the frozen artifact's
     gated content section, and a run has to send it byte-for-byte (§2.4.3). The comments are
-    read here, from the same committed file whose hash a stage verified, rather than carried
+    read here, from the same file whose hash a stage verified, rather than carried
     through ``prepare.json``: under the default setting there is then no copy of them anywhere
     on the path to a prompt, so "never shown" is a property of the code rather than of a flag
     somebody has to keep set. A report with no comments, or a hints section the gate emptied,
     leaves the text as it was — turning the ablation on cannot invent hints that do not exist.
+
+    ``issues_dir`` is the ``--issues-dir`` the invocation named, or ``None`` for the committed
+    default. When it is given, it is the ONLY directory the hints may come from: a report
+    missing there is a refusal naming the bug, never a fall back to the default directory and
+    never a live re-fetch — an ablation row has to read the same frozen file every other stage
+    read, or it is not the ablation it claims to be (§2.4).
     """
     text = prep.issue.text if prep.issue else ""
     if not show_hints:
         return text
     frozen = issue_source.load_or_none(
-        issue_source.ISSUES_DIR, prep.bug.project, prep.bug.bug_id
+        issue_source.ISSUES_DIR if issues_dir is None else issues_dir,
+        prep.bug.project,
+        prep.bug.bug_id,
     )
-    if frozen is None or not frozen.hints:
+    if frozen is None:
+        if issues_dir is None:
+            # The default setting: a report the freeze never wrote is simply no hints.
+            return text
+        raise RunnerError(
+            f"--show-hints reads {issues_dir}, where the frozen issue report for "
+            f"{prep.bug.project}/{prep.bug.bug_id} is missing. This harness never "
+            f"falls back to {issue_source.ISSUES_DIR} and never re-fetches a report "
+            "live: freeze it with `python3 scripts/bugsinpy_run.py prepare "
+            f"--issues-dir {issues_dir} …` first."
+        )
+    if not frozen.hints:
         return text
     return f"{text}\n{frozen.hints}"
 
@@ -3117,7 +3187,10 @@ def run_job(
     # same way; the issue path is the one that was still keyed by the bug.
     issue_path = paths.issues / f"{_stem(job.key)}.txt"
     issue_path.parent.mkdir(parents=True, exist_ok=True)
-    issue_path.write_text(issue_text_for(prep, show_hints=job.show_hints), encoding="utf-8")
+    issue_path.write_text(
+        issue_text_for(prep, show_hints=job.show_hints, issues_dir=job.issues_dir),
+        encoding="utf-8",
+    )
     issue_sha256 = sha256_text(issue_path.read_text(encoding="utf-8"))
 
     log_path = paths.logs / f"{_stem(job.key)}.log"
@@ -3779,6 +3852,7 @@ def run_batch(
     announce: bool = True,
     arm_spellings: Optional[Sequence[str]] = None,
     budget: Optional[budget_mod.Budget] = None,
+    issues_dir: Optional[Path] = None,
 ) -> tuple[int, list[WaveResult]]:
     """The whole batch: per wave, D13's four phases, then the wave-1 gate.
 
@@ -3917,6 +3991,13 @@ def run_batch(
     if plan_only:
         return 0, []
 
+    # The `--issues-dir` premise, checked once and before any row: a report missing
+    # under the directory the invocation named stops the batch by name here, rather
+    # than every `--show-hints` row discovering it mid-flight (or, worse, a row
+    # silently reading the default directory). `--plan` returned above, so a plan
+    # never needs the directory.
+    require_frozen_issues(preps, issues_dir=issues_dir)
+
     checkpoint_pythons: dict[str, str] = {}
     if announce:
         print(
@@ -3986,6 +4067,7 @@ def run_batch(
                 repair_configs=repair_configs,
                 disk_mb=disk_mb,
                 budget=budget,
+                issues_dir=issues_dir,
             )
             if budget is not None and budget.concurrent:
                 status, phase_records, phase_failed = _run_jobs_concurrently(
@@ -4173,6 +4255,7 @@ def _phase_jobs(
     repair_configs: Sequence[str],
     disk_mb: int,
     budget: Optional["budget_mod.Budget"] = None,
+    issues_dir: Optional[Path] = None,
 ) -> list["Job"]:
     """One phase's jobs, in the exact order the serial loop visited them.
 
@@ -4222,6 +4305,7 @@ def _phase_jobs(
                             config_block=config_block,
                             prep_config_block=prep_config_block,
                             frozen_env=frozen_env,
+                            issues_dir=issues_dir,
                         )
                     )
                     continue
@@ -4256,6 +4340,7 @@ def _phase_jobs(
                             config_block=config_block,
                             prep_config_block=prep_config_block,
                             frozen_env=frozen_env,
+                            issues_dir=issues_dir,
                         )
                     )
     return jobs
@@ -5529,6 +5614,7 @@ def run_queue(
     frozen_env: Optional[Mapping[str, str]] = None,
     arm_spellings: Optional[Sequence[str]] = None,
     budget: Optional[budget_mod.Budget] = None,
+    issues_dir: Optional[Path] = None,
 ) -> tuple[int, list[QueueOutcome]]:
     """Item 13 — run a prepared batch's bugs up to ``jobs`` at a time.
 
@@ -5587,6 +5673,7 @@ def run_queue(
             frozen_env=frozen_env,
             arm_spellings=arm_spellings,
             budget=budget,
+            issues_dir=issues_dir,
         )
     finally:
         owner.release()
@@ -5797,6 +5884,11 @@ def _run_task(
             # M3 item S6 — the ONE scheduler of the whole invocation, so every row
             # of every bug of this wave shares the same budget.
             budget=kwargs["budget"],
+            # Round 9 — the `--issues-dir` the invocation named, so a `--show-hints`
+            # row reads the same frozen report every other stage read. `.get` because
+            # a caller that drives `_run_queue` with its own kwargs (a test) need not
+            # name it; absent means the committed default, exactly as before.
+            issues_dir=kwargs.get("issues_dir"),
         )
     except Exception as exc:  # one bug must not take the queue down
         print(f"  [{prep.key}] FAILED — {type(exc).__name__}: {exc}", flush=True)

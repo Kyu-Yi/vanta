@@ -5763,6 +5763,59 @@ class TestTheHintsAreKeptOutOfTheDefaultPrompt:
         bug_prep = self._prep_with_issue()
         assert runner_mod.issue_text_for(bug_prep, show_hints=True) == bug_prep.issue.text
 
+    def test_the_flag_absent_reads_the_committed_directory(self, tmp_path, monkeypatch):
+        """No ``--issues-dir`` is today's path, byte-for-byte (§2.4): the dev split omits it.
+
+        ``issues_dir=None`` must read ``issue_source.ISSUES_DIR`` — the committed
+        ``plans/bugsinpy_issues`` — and nothing about the read may change. This is the
+        same directory the two hint tests above read; here it is named explicitly so the
+        flag-absent case is pinned as *that* path rather than merely "some path".
+        """
+        issues = tmp_path / "issues"
+        self._frozen(issues, comments=self._hints())
+        monkeypatch.setattr(source_mod, "ISSUES_DIR", issues)
+        bug_prep = self._prep_with_issue()
+        text = runner_mod.issue_text_for(bug_prep, show_hints=True, issues_dir=None)
+        assert "the cause is parse_with_dots in pkg/mod.py" in text
+        # With the default, the batch premise is not a requirement and never refuses.
+        runner_mod.require_frozen_issues([bug_prep], issues_dir=None)
+
+    def test_the_flag_reads_the_directory_it_names(self, tmp_path, monkeypatch):
+        """With the flag given, the hints come from THAT directory, not the committed one."""
+        committed = tmp_path / "committed"
+        heldout = tmp_path / "heldout"
+        self._frozen(committed, comments=[])  # committed has no hints
+        self._frozen(heldout, comments=self._hints())  # the named directory does
+        monkeypatch.setattr(source_mod, "ISSUES_DIR", committed)
+        bug_prep = self._prep_with_issue()
+        runner_mod.require_frozen_issues([bug_prep], issues_dir=heldout)
+        text = runner_mod.issue_text_for(bug_prep, show_hints=True, issues_dir=heldout)
+        assert "the cause is parse_with_dots in pkg/mod.py" in text
+
+    def test_a_report_missing_under_the_flag_refuses_the_bug_by_name(
+        self, tmp_path, monkeypatch
+    ):
+        """``--issues-dir`` is a REQUIREMENT, not a hint (§2.4): a miss refuses, never falls back.
+
+        The bug is named so an operator reads which freeze is missing; and the populated
+        committed default is never consulted to paper over the gap, nor is a report
+        re-fetched live. Both entry points — the per-row hints read and the batch premise
+        check — refuse the same way.
+        """
+        committed = tmp_path / "committed"
+        self._frozen(committed, comments=self._hints())
+        monkeypatch.setattr(source_mod, "ISSUES_DIR", committed)
+        bug_prep = self._prep_with_issue()
+        empty = tmp_path / "heldout"
+        empty.mkdir()
+        with pytest.raises(runner_mod.RunnerError, match="Demo/1") as hints:
+            runner_mod.issue_text_for(bug_prep, show_hints=True, issues_dir=empty)
+        assert str(empty) in str(hints.value)
+        assert "never falls back" in str(hints.value)
+        with pytest.raises(runner_mod.RunnerError, match="Demo/1") as batch:
+            runner_mod.require_frozen_issues([bug_prep], issues_dir=empty)
+        assert str(empty) in str(batch.value)
+
 
 # ============================================================================
 # shuru.py — how an argv becomes a guest shell line (no VM)
@@ -40237,6 +40290,35 @@ class TestFrozenConfigWiring:
         assert (
             parser.parse_args(["run", "--batch", "b", "--allow-override"]).allow_override
             is True
+        )
+
+    def test_the_three_stages_carry_issues_dir_defaulting_to_the_committed_path(self):
+        """§2.4 round 9 — ``--issues-dir`` rides on prepare, run and queue; absent = today's path.
+
+        Scope is exactly those three stages: the held-out split freezes and reads
+        through one gitignored directory, and the dev split omits the flag and keeps the
+        committed ``plans/bugsinpy_issues`` byte-for-byte.
+        """
+        parser = run_mod.build_parser()
+        for argv in (
+            ["prepare", "--split", "x.json"],
+            ["run", "--batch", "b"],
+            ["queue", "--batch", "b"],
+        ):
+            assert parser.parse_args(argv).issues_dir is None
+        assert (
+            parser.parse_args(
+                ["prepare", "--split", "x.json", "--issues-dir", "d"]
+            ).issues_dir
+            == Path("d")
+        )
+        assert (
+            parser.parse_args(["run", "--batch", "b", "--issues-dir", "d"]).issues_dir
+            == Path("d")
+        )
+        assert (
+            parser.parse_args(["queue", "--batch", "b", "--issues-dir", "d"]).issues_dir
+            == Path("d")
         )
 
     def test_the_analyse_command_carries_allow_mixed_configs_defaulting_off(self):

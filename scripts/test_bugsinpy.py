@@ -18228,6 +18228,95 @@ class TestTheRetryOnAnUnbuildablePin:
             minor="3.8",
         )
 
+    def test_a_pin_that_merely_declares_a_no_deps_name_does_not_move(self):
+        """The narrowed seed: only the pins this retry **dropped** seed the walk.
+
+        A ``--no-deps`` pin's name is in ``/tmp/constraints.txt``, so a main-pass pin
+        that only declares one gives pip no version to choose and leaks nothing. Measured
+        on ``pandas/7``: ``pytest==5.4.3`` declares ``hypothesis`` behind an ``extra``,
+        ``hypothesis`` is one of the layer's eight ``--no-deps`` pins, and the old seed —
+        the dropped names **and** the ``--no-deps`` names — moved pytest out of the
+        resolving pass, where the safeguard then refused the whole retry.
+        """
+        def reader(name, version):
+            declared = {
+                ("pytest", "5.4.3"): ("hypothesis (>=3.56) ; extra == 'testing'",),
+                ("clifford", "1.3.1"): ("h5py",),
+                ("mpl-toolkits-clifford", "0.0.3"): ("clifford",),
+            }.get((name, version), ())
+            return (declared, None)
+
+        deps = self._deps(
+            installs=(
+                "pytest==5.4.3",
+                "hypothesis==5.16.0",
+                "h5py==2.10.0",
+                "clifford==1.3.1",
+                "mpl-toolkits-clifford==0.0.3",
+            ),
+            metadata_of=reader,
+            no_deps_pins=("hypothesis==5.16.0",),
+        )
+        plan = bake_mod.retry_plan(deps, "Failed to build h5py\n")
+        assert plan is not None
+        assert plan.refused is None
+        assert [drop.pin for drop in plan.drops] == ["h5py==2.10.0"]
+        main = (
+            plan.script.split("<<'VANTA_REQUIREMENTS'\n", 1)[1]
+            .split("\nVANTA_REQUIREMENTS", 1)[0]
+        )
+        assert main.splitlines() == ["pytest==5.4.3"], "pytest is never moved"
+        no_deps = plan.script.split("<<'VANTA_NO_DEPS'\n", 1)[1]
+        # The dropped ``h5py``'s dependers re-close onto the pass; the kept pin stays put.
+        assert no_deps.startswith(
+            "hypothesis==5.16.0\nclifford==1.3.1\nmpl-toolkits-clifford==0.0.3\n"
+        )
+
+    def test_pandas_7_s_real_pins_move_nothing_new_under_the_narrowed_seed(self):
+        """``pandas/7``'s own retry: the eight ``--no-deps`` pins stay exactly as they
+        are, ``clifford`` and ``mpl-toolkits-clifford`` re-close on the ``h5py`` they
+        already declared, nothing joins the pass, and the retry is rendered — not
+        refused. ``pytest`` stays in the resolving pass throughout."""
+        KEPT = (
+            "clifford==1.3.1",
+            "hypothesis==5.16.0",
+            "mpl-toolkits-clifford==0.0.3",
+            "sparse==0.10.0",
+            "xarray==0.15.0",
+            "fastparquet==0.3.2",
+            "dask==2.10.1",
+            "statsmodels==0.11.0",
+        )
+        declared = {
+            ("clifford", "1.3.1"): ("numpy", "scipy", "numba (>0.46)", "h5py", "sparse"),
+            ("mpl-toolkits-clifford", "0.0.3"): ("clifford", "matplotlib", "trimesh"),
+            ("sparse", "0.10.0"): ("numpy", "scipy (>=0.19)", "numba (>=0.49)"),
+            ("xarray", "0.15.0"): ("pandas (>=0.25)",),
+            ("fastparquet", "0.3.2"): ("pandas (>=0.19)",),
+            ("statsmodels", "0.11.0"): ("pandas (>=0.25)",),
+            ("pytest", "5.4.3"): ("hypothesis (>=3.56) ; extra == 'testing'",),
+        }
+
+        def reader(name, version):
+            return (declared.get((name, version), ()), None)
+
+        installs = ("pytest==5.4.3", "h5py==2.10.0", *KEPT)
+        deps = self._deps(installs=installs, metadata_of=reader, no_deps_pins=KEPT)
+        plan = bake_mod.retry_plan(deps, "Failed to build h5py\n")
+        assert plan is not None
+        assert plan.refused is None
+        assert [drop.pin for drop in plan.drops] == ["h5py==2.10.0"]
+        main = (
+            plan.script.split("<<'VANTA_REQUIREMENTS'\n", 1)[1]
+            .split("\nVANTA_REQUIREMENTS", 1)[0]
+        )
+        assert main.splitlines() == ["pytest==5.4.3"], "pytest is never moved"
+        no_deps = plan.script.split("<<'VANTA_NO_DEPS'\n", 1)[1]
+        assert no_deps.startswith("".join(f"{pin}\n" for pin in KEPT))
+        assert plan.script == bake_mod.requirements_recipe(
+            ("pytest==5.4.3", *KEPT), no_deps_pins=KEPT, minor="3.8"
+        )
+
     def test_a_protected_dependent_makes_the_retry_refuse(self):
         """A dependent the safeguard protects may not leave the resolving pass (D2/D5b)."""
         safeguard = bake_mod.pin_safeguard(

@@ -10026,23 +10026,26 @@ def retry_plan(deps: "BugDeps", output: str) -> Optional[RetryPlan]:
         early_pins = surviving(deps.early_pins)
         kept_no_deps = surviving(deps.no_deps_pins)
         # D3: the retry **moves**, it does not merely drop. A pin the main pass keeps but
-        # whose own release declares a name that pass installs nothing for makes pip
+        # whose own release declares a name that pass installs **nothing for** makes pip
         # resolve that name itself, at the newest release of the day — exactly what the
         # failing first pass did, and the whole reason §3.2's absent-name rule exists — so
-        # it would fail again. ``absent`` is the names the retry's main pass installs
-        # nothing for: the pins just dropped, and the names the layer's own ``--no-deps``
-        # pass already holds (its pins leave the resolving pass too). The closure is
-        # transitive, so ``mpl-toolkits-clifford`` moves with ``clifford`` moves with the
-        # dropped ``h5py``, and it is the *same* reader the first pass used, so the two
-        # passes cannot answer differently.
-        absent = [
-            *(canonicalize_name(drop.name) for drop in drops),
-            *(
-                _pinned_parts(spec)[0]
-                for spec in kept_no_deps
-                if _pinned_parts(spec) is not None
-            ),
-        ]
+        # it would fail again. ``absent`` is therefore the names the retry's main pass
+        # installs nothing for, and that is the pins this retry just **dropped** and
+        # nothing else. A ``--no-deps`` pin's name is **not** such a name: it *is* in
+        # ``/tmp/constraints.txt`` (:func:`constraint_lines` holds every ``install_specs``
+        # entry, the ``--no-deps`` ones included), so a main-pass pin that merely declares
+        # one gives pip no version to choose and leaks nothing — ``pytest`` declares
+        # ``hypothesis`` behind an ``extra``, ``hypothesis`` is one of the layer's eight
+        # ``--no-deps`` pins, and pytest stays in the resolving pass. Nor do the names the
+        # first pass itself found absent need re-seeding here: the first pass seeded on
+        # exactly those (its dropped and tree-satisfied names) and its answer is
+        # ``kept_no_deps``, which the retry keeps and starts from, so seeding on the
+        # retry's own drops reaches the same fixpoint on fewer moves. The closure is
+        # transitive, so ``clifford`` (which declares the dropped ``h5py``) moves, and
+        # ``mpl-toolkits-clifford`` (which declares ``clifford``) moves with it, and it is
+        # the *same* reader the first pass used, so the two passes cannot answer
+        # differently.
+        absent = [canonicalize_name(drop.name) for drop in drops]
         try:
             moved = no_deps_dependents(
                 installs, absent, metadata_of=material.metadata_of

@@ -23222,6 +23222,149 @@ needs_bare_repos = pytest.mark.skipif(
 )
 
 
+class TestSuitePythonpath:
+    """§8.6 round 10 — the suite's ``PYTHONPATH`` is the project's own, read per commit.
+
+    The split records the *rule* (this project's suite needs a ``PYTHONPATH``); the
+    *value* is read from the buggy commit's own ``scripts/test.sh``, because fastapi
+    moved its example tree from ``docs_src`` to ``docs/src`` and one recorded value
+    served only one side of the move. ``_sandbox_env`` is exactly what ``prepare_one``
+    builds the row with, so a test of it is a test of the row.
+    """
+
+    FASTAPI_REPO = REPO_ROOT / "runs" / "bugsinpy" / "repos" / "fastapi.git"
+    # The buggy commits the held-out split records (§8.6 round 10). Kept as literals
+    # because the point of the test is that *these* commits, read from the mirror,
+    # say what the canary needs — not that the split happens to agree with itself.
+    FASTAPI_11 = "bf229ad5d830eb5320f966d51a55e590e8d57008"
+    FASTAPI_3 = "869c7389e22dc9ad659940fa271da76c4f3ba3b1"
+
+    def test_the_project_s_own_export_is_read(self, monkeypatch):
+        monkeypatch.setattr(
+            tree_mod,
+            "read_file_at",
+            lambda repo, commit, path: "set -e\nexport PYTHONPATH=./docs/src\npytest tests\n",
+        )
+        assert (
+            prepare_mod.suite_pythonpath(Path("/clones/fastapi.git"), "c" * 40)
+            == "./docs/src"
+        )
+
+    def test_quotes_around_the_value_are_trimmed(self, monkeypatch):
+        monkeypatch.setattr(
+            tree_mod,
+            "read_file_at",
+            lambda repo, commit, path: 'export PYTHONPATH="./docs/src"\n',
+        )
+        assert (
+            prepare_mod.suite_pythonpath(Path("/clones/fastapi.git"), "c" * 40)
+            == "./docs/src"
+        )
+
+    def test_a_project_with_no_runner_states_nothing(self, monkeypatch):
+        monkeypatch.setattr(tree_mod, "read_file_at", lambda repo, commit, path: None)
+        assert prepare_mod.suite_pythonpath(Path("/clones/matplotlib.git"), "c" * 40) is None
+
+    def test_a_runner_that_exports_no_pythonpath_states_nothing(self, monkeypatch):
+        monkeypatch.setattr(
+            tree_mod,
+            "read_file_at",
+            lambda repo, commit, path: "#!/usr/bin/env bash\npytest tests\n",
+        )
+        assert prepare_mod.suite_pythonpath(Path("/clones/luigi.git"), "c" * 40) is None
+
+    def test_the_row_takes_the_commits_value_over_the_splits(self, monkeypatch):
+        """The stale recorded value does not win: fastapi/11's tree has no ``docs_src``."""
+        monkeypatch.setattr(
+            tree_mod,
+            "read_file_at",
+            lambda repo, commit, path: "export PYTHONPATH=./docs/src\n",
+        )
+        env = prepare_mod._sandbox_env(
+            {"sandbox_env": {"PYTHONPATH": "./docs_src"}},
+            repo=Path("/clones/fastapi.git"),
+            commit=self.FASTAPI_11,
+        )
+        assert env == {"PYTHONPATH": "./docs/src"}
+
+    def test_the_row_keeps_the_split_value_when_the_project_states_nothing(self, monkeypatch):
+        """matplotlib ships no ``scripts/test.sh``: its recorded ``lib`` stands."""
+        monkeypatch.setattr(tree_mod, "read_file_at", lambda repo, commit, path: None)
+        env = prepare_mod._sandbox_env(
+            {"sandbox_env": {"MPLBACKEND": "Agg", "PYTHONPATH": "lib"}},
+            repo=Path("/clones/matplotlib.git"),
+            commit="c" * 40,
+        )
+        assert env == {"MPLBACKEND": "Agg", "PYTHONPATH": "lib"}
+
+    def test_a_project_that_states_a_path_with_no_recorded_rule_gets_it(self, monkeypatch):
+        monkeypatch.setattr(
+            tree_mod,
+            "read_file_at",
+            lambda repo, commit, path: "export PYTHONPATH=./docs/src\n",
+        )
+        assert prepare_mod._sandbox_env(
+            {}, repo=Path("/clones/fastapi.git"), commit=self.FASTAPI_11
+        ) == {"PYTHONPATH": "./docs/src"}
+
+    def test_fastapi_11s_suite_run_sees_docs_src_on_the_path(self, monkeypatch, tmp_path):
+        """The env that reaches the deps gate's collect is the commit's own ``./docs/src``.
+
+        [VANTA-WHY] The deps gate's collect is the run that failed on fastapi/11 — its
+        tutorial tests import the example apps out of the tree's docs directory — so
+        that is the run this asserts. The row's ``sandbox_env`` is what every run of the
+        row gets (``TestSandboxEnvReachesEveryRun``), and here it is built from the same
+        commit the held-out split records.
+        """
+        monkeypatch.setattr(
+            tree_mod,
+            "read_file_at",
+            lambda repo, commit, path: "export PYTHONPATH=./docs/src\n",
+        )
+        env = prepare_mod._sandbox_env(
+            {"sandbox_env": {"PYTHONPATH": "./docs_src"}},
+            repo=self.FASTAPI_REPO,
+            commit=self.FASTAPI_11,
+        )
+        seen: dict = {}
+        monkeypatch.setattr(
+            suite_mod,
+            "collect_only",
+            lambda **kwargs: seen.update(collect=kwargs) or {"tests/x.py::t"},
+        )
+        monkeypatch.setattr(
+            suite_mod,
+            "import_probe",
+            lambda **kwargs: seen.update(probe=kwargs)
+            or "/workspace/worktrees/fastapi_11/oracle_tree/fastapi/__init__.py",
+        )
+        prepare_mod.check_deps(
+            prep(
+                root=tmp_path / "batch" / "worktrees" / "fastapi_11",
+                sandbox_env=env,
+            ),
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            deps={"import_name": "fastapi"},
+        )
+        assert seen["collect"]["extra_env"] == {"PYTHONPATH": "./docs/src"}
+        assert seen["probe"]["extra_env"] == {"PYTHONPATH": "./docs/src"}
+
+    @needs_bare_repos
+    def test_fastapi_11s_own_commit_declares_docs_src(self):
+        """The canary's fact, read from the real mirror rather than a stub."""
+        assert (
+            prepare_mod.suite_pythonpath(self.FASTAPI_REPO, self.FASTAPI_11) == "./docs/src"
+        )
+
+    @needs_bare_repos
+    def test_fastapi_3s_own_commit_declares_docs_src(self):
+        """The other side of the move: /3's tree carries ``docs_src`` and it passes."""
+        assert (
+            prepare_mod.suite_pythonpath(self.FASTAPI_REPO, self.FASTAPI_3) == "./docs_src"
+        )
+
+
 @needs_bare_repos
 @needs_clone
 class TestRealPySnooperDependencies:

@@ -20,6 +20,7 @@ Every suite run happens inside Shuru — ``prepare`` is not exempt from C3.
 from __future__ import annotations
 
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -2746,6 +2747,63 @@ def check_build_declared(entry: dict[str, Any], bug: BugInfo, *, repo: Path) -> 
     ]
 
 
+PYTHONPATH_DECL = re.compile(
+    r"^[ \t]*(?:export[ \t]+)?PYTHONPATH=(?P<value>[^\s#;]+)",
+    re.MULTILINE,
+)
+"""The line a project's own suite runner uses to put its import root on ``PYTHONPATH``.
+
+Covers both the shell form the projects use (``export PYTHONPATH=./docs/src``) and a
+bare assignment ahead of the test command. The value is a path token — no quotes are
+consumed here; :func:`suite_pythonpath` trims any it finds.
+"""
+
+
+def suite_pythonpath(repo: Path, commit: str) -> Optional[str]:
+    """The ``PYTHONPATH`` the project's own suite runner declares at ``commit``.
+
+    ``repo`` is the project's clone mirror, and the value is read out of that
+    commit's ``scripts/test.sh`` through :func:`trees.read_file_at` (git, no
+    checkout): whatever the project's own runner exports is what the suite is written
+    against. ``None`` when the project ships no such script or exports nothing, in
+    which case the split's recorded value stands unchanged.
+
+    [VANTA-WHY] §8.6 round 10. The split recorded one value, ``./docs_src``, for every
+    fastapi bug — the layout of its *newer* commits. fastapi/11, /5 and /6 are older
+    commits whose own ``scripts/test.sh`` export ``PYTHONPATH=./docs/src``, so the
+    deps gate's collect imported the example apps from a directory that commit does
+    not ship and refused the bug with ``No module named 'additional_responses'`` while
+    fastapi/3 passed, because only its tree carries a ``docs_src/``. The path moved
+    with the project, so it is read per commit rather than frozen into the protocol;
+    the environment variable the suite runs under is named ``PYTHONPATH`` either way,
+    whatever the project's file calls the directory.
+    """
+    text = tree_mod.read_file_at(repo, commit, "scripts/test.sh")
+    if not text:
+        return None
+    match = PYTHONPATH_DECL.search(text)
+    if not match:
+        return None
+    return match.group("value").strip().strip("'\"")
+
+
+def _sandbox_env(entry: dict[str, Any], *, repo: Path, commit: str) -> dict[str, str]:
+    """The row's ``sandbox_env``: the split's rule, with ``PYTHONPATH`` from the commit.
+
+    [VANTA-WHY] The split records *that* a project's suite needs a ``PYTHONPATH``
+    (fastapi's example apps, matplotlib's ``lib``); the *value* is read from the
+    commit for a project whose own runner states it (:func:`suite_pythonpath`), so a
+    directory the project moved is not a value frozen into the protocol. A project
+    that states nothing keeps exactly what the split recorded — including the case
+    where the split recorded no ``sandbox_env`` at all.
+    """
+    env = {str(k): str(v) for k, v in (entry.get("sandbox_env") or {}).items()}
+    declared = suite_pythonpath(repo, commit)
+    if declared is not None:
+        env["PYTHONPATH"] = declared
+    return env
+
+
 def _memory_entry(entry: dict[str, Any]) -> Optional[int]:
     """The split entry's ``vm_memory_mb``, or ``None``.
 
@@ -2819,11 +2877,14 @@ def prepare_one(
         # them. Read from the split, which is where the command itself comes from.
         native_test_paths=[str(part) for part in entry["native_test_paths"]],
         prepare_mode=FULL if full else MEASURE_ONLY,
-        # §3.4 — the project's own suite environment. Declared on the split entry
-        # (``sandbox_env``) and only read here, so the value is never typed per bug
-        # in pipeline code: whatever the split records is what every run of this row
-        # gets. Empty for every bug but fastapi's.
-        sandbox_env={str(k): str(v) for k, v in (entry.get("sandbox_env") or {}).items()},
+        # §3.4 — the project's own suite environment. The split records *that* the
+        # project's suite needs one (``sandbox_env``) — fastapi's example apps on
+        # ``PYTHONPATH``, matplotlib's ``lib`` — and the ``PYTHONPATH`` value itself is
+        # read from the buggy commit's own ``scripts/test.sh``, so a directory the
+        # project moved between commits is not a value frozen into the protocol
+        # (:func:`_sandbox_env`). Whatever the row records is what every run of this row
+        # gets. Empty for every bug but fastapi's and matplotlib's.
+        sandbox_env=_sandbox_env(entry, repo=repo_cache, commit=bug.buggy_commit),
         # §3.4 — the project's own build rule (``build_env``), read here in the same
         # way and for the same reason: the split records it once, and every tree this
         # row builds gets it from the row rather than from a pipeline literal.

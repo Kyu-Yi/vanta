@@ -121,14 +121,19 @@ protocol is recorded.
 
 [VANTA-WHY] ``sandbox_env`` is the project's own statement of the environment its
 suite runs in, recorded rather than hard-coded: fastapi's ``scripts/test.sh`` exports
-``PYTHONPATH=./docs_src`` and ~250 of its tests import a module the tree ships in that
-directory (``from additional_responses.tutorial001 import app``), so without it the
-suites die at collection with ``ModuleNotFoundError`` and the bug reads as a broken
-tree. It is per bug in this file because the file is a list of bugs — the rule is the
-*project's*, and a bug of a project that declares one carries it. The one alternative
-that would have kept the tree free of harness-made files was a ``conftest.py`` written
-into the repo, and it was rejected: the tree the Attacker and the Creator read must be
-exactly what the benchmark ships.
+``PYTHONPATH`` over the directory its example apps live in and ~250 of its tests
+import a module the tree ships there (``from additional_responses.tutorial001 import
+app``), so without it the suites die at collection with ``ModuleNotFoundError`` and the
+bug reads as a broken tree. It is per bug in this file because the file is a list of
+bugs — the rule is the *project's*, and a bug of a project that declares one carries
+it. The recorded value is the *directory*, and it is not frozen: for the projects whose
+own runner states it (fastapi), ``prepare`` reads the ``PYTHONPATH`` out of that bug's
+buggy commit, because the directory moved between commits — the newer ones ship
+``docs_src``, the older ones ``docs/src`` — and one recorded value served only one side
+of the move (§8.6 round 10). What the row records is what every run of the row gets.
+The one alternative that would have kept the tree free of harness-made files was a
+``conftest.py`` written into the repo, and it was rejected: the tree the Attacker and
+the Creator read must be exactly what the benchmark ships.
 
 [VANTA-WHY] ``build_env`` is the project's own build rule, for a tree whose ``setup.py``
 compiles with ``-Werror`` against sources written for an older toolchain. pandas/1 is the

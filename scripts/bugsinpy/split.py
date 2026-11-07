@@ -276,6 +276,7 @@ DERIVED_BUG_KEYS = frozenset(
         "partially_hidden_functions",
         "hidden_by_collect_flip",
         "collect_flip_nodeids",
+        "collect_excluded",
         "gate_failures",
         "prompt_tokens_estimate",
         "context_ok",

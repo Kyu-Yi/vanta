@@ -28,6 +28,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 from . import bake as bake_mod
 from . import budget as budget_mod
+from . import compact as compact_mod
 from . import context as ctx
 from . import issue as issue_mod
 from . import issue_source
@@ -380,6 +381,22 @@ class BugPrep:
     re-derived because re-deriving needs two suite runs inside a VM — grading must
     not have to re-measure what prepare already measured.
     """
+    collect_excluded: dict[str, str] = field(default_factory=dict)
+    """§3.4 — test files the collect gate sets aside because they are not the bug's tests.
+
+    Keys are the files, values are the reason: the file's own buggy-tree collection
+    error, and the declared test files whose import closure does not reach it.
+
+    [VANTA-WHY] The gate collects the *whole* suite, but grading only ever runs the
+    tests the bug declares. A side module the bug's own tests never import — luigi's
+    ``test/_mysqldb_test.py``, which needs the mysql driver the bug's layer does not
+    carry — errored during collection, so the gate refused a bug whose own tests
+    collect perfectly. That is a property of the suite's *edges*, not of the bug, so
+    the file is set aside with the reason recorded rather than the bug replaced (§8
+    rule 6: a harness limitation is never grounds to replace a bug). A file inside
+    the failing tests' closure, or a ``conftest.py``, is never set aside: an error
+    there is a real environment gap and keeps the refusal.
+    """
     gate_failures: list[str] = field(default_factory=list)
     context: Optional[ctx.ContextVerdict] = None
     issue: Optional[issue_mod.IssueText] = None
@@ -613,6 +630,7 @@ class BugPrep:
             "partially_hidden_functions": self.partially_hidden_functions,
             "hidden_by_collect_flip": self.hidden_by_collect_flip,
             "collect_flip_nodeids": sorted(self.collect_flip_nodeids),
+            "collect_excluded": self.collect_excluded,
             "gate_failures": self.gate_failures,
             "context": self.context.to_dict() if self.context else None,
             "issue": self.issue.to_dict() if self.issue else None,
@@ -700,6 +718,9 @@ class BugPrep:
             ),
             collect_flip_nodeids=strings_of(
                 payload, "collect_flip_nodeids", owner=owner, where=where
+            ),
+            collect_excluded=map_of(
+                payload, "collect_excluded", owner=owner, where=where
             ),
             gate_failures=strings_of(payload, "gate_failures", owner=owner, where=where),
             context=None
@@ -827,8 +848,11 @@ def check_deps(
 
     (a) the oracle tree's tests collect, with no collection error — except that a
         collection error which is a recorded *collect-flip* is set aside and the
-        gate is re-run with ``--ignore`` over it (:func:`detect_collect_flip`), so
-        the pass is still a clean exit and not a filtered error list;
+        gate is re-run with ``--ignore`` over it (:func:`detect_collect_flip`), and
+        an error in a test file *outside* the failing tests' import closure — a side
+        module the bug's own tests never import (:func:`_failing_tests_closure`) —
+        is set aside the same way — so the pass is still a clean exit and not a
+        filtered error list;
     (b) the project's own package imports **from the tree under test**, not from
         site-packages, where a ``setup.py install`` would have left a frozen copy
         that makes every patch grade the same.
@@ -900,25 +924,47 @@ def _collect_flip_or_raise(
 
     [VANTA-WHY] Only when the strict gate has *already* refused does this run, and
     its answer is only accepted when it explains the whole refusal: every file that
-    errored on the buggy tree must be a file that collects cleanly on the fixed one,
-    and there must be at least one. Anything else — an error on both trees, an error
-    on a tree the fix does not touch enough to clear, a collection that errors with
-    no file named — keeps the refusal, because those are the shapes of a genuinely
-    broken environment and hiding one would grade a bug against tests it does not
-    have.
+    errored on the buggy tree must be either a file that collects cleanly on the fixed
+    one (a collect-flip, :func:`detect_collect_flip`) — there must be at least one of
+    these or an exclusion below — or a test file *outside* the failing tests' import
+    closure (:func:`_failing_tests_closure`). Anything else — an error on both trees,
+    an error on a tree the fix does not touch enough to clear, an error inside the
+    failing tests' own closure, an error with no file named — keeps the refusal,
+    because those are the shapes of a genuinely broken environment and hiding one
+    would grade a bug against tests it does not have.
 
-    The gate is then re-run for real, with ``--ignore`` over the flipped files, so
-    what passes is a clean collection rather than a filtered error list.
+    [VANTA-WHY] The second admission, and why it is a harness rule (M3-plan §4). The
+    gate collects the *whole* suite, but grading only ever runs the tests the bug
+    declares. Measured on ``luigi/33``: the bug's own tests collect perfectly, and the
+    only failing files are side modules its tests never import — ``test/_esindex_test.py``
+    (elasticsearch), ``test/_mysqldb_test.py`` (mysql), ``s3``/``redshift`` (cryptography)
+    — which need drivers a layer baked for this bug does not carry. The suite-total
+    collection error is a property of the suite's *edges*, not of the bug, so the
+    outside-closure files are set aside with the reason recorded (:attr:`collect_excluded`)
+    and the bug is retried rather than replaced (§8 rule 6). The closure is computed over
+    the same ``oracle_tree`` the gate collects, from the tree's own module-scope imports
+    (the :func:`bake.module_import_graph` / :func:`bake.import_closure` pair the pin audit
+    already uses), so "the tests the bug declares need to collect" is answered by the code
+    rather than by a list. An empty root set excludes nothing: with no declared file in
+    the tree there is no closure to be outside of, and the refusal is kept.
+
+    The gate is then re-run for real, with ``--ignore`` over the flipped and set-aside
+    files, so what passes is a clean collection rather than a filtered error list.
     """
     flips, nodeids, errors = detect_collect_flip(
         prep, checkpoint=checkpoint, batch_dir=batch_dir, env=env, budget=budget
     )
     unexplained = {file: err for file, err in errors.items() if file not in flips}
-    if not flips or unexplained:
+    excluded = _outside_failing_closure(prep, unexplained) if unexplained else {}
+    unexplained = {
+        file: err for file, err in unexplained.items() if file not in excluded
+    }
+    if not (flips or excluded) or unexplained:
         raise suite_mod.SuiteError(f"deps: collection failed: {refusal}") from refusal
 
     prep.hidden_by_collect_flip = flips
     prep.collect_flip_nodeids = nodeids
+    prep.collect_excluded = excluded
     progress(prep.key, "deps gate: collect oracle_tree ignoring the flipped files")
     return suite_mod.collect_only(
         checkpoint=checkpoint,
@@ -927,11 +973,79 @@ def _collect_flip_or_raise(
         test_cmd=prep.test_cmd,
         disk_mb=DISK_MB,
         extra_env=env,
-        ignore=sorted(flips),
+        ignore=sorted(set(flips) | set(excluded)),
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
         budget=budget,
     )
+
+
+def _outside_failing_closure(
+    prep: BugPrep, errors: Mapping[str, str]
+) -> dict[str, str]:
+    """The erroring files among ``errors`` the failing tests' closure does not reach.
+
+    Returns ``{file: reason}``, each reason naming the declared test files that are the
+    closure's roots and the file's own buggy-tree error. A ``conftest.py`` is never
+    named: pytest loads it to collect the declared tests too, so an error there is the
+    suite's own harness failing and must keep the refusal however far it sits from any
+    one test file.
+    """
+    candidates = {file: err for file, err in errors.items() if _is_excludable(file)}
+    if not candidates:
+        return {}
+    roots, closure = _failing_tests_closure(prep)
+    if not roots:
+        return {}
+    return {
+        file: (
+            f"outside the import closure of the declared tests "
+            f"({', '.join(roots)}): {err}"
+        )
+        for file, err in candidates.items()
+        if file not in closure
+    }
+
+
+def _is_excludable(file: str) -> bool:
+    """A file the collect gate may set aside: a test file, but never a ``conftest.py``."""
+    return tree_mod.is_test_path(file) and file.rsplit("/", 1)[-1] != "conftest.py"
+
+
+def _failing_tests_closure(prep: BugPrep) -> tuple[list[str], frozenset[str]]:
+    """The declared failing tests' import closure over the tree under test (§3.4).
+
+    Returns ``(roots, closure)``: ``roots`` is the files BugsInPy declares for this bug
+    (:func:`declared_test_files`) that ``oracle_tree`` actually carries, and ``closure``
+    is every tree file their module-scope imports reach — the pin audit's own
+    :func:`bake.module_import_graph` / :func:`bake.import_closure` pair, read over the
+    tree the gate collects.
+
+    [VANTA-WHY] The closure is the answer to "what do the bug's own tests need to
+    collect", which is the only question grading asks, and it is derived from the tree
+    rather than declared so a fix that adds an import is followed. When ``roots`` is
+    empty the closure is empty on purpose: a caller reading it as "set aside whatever is
+    outside" must then set nothing aside, because there is no failing-test closure to be
+    outside of and the conservative direction is the refusal. A tree that cannot be
+    walked is read as having no roots for the same reason — nothing is set aside and the
+    gate's own refusal stands, rather than a ``CompactError`` escaping ``check_deps``'s
+    ``SuiteError`` contract as a crash.
+    """
+    root = prep.root / "oracle_tree"
+    try:
+        files = [rel for rel, _ in compact_mod.tree_files(root)]
+    except compact_mod.CompactError:
+        return [], frozenset()
+
+    def read(rel: str) -> Optional[str]:
+        try:
+            return (root / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+    graph = bake_mod.module_import_graph(files, read_file=read)
+    roots = [rel for rel in declared_test_files(prep.bug) if rel in graph]
+    return roots, bake_mod.import_closure(roots, graph)
 
 
 def detect_collect_flip(
@@ -2951,6 +3065,7 @@ def derive_verdict(prep: BugPrep) -> dict[str, Any]:
         "partially_hidden_functions": prep.partially_hidden_functions,
         "hidden_by_collect_flip": prep.hidden_by_collect_flip,
         "collect_flip_nodeids": sorted(prep.collect_flip_nodeids),
+        "collect_excluded": prep.collect_excluded,
         "gate_failures": prep.gate_failures,
         "prompt_tokens_estimate": prep.context.estimated_prompt_tokens
         if prep.context

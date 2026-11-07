@@ -10261,6 +10261,12 @@ class TestPrepareRunRecordContract:
                 )
             },
             collect_flip_nodeids=["tests/test_skip_defaults.py::test_skip_defaults"],
+            collect_excluded={
+                "tests/test_side.py": (
+                    "outside the import closure of the declared tests "
+                    "(tests/test_declared.py): ModuleNotFoundError: No module named 'mysql'"
+                )
+            },
             gate_failures=[],
             context=verdict,
             issue=issue,
@@ -10343,6 +10349,9 @@ class TestPrepareRunRecordContract:
         assert loaded.precompile == ["lib/matplotlib/widgets.py"]
         assert loaded.hidden_by_collect_flip == original.hidden_by_collect_flip
         assert loaded.collect_flip_nodeids == sorted(original.collect_flip_nodeids)
+        # §3.4 round 10: the files the collect gate set aside, which the row records so
+        # a re-prepare can prove it set aside the same suite edges.
+        assert loaded.collect_excluded == original.collect_excluded
         assert loaded.hidden_nodeids == sorted(
             [*original.fail_to_pass, *original.collect_flip_nodeids]
         )
@@ -25187,6 +25196,234 @@ class TestCollectFlipGate:
                 self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch",
                 deps=self._deps(),
             )
+
+    def test_an_error_outside_the_failing_tests_closure_is_set_aside(
+        self, tmp_path, monkeypatch
+    ):
+        """§8.6 round 10 — luigi's shape: side modules the bug's own tests never import.
+
+        The gate collects the *whole* suite, but grading runs only the tests the bug
+        declares. A module outside their import closure that cannot collect is the
+        suite's edge, not the bug, so it is set aside with the reason recorded and the
+        bug is retried rather than replaced (§8 rule 6).
+        """
+        calls: list = []
+
+        def strict(**kwargs):
+            calls.append(kwargs)
+            if "ignore" not in kwargs or not kwargs["ignore"]:
+                raise suite_mod.SuiteError(
+                    "pytest exited 2 while collecting (9 test(s) collected)"
+                )
+            return {"tests/test_kept.py::test_a"}
+
+        monkeypatch.setattr(suite_mod, "collect_only", strict)
+        monkeypatch.setattr(
+            suite_mod,
+            "import_probe",
+            lambda **kwargs: (
+                "/workspace/worktrees/Demo_1/oracle_tree/pysnooper/__init__.py"
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod,
+            "detect_collect_flip",
+            lambda prep, **kwargs: (
+                {},
+                [],
+                {"tests/test_side.py": "ModuleNotFoundError: No module named 'mysql'"},
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod,
+            "_failing_tests_closure",
+            lambda prep: (
+                ["tests/test_declared.py"],
+                frozenset({"tests/test_declared.py"}),
+            ),
+        )
+
+        bug_prep = self._prep(tmp_path)
+        nodeids = prepare_mod.check_deps(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch", deps=self._deps()
+        )
+
+        assert nodeids == {"tests/test_kept.py::test_a"}
+        assert len(calls) == 2, "the gate ran strict, then re-ran with the edge set aside"
+        assert calls[1]["ignore"] == ["tests/test_side.py"], (
+            "the pass must come from a clean run with the set-aside file ignored"
+        )
+        assert bug_prep.hidden_by_collect_flip == {}, "a side module is not hidden oracle"
+        assert list(bug_prep.collect_excluded) == ["tests/test_side.py"]
+        assert "import closure" in bug_prep.collect_excluded["tests/test_side.py"]
+        assert "tests/test_declared.py" in bug_prep.collect_excluded["tests/test_side.py"]
+
+    def test_an_error_inside_the_closure_keeps_the_refusal(self, tmp_path, monkeypatch):
+        """A file the declared tests *do* reach is a real gap, not a suite edge."""
+        monkeypatch.setattr(
+            suite_mod,
+            "collect_only",
+            lambda **kwargs: (_ for _ in ()).throw(
+                suite_mod.SuiteError("pytest collected nothing (exit 2)")
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod,
+            "detect_collect_flip",
+            lambda prep, **kwargs: (
+                {},
+                [],
+                {"tests/test_declared.py": "ModuleNotFoundError: gone"},
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod,
+            "_failing_tests_closure",
+            lambda prep: (
+                ["tests/test_declared.py"],
+                frozenset({"tests/test_declared.py"}),
+            ),
+        )
+        monkeypatch.setattr(
+            suite_mod, "import_probe", lambda **kwargs: pytest.fail("probe ran anyway")
+        )
+
+        with pytest.raises(suite_mod.SuiteError, match="^deps: collection failed:"):
+            prepare_mod.check_deps(
+                self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch",
+                deps=self._deps(),
+            )
+
+    def test_a_conftest_error_is_never_set_aside(self, tmp_path, monkeypatch):
+        """pytest loads ``conftest.py`` to collect the declared tests too."""
+        monkeypatch.setattr(
+            suite_mod,
+            "collect_only",
+            lambda **kwargs: (_ for _ in ()).throw(
+                suite_mod.SuiteError("pytest collected nothing (exit 2)")
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod,
+            "detect_collect_flip",
+            lambda prep, **kwargs: (
+                {},
+                [],
+                {"tests/conftest.py": "ImportError: while loading conftest"},
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod,
+            "_failing_tests_closure",
+            lambda prep: (
+                ["tests/test_declared.py"],
+                frozenset({"tests/test_declared.py"}),
+            ),
+        )
+        monkeypatch.setattr(
+            suite_mod, "import_probe", lambda **kwargs: pytest.fail("probe ran anyway")
+        )
+
+        with pytest.raises(suite_mod.SuiteError, match="^deps: collection failed:"):
+            prepare_mod.check_deps(
+                self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch",
+                deps=self._deps(),
+            )
+
+    def test_no_declared_file_excludes_nothing(self, tmp_path, monkeypatch):
+        """With no root there is no closure to be outside of, so the refusal stands."""
+        monkeypatch.setattr(
+            suite_mod,
+            "collect_only",
+            lambda **kwargs: (_ for _ in ()).throw(
+                suite_mod.SuiteError("pytest collected nothing (exit 2)")
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod,
+            "detect_collect_flip",
+            lambda prep, **kwargs: (
+                {},
+                [],
+                {"tests/test_side.py": "ModuleNotFoundError: No module named 'mysql'"},
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod, "_failing_tests_closure", lambda prep: ([], frozenset())
+        )
+        monkeypatch.setattr(
+            suite_mod, "import_probe", lambda **kwargs: pytest.fail("probe ran anyway")
+        )
+
+        with pytest.raises(suite_mod.SuiteError, match="^deps: collection failed:"):
+            prepare_mod.check_deps(
+                self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch",
+                deps=self._deps(),
+            )
+
+
+class TestFailingTestsClosure:
+    """§3.4 round 10 — the closure that decides which collect errors are the suite's edges."""
+
+    @staticmethod
+    def _prep(tmp_path: Path) -> prepare_mod.BugPrep:
+        root = tmp_path / "batch" / "worktrees" / "Demo_1"
+        tree = root / "oracle_tree"
+        (tree / "pkg").mkdir(parents=True)
+        (tree / "tests").mkdir(parents=True)
+        (tree / "pkg" / "__init__.py").write_text("")
+        (tree / "pkg" / "core.py").write_text("import os\n")
+        (tree / "tests" / "test_declared.py").write_text("from pkg.core import thing\n")
+        (tree / "tests" / "test_side.py").write_text("import mysql.connector\n")
+        (tree / "conftest.py").write_text("")
+        return prep(root=root, bug=bug_info(test_file="tests/test_declared.py"))
+
+    def test_the_closure_is_what_the_declared_tests_import(self, tmp_path):
+        roots, closure = prepare_mod._failing_tests_closure(self._prep(tmp_path))
+        assert roots == ["tests/test_declared.py"]
+        assert "tests/test_declared.py" in closure
+        assert "pkg/core.py" in closure
+        assert "tests/test_side.py" not in closure, (
+            "a side module the declared test never imports is outside the closure"
+        )
+
+    def test_a_side_module_outside_the_closure_is_set_aside(self, tmp_path):
+        excluded = prepare_mod._outside_failing_closure(
+            self._prep(tmp_path),
+            {"tests/test_side.py": "ModuleNotFoundError: No module named 'mysql'"},
+        )
+        assert list(excluded) == ["tests/test_side.py"]
+        assert "tests/test_declared.py" in excluded["tests/test_side.py"]
+
+    def test_an_in_closure_file_is_not_set_aside(self, tmp_path):
+        assert (
+            prepare_mod._outside_failing_closure(
+                self._prep(tmp_path), {"tests/test_declared.py": "ModuleNotFoundError: gone"}
+            )
+            == {}
+        )
+
+    def test_a_conftest_is_never_set_aside(self, tmp_path):
+        assert (
+            prepare_mod._outside_failing_closure(
+                self._prep(tmp_path), {"conftest.py": "ImportError: boom"}
+            )
+            == {}
+        )
+
+    def test_a_non_test_file_is_never_set_aside(self, tmp_path):
+        """Only test files are the suite's edges; a package module is never hidden."""
+        assert (
+            prepare_mod._outside_failing_closure(
+                self._prep(tmp_path), {"pkg/core.py": "SyntaxError: nope"}
+            )
+            == {}
+        )
+
+    def test_a_tree_that_is_not_there_has_no_roots(self, tmp_path):
+        """Nothing to walk must not crash the gate; it must exclude nothing."""
+        gone = prep(root=tmp_path / "gone", bug=bug_info(test_file="tests/test_declared.py"))
+        assert prepare_mod._failing_tests_closure(gone) == ([], frozenset())
 
 
 class TestSandboxEnvReachesEveryRun:

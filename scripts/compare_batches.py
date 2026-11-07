@@ -38,7 +38,8 @@ are therefore comparable, and the parts the model produced are not:
   * **Comparable** (a difference here is a failure): the per-nodeid native sets
     ``prepare.json`` records (``fail_to_pass``, ``flaky_nodeids``,
     ``preexisting_failures``, ``native_failure_baseline``, ``collect_flip_nodeids``,
-    ``f2p_undeclared``) and the native scalars beside them; whether a row exists at
+    ``f2p_undeclared``) and the set of collect-gate exclusions (``collect_excluded``),
+    plus the native scalars beside them; whether a row exists at
     all for a job (``bug`` × ``config`` × ``mode`` × ``seed``); and every row's
     **time-limit behaviour** — ``timed_out``, ``stop_reason`` and
     ``native_timeout``, plus the ``scheduler`` block's wall time, deadline left and
@@ -194,6 +195,7 @@ PREPARE_NODEID_FIELDS = (
     "preexisting_failures",
     "native_failure_baseline",
     "collect_flip_nodeids",
+    "collect_excluded",
 )
 """The per-nodeid sets ``prepare.json`` records per bug — the S5 half of the gate.
 
@@ -203,6 +205,11 @@ the clock, not about the tree: the same suite can flip a different test on each
 run. It is compared, but as its own category
 (:func:`compare_prepare`'s ``flaky_differences``) and under the ``identical_except_flaky``
 verdict, never as a plain nodeid difference.
+
+``collect_excluded`` is a ``{file: reason}`` map, not a nodeid list; the set
+difference runs over its *keys*, which is the fact worth comparing — the set of
+files the collect gate had to set aside. Two preparations of one bug that set
+aside different files are not the same preparation even when the nodeids agree.
 """
 
 PREPARE_SCALAR_FIELDS = (

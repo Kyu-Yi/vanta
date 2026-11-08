@@ -24769,10 +24769,37 @@ class TestBuildTreesInPlace:
             repo=tmp_path / "clone",
         )
 
-        assert seen["env"] == dict(bake_mod.build_env_for("3.8")), (
-            "the compiler the interpreter recorded is the builder's, not the layer's"
-        )
+        layer = bake_mod.build_env_for("3.8")
+        assert seen["env"] == dict(
+            layer, CFLAGS=f"{layer['CFLAGS']} -Wno-error=array-bounds"
+        ), "the compiler the interpreter recorded is the builder's, not the layer's"
         assert seen["env"]["CC"] == bake_mod.VANTA_CC_PATH
+
+    def test_the_array_bounds_demotion_reaches_the_build(self, tmp_path, monkeypatch):
+        """M3 §8.6 round 12 (item 5) — ``pandas/6``'s C parser needs ``-Warray-bounds`` demoted.
+
+        GCC 14 flags the out-of-range subscript in ``tokenizer.c`` and the tree's own
+        ``-Werror`` fails the build on it. The demotion is appended at *prepare* time to
+        the layer's ``CFLAGS`` — so no layer is rebaked — and only that one diagnosis is
+        affected, leaving a build that never trips it compiling exactly as before.
+        """
+        seen: dict = {}
+        monkeypatch.setattr(
+            suite_mod,
+            "build_tree_in_place",
+            lambda **kwargs: seen.update(kwargs),
+        )
+        self._rule(monkeypatch, needed=True)
+
+        prepare_mod.build_trees_in_place(
+            self._prep(tmp_path),
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            repo=tmp_path / "clone",
+        )
+
+        assert seen["env"]["CFLAGS"].endswith("-Wno-error=array-bounds")
+        assert seen["env"]["CFLAGS"].count("-Wno-error=array-bounds") == 1
 
     def test_the_projects_own_build_rule_reaches_the_build(self, tmp_path, monkeypatch):
         """``build_env`` is added to the layer's environment, not put in its place.
@@ -24794,7 +24821,7 @@ class TestBuildTreesInPlace:
             self._prep(
                 tmp_path,
                 build_env={
-                    "CFLAGS": "-Wno-error=array-bounds",
+                    "CFLAGS": "-fno-strict-aliasing",
                     "MPLSETUPCFG": "/workspace/vanta-build.cfg",
                 },
             ),
@@ -24804,7 +24831,10 @@ class TestBuildTreesInPlace:
         )
 
         layer = bake_mod.build_env_for("3.8")
-        assert seen["env"]["CFLAGS"] == f"{layer['CFLAGS']} -Wno-error=array-bounds"
+        assert (
+            seen["env"]["CFLAGS"]
+            == f"{layer['CFLAGS']} -Wno-error=array-bounds -fno-strict-aliasing"
+        )
         assert seen["env"]["MPLSETUPCFG"] == "/workspace/vanta-build.cfg"
         assert seen["env"]["CC"] == layer["CC"], "the layer's own variables survive"
 

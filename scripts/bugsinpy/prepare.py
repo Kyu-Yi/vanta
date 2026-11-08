@@ -1222,6 +1222,22 @@ def build_trees_in_place(
         return
 
     env = dict(bake_mod.build_env_for(bake_mod.minor_version(prep.bug.python_version)))
+    if "CFLAGS" in env:
+        # [VANTA-WHY] M3 §8.6 round 12, item 5 — measured on ``pandas/6``, whose C
+        # parser is built from source in its own layer: ``tokenizer.c:1764`` reads one
+        # element past a ``double[309]`` table, GCC 14's ``-Warray-bounds`` catches it,
+        # and the tree's own ``-Werror`` turns that warning into a hard failure
+        # (``cc1: all warnings being treated as errors``). The subscript is 2020-era
+        # code that compiled under the compiler of its day; what changed is the
+        # diagnostic, not the tree. Appended HERE, at prepare time, so no layer is
+        # rebaked and only the builds this harness runs are affected — and only the
+        # array-bounds diagnosis is demoted, so a build that never trips it compiles as
+        # before. ``-Wno-error=``, not ``-Wno-``: the warning stays visible. GCC
+        # resolves a specific ``-Wno-error=<diag>`` over a bare ``-Werror`` regardless
+        # of position, which is what makes it hold against the tree's own ``-Werror``
+        # on the same line. Placed before the project's rule joins below, so the
+        # split's ``build_env`` still lands last.
+        env["CFLAGS"] = f"{env['CFLAGS']} -Wno-error=array-bounds"
     if prep.build_env:
         # §3.4 — the project's own build rule, added to whatever the layer set rather
         # than put in its place: the layer's ``CFLAGS`` carry the era's warning

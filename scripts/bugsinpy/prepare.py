@@ -557,6 +557,25 @@ class BugPrep:
         return sorted(set(self.fail_to_pass) | set(self.collect_flip_nodeids))
 
     @property
+    def collect_set_aside(self) -> list[str]:
+        """The files the collect gate set aside — the ONE ignore list every suite run uses.
+
+        [VANTA-WHY] M3 §8.6 round 12, item 1. :func:`_collect_flip_or_raise` proved
+        these files are the suite's *edges* rather than the bug's tests (the
+        collect-flip files, whose buggy-tree import error *is* the oracle, and the
+        outside-closure files :attr:`collect_excluded` records) and re-ran its own
+        collection with ``--ignore`` over them. Every other run of the same trees — the
+        three graded derivations, the stripped ``vanta_tree`` baseline, the oracle's
+        hidden and patched pairs, and Vanta's own in-session suites — would otherwise
+        die on the very collection error the gate had set aside, which is the
+        asymmetry the item removes. One property, so the oracle, the derivations and
+        the record cannot disagree about which files the gate excluded; empty on every
+        bug whose strict gate passed (measured: all 13 runnable rows of the round-11
+        held-out split), so those runs keep the command they always had.
+        """
+        return sorted(set(self.hidden_by_collect_flip) | set(self.collect_excluded))
+
+    @property
     def runnable(self) -> bool:
         return (
             self.prepare_mode == FULL
@@ -974,7 +993,11 @@ def _collect_flip_or_raise(
         test_cmd=prep.test_cmd,
         disk_mb=DISK_MB,
         extra_env=env,
-        ignore=sorted(set(flips) | set(excluded)),
+        # The same list every other run of this bug is given
+        # (:attr:`BugPrep.collect_set_aside`), read back from the fields just written
+        # so the gate and the graded suites cannot disagree about which files are set
+        # aside.
+        ignore=prep.collect_set_aside,
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
         budget=budget,
@@ -1618,6 +1641,11 @@ def _suite(
         precompile=prep.precompile,
         origin=f"{prep.slug}/{tree_name}",
         budget=budget,
+        # M3 §8.6 round 12, item 1 — the collect gate's set-aside list reaches every
+        # graded derivation of this bug (both the three ``derive_hidden`` trees and
+        # the stripped ``vanta_tree`` baseline), so a run of a tree the gate accepted
+        # is not refused by a collection error the gate had already set aside.
+        ignore=prep.collect_set_aside,
     )
 
 

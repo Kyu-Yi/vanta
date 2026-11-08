@@ -372,6 +372,10 @@ def grade(
         precompile=prep.precompile,
         origin=f"{prep.slug}/{label}/hidden",
         budget=budget,
+        # M3 §8.6 round 12, item 1 — the collect gate's set-aside list, so the graded
+        # hidden run of a tree the gate accepted is not refused by a collection error
+        # the gate had already set aside. Empty for every bug whose strict gate passed.
+        ignore=prep.collect_set_aside,
     )
     # M3 item S2 — record how the hidden pair was obtained BEFORE the guard below
     # can return: a censored grading is still a grading that may have been served
@@ -423,6 +427,10 @@ def grade(
         # (the patched side of the regression reading).
         origin=f"{prep.slug}/{label}/patched",
         budget=budget,
+        # M3 §8.6 round 12, item 1 — the patched side of the regression reading runs
+        # the native command in full, so it needs the set-aside list for the same
+        # reason the hidden pair does.
+        ignore=prep.collect_set_aside,
     )
     # M3 item S2 — the patched pair's note, again before its guard can return.
     if patched_pair.cache is not None:

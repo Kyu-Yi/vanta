@@ -6320,6 +6320,24 @@ class TestSuiteCommand:
         with pytest.raises(suite_mod.SuiteError, match="placeholder"):
             suite_mod.build_command(["python", "-m", "pytest", "tests"], "/workspace/r.json")
 
+    def test_it_appends_the_set_aside_files_as_ignores(self):
+        """M3 §8.6 round 12 (item 1) — the collect gate's set-aside list reaches the run."""
+        cmd = suite_mod.build_command(
+            ["python", "-m", "pytest", "tests", "--json-report-file={report}"],
+            "/workspace/reports/a.json",
+            ["test/_side.py", "test/other.py"],
+        )
+        assert cmd[-2:] == ["--ignore=test/_side.py", "--ignore=test/other.py"]
+
+    def test_no_set_aside_files_keeps_the_command_unchanged(self):
+        """Every bug whose strict gate passed has an empty list, so nothing is appended."""
+        cmd = suite_mod.build_command(
+            ["python", "-m", "pytest", "tests", "--json-report-file={report}"],
+            "/workspace/reports/a.json",
+        )
+        assert cmd[-1] == "--json-report-file=/workspace/reports/a.json"
+        assert not any(part.startswith("--ignore=") for part in cmd)
+
 
 class TestPrecompileLines:
     """The step that runs before pytest in *every* VM run of a bug with the rule (§3.4).
@@ -27549,6 +27567,23 @@ class TestVantaTestCmd:
     def test_a_command_that_is_nothing_but_report_flags_is_an_error(self):
         with pytest.raises(runner_mod.RunnerError, match="empty"):
             runner_mod.vanta_test_cmd(["--json-report-file={report}"])
+
+    def test_the_collect_set_aside_files_ride_the_command(self):
+        """M3 §8.6 round 12 (item 1) — Vanta's own suites meet the gate's set-asides.
+
+        The list rides ``--test-cmd`` rather than a flag of its own because a
+        set-aside path is batch-relative with no whitespace, so it survives the
+        whitespace-split round-trip the binary's ``TestCommand::from_shell`` does.
+        """
+        assert runner_mod.vanta_test_cmd(
+            ["python", "-m", "pytest", "tests", "--json-report-file={report}"],
+            ["test/_side.py"],
+        ) == "python -m pytest tests --ignore=test/_side.py"
+
+    def test_no_set_aside_files_leaves_the_command_unchanged(self):
+        assert runner_mod.vanta_test_cmd(
+            ["python", "-m", "pytest", "tests", "--json-report-file={report}"]
+        ) == "python -m pytest tests"
 
 
 class TestInvokeVantaCarriesTheRecordedSandboxEnv:

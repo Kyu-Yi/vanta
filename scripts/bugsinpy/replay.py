@@ -1354,6 +1354,11 @@ def run_column(
         extra_env=prep.sandbox_env or None,
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
+        # M3 §8.6 round 12, item 1 — a replay column runs a suite of the same bug, so
+        # it is given the same collect-gate set-aside list every other suite path
+        # uses (:attr:`prepare.BugPrep.collect_set_aside`). Empty for every bug whose
+        # strict gate passed, which leaves the column's command byte-identical.
+        ignore=prep.collect_set_aside,
     )
     run.boots += 1
     run.secs += time.monotonic() - started

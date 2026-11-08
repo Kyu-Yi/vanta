@@ -752,7 +752,7 @@ def env_log_line(env: Mapping[str, str]) -> str:
 # ---------------------------------------------------------------------------
 # the test command handed to Vanta
 # ---------------------------------------------------------------------------
-def vanta_test_cmd(test_cmd: Sequence[str]) -> str:
+def vanta_test_cmd(test_cmd: Sequence[str], ignore: Sequence[str] = ()) -> str:
     """The split's ``test_cmd`` as a shell string, minus Vanta's own report flags.
 
     Two facts collide here. ``TestCommand::from_shell`` splits on whitespace with
@@ -762,6 +762,15 @@ def vanta_test_cmd(test_cmd: Sequence[str]) -> str:
     (``harness::build_test_cmd``), so passing the split's copies would make pytest
     receive two report files and the *last* one would win: the harness would then
     read a report Vanta never wrote.
+
+    ``ignore`` (M3 §8.6 round 12, item 1) is the collect gate's set-aside list
+    (``prepare.BugPrep.collect_set_aside``), appended as ``--ignore=<file>`` so
+    Vanta's own in-session suites meet the same collection the preparation gates
+    accepted. It rides the ``--test-cmd`` string rather than a flag of its own
+    because a set-aside path is batch-relative with no whitespace, so it survives
+    the whitespace-split round-trip exactly as ``--precompile``'s paths do; the
+    binary then needs no new option. Empty — every bug whose strict gate passed —
+    appends nothing, so those runs are handed the string they always were.
     """
     kept: list[str] = []
     for part in test_cmd:
@@ -775,6 +784,15 @@ def vanta_test_cmd(test_cmd: Sequence[str]) -> str:
                 "cannot be passed through faithfully"
             )
         kept.append(token)
+    for path in ignore:
+        as_token = f"--ignore={path}"
+        if any(ch.isspace() for ch in as_token):
+            raise RunnerError(
+                f"set-aside path {path!r} contains whitespace; Vanta's --test-cmd "
+                "is whitespace-split with no quoting, so this command cannot be "
+                "passed through faithfully"
+            )
+        kept.append(as_token)
     if not kept:
         raise RunnerError(f"test_cmd {list(test_cmd)!r} is empty after dropping the report flags")
     return " ".join(kept)
@@ -2029,7 +2047,7 @@ def invoke_vanta(
         str(vanta_bin),
         "--repo", str(prep.root / "vanta_tree"),
         "--issue", str(issue_path),
-        "--test-cmd", vanta_test_cmd(prep.test_cmd),
+        "--test-cmd", vanta_test_cmd(prep.test_cmd, prep.collect_set_aside),
         "--max-attempts", str(max_attempts),
     ]
     # [VANTA-WHY] M3 item 9/A5 — the harness STATES a fixed-round arm's K on the

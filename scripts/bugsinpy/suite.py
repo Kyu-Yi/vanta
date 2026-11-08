@@ -353,14 +353,29 @@ def native_timeout_secs(native_secs: Optional[float], *, floor: int) -> int:
 # ---------------------------------------------------------------------------
 # command construction
 # ---------------------------------------------------------------------------
-def build_command(test_cmd: Sequence[str], report_guest_path: str) -> list[str]:
+def build_command(
+    test_cmd: Sequence[str], report_guest_path: str, ignore: Sequence[str] = ()
+) -> list[str]:
+    """``test_cmd`` with the report path substituted, plus any set-aside files ignored.
+
+    [VANTA-WHY] ``ignore`` is the collect gate's set-aside list (M3 §8.6 round 12,
+    item 1): the files the gate proved are the suite's *edges* rather than the bug's
+    tests (``prepare.BugPrep.collect_set_aside``). The gate already excludes them so
+    its own collection exits 0; without the same list here a graded run of the same
+    tree would die on the very collection error the gate had set aside, which is the
+    asymmetry the item removes. ``--ignore`` keeps the file out of collection exactly
+    as :func:`collect_command` does, so a graded run measures the suite the gate
+    accepted and not one that merely resembles it. Empty — every bug whose gate never
+    set a file aside, which is every bug that passed the strict gate — appends
+    nothing, so those runs keep the command they always had.
+    """
     substituted = [str(part).replace("{report}", report_guest_path) for part in test_cmd]
     if not any(report_guest_path in part for part in substituted):
         raise SuiteError(
             "test_cmd has no {report} placeholder; the JSON report would then be "
             "written to a path the harness cannot read back"
         )
-    return substituted
+    return substituted + [f"--ignore={path}" for path in ignore]
 
 
 def _shell_quote(parts: Sequence[str]) -> str:
@@ -935,6 +950,7 @@ def cache_material(
     memory_mb: Optional[int] = None,
     precompile: Sequence[str] = (),
     carry: Sequence[str] = (),
+    ignore: Sequence[str] = (),
 ) -> Optional[dict]:
     """The key material for one pair of runs, or ``None`` when it cannot be built.
 
@@ -988,6 +1004,13 @@ def cache_material(
         if carried is None:
             return None
         material["carry"] = carried
+    if ignore:
+        # [VANTA-WHY] M3 §8.6 round 12, item 1 — the set-aside files change the
+        # command line (``build_command`` appends ``--ignore=``), so a pair measured
+        # under them is not the pair measured without them. Hashed only when
+        # non-empty, exactly as ``carry`` is: every bug whose gate set nothing aside
+        # contributes nothing and keeps its old key.
+        material["ignore"] = [str(path) for path in ignore]
     return material
 
 
@@ -1089,6 +1112,7 @@ def run_suite_twice(
     origin: Optional[str] = None,
     budget: Optional[budget_mod.Budget] = None,
     carry: Sequence[str] = (),
+    ignore: Sequence[str] = (),
 ) -> SuitePair:
     """Run ``test_cmd`` twice inside the checkpoint and diff the two reports.
 
@@ -1124,6 +1148,13 @@ def run_suite_twice(
     path beside the tree would simply not exist inside the VM. Non-empty ``carry`` is
     part of the cache key (:func:`cache_material`); empty ``carry`` contributes
     nothing, so today's callers keep today's keys byte for byte.
+
+    ``ignore`` (M3 §8.6 round 12, item 1) is the collect gate's set-aside list, handed
+    to :func:`build_command` so a graded run measures the suite the gate accepted
+    rather than dying on a collection error the gate had already set aside. Like
+    ``carry`` it is part of the cache key only when non-empty: a bug whose gate set a
+    file aside gets a fresh key (its command line differs), and every bug whose gate
+    set nothing aside keeps today's key byte for byte.
     """
     material = (
         None
@@ -1139,6 +1170,7 @@ def run_suite_twice(
             memory_mb=memory_mb,
             precompile=precompile,
             carry=carry,
+            ignore=ignore,
         )
     )
     key = "" if material is None else suite_cache.key_of(material)
@@ -1163,6 +1195,7 @@ def run_suite_twice(
             material=material,
             key=key,
             carry=carry,
+            ignore=ignore,
         ),
     )
 
@@ -1184,6 +1217,7 @@ def _measure_suite(
     material: Optional[dict],
     key: str,
     carry: Sequence[str] = (),
+    ignore: Sequence[str] = (),
 ) -> SuitePair:
     """The cache-aware body of :func:`run_suite_twice`, run under its flight.
 
@@ -1268,8 +1302,8 @@ def _measure_suite(
     for rel in (rel1, rel2):
         (batch_dir / rel).unlink(missing_ok=True)
 
-    cmd1 = _shell_quote(build_command(test_cmd, f"/workspace/{rel1}"))
-    cmd2 = _shell_quote(build_command(test_cmd, f"/workspace/{rel2}"))
+    cmd1 = _shell_quote(build_command(test_cmd, f"/workspace/{rel1}", ignore))
+    cmd2 = _shell_quote(build_command(test_cmd, f"/workspace/{rel2}", ignore))
 
     env = cache_env(extra_env)
 

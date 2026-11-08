@@ -16932,8 +16932,9 @@ class TestUnresolvablePins:
         bare), the interpreter makes it redundant, and its ``enum`` shadows the stdlib's.
 
         ``luigi/7`` and ``luigi/5`` die at pytest start-up with ``TypeError: an integer
-        is required (got type bytes)`` while ``luigi/9`` and ``luigi/12``, whose
-        hypotheses are older but which carry no ``enum34``, run.
+        is required (got type bytes)``. ``luigi/9`` and ``luigi/12`` carry no ``enum34``
+        but fail an earlier gate (``empty FAIL_TO_PASS``) and never run, so they are not
+        evidence that the suite runs without it.
         """
         enum = bake_mod.ResolvedDep(
             name="enum34",

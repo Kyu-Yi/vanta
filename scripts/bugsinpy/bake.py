@@ -6868,9 +6868,12 @@ module *ahead of the stdlib one* on ``sys.path``: the layer's interpreter alread
 the real module, so the backport does not add a capability, it shadows the one the
 interpreter has. Measured on ``luigi/7`` and ``luigi/5``, whose full prepare dies at
 pytest start-up with ``TypeError: an integer is required (got type bytes)`` — an old
-``enum`` backport reading bytes the 3.8 stdlib hands it — while ``luigi/9`` and
-``luigi/12``, whose ``hypothesis`` pins are older still but which carry no ``enum34``,
-run.
+``enum`` backport reading bytes the 3.8 stdlib hands it. The two bugs that carry no
+``enum34`` (``luigi/9`` and ``luigi/12``, whose ``hypothesis`` pins are older still) are
+**not** the counterfactual an earlier reading of this took them for: both fail an earlier
+gate (``empty FAIL_TO_PASS``) and never run at all, so nothing here measures "without
+``enum34`` this suite runs". ``luigi/8`` carries ``enum34`` too and fails that same
+earlier gate, so it neither adds nor removes evidence for the crash.
 
 The list is closed and named (:data:`STDLIB_BACKPORTS`) rather than a rule over PYPI
 names: the drop happens by name, on evidence, and only for a distribution that is a
@@ -10683,11 +10686,13 @@ STDLIB_BACKPORTS: Mapping[str, StdlibBackport] = {
         since="3.4",
         evidence=(
             "§8.6 round 11: the date rule pins enum34==1.1.6 transitively for luigi/7, "
-            "luigi/5 and luigi/8 (hypothesis==3.17.0/3.42.2/3.11.6 each declare it bare), "
+            "luigi/8 and luigi/5 (hypothesis==3.17.0/3.11.6/3.42.2 each declare it bare), "
             "and luigi/7's and luigi/5's full prepare dies at pytest start-up with "
-            "'TypeError: an integer is required (got type bytes)'; luigi/9 and luigi/12, "
-            "whose hypotheses are older but which carry no enum34, run, and the frozen "
-            "issue's own text opens '# no mo enum 34'"
+            "'TypeError: an integer is required (got type bytes)'. luigi/9 and luigi/12 "
+            "carry no enum34 (their hypotheses are older still, 3.6.1 and 3.4.0) but fail "
+            "an earlier gate (empty FAIL_TO_PASS) and never run, so they are not evidence "
+            "that the suite runs without it; luigi/8 carries enum34 and fails that same "
+            "earlier gate. The frozen issue's own text opens '# no mo enum 34'"
         ),
     ),
 }

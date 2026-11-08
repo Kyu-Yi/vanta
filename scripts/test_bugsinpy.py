@@ -16902,6 +16902,110 @@ class TestUnresolvablePins:
         assert kept == [argparse]
         assert dropped == []
 
+    # ---- §8.6's round-11 self-pin drop -------------------------------------
+    def _self_pin(self, name: str, pin: str) -> bake_mod.ResolvedDep:
+        return bake_mod.ResolvedDep(
+            name=name,
+            spec=pin,
+            sources=("requirements.txt line 3",),
+            pin=pin,
+            harness=False,
+        )
+
+    def _gap_classifier(self, *, gaps=()):
+        """A classifier that calls the named pins unreviewed sdists and everything else a
+        wheel (:attr:`bake_mod.PreflightPin.gap`)."""
+
+        def classify(name, version, python_minor):
+            if (name, version) in gaps:
+                return bake_mod.PreflightPin(
+                    name,
+                    version,
+                    bake_mod.SDIST_ONLY,
+                    "no wheel; pip builds it from its sdist",
+                    compiled=("src/x.c",),
+                    gap="unreviewed: compiles from its sdist and the table has no entry",
+                )
+            return bake_mod.PreflightPin(
+                name,
+                version,
+                bake_mod.INSTALLABLE_WHEEL,
+                "w",
+                matched_tag="py3-none-any",
+            )
+
+        return classify
+
+    def test_a_self_pin_built_from_an_unreviewed_sdist_is_dropped(self):
+        """``pandas/154``'s ``pandas==1.0.4``: the tree's own name, built from its sdist."""
+        self_pin = self._self_pin("pandas", "pandas==1.0.4")
+        kept = bake_mod.drop_self_pin(
+            (self_pin,),
+            tree_names={"pandas"},
+            classify=self._gap_classifier(gaps={("pandas", "1.0.4")}),
+            python_minor="3.8",
+        )
+        assert kept == []
+
+    def test_a_self_pin_that_installs_from_a_wheel_is_kept(self):
+        """``fastapi/3``'s ``fastapi==0.55.1`` and ``scrapy/1``'s ``scrapy==2.1.0``.
+
+        A wheel self-pin is harmless — it installs the project over itself from a wheel —
+        so the narrow rule leaves it alone, which is what keeps this drop a no-op for every
+        layer measured but ``pandas/154`` and ``pandas/160``.
+        """
+        self_pin = self._self_pin("fastapi", "fastapi==0.55.1")
+        kept = bake_mod.drop_self_pin(
+            (self_pin,),
+            tree_names={"fastapi"},
+            classify=self._gap_classifier(),
+            python_minor="3.8",
+        )
+        assert kept == [self_pin]
+
+    def test_a_self_pin_with_a_reviewed_sdist_is_kept(self):
+        """The gap is the qualifier: a reviewed sdist has a table entry saying what it needs."""
+        self_pin = self._self_pin("pandas", "pandas==1.0.4")
+
+        def classify(name, version, python_minor):
+            return bake_mod.PreflightPin(
+                name,
+                version,
+                bake_mod.SDIST_ONLY,
+                "reviewed: needs gfortran, libopenblas-dev",
+                compiled=("src/x.c",),
+            )
+
+        assert bake_mod.drop_self_pin(
+            (self_pin,), tree_names={"pandas"}, classify=classify, python_minor="3.8"
+        ) == [self_pin]
+
+    def test_a_pin_that_is_not_the_projects_own_name_is_kept(self):
+        """The rule is about the project under test, not about sdists: any other name stays."""
+        scipy = self._self_pin("scipy", "scipy==1.4.1")
+        assert bake_mod.drop_self_pin(
+            (scipy,),
+            tree_names={"pandas"},
+            classify=self._gap_classifier(gaps={("scipy", "1.4.1")}),
+            python_minor="3.8",
+        ) == [scipy]
+
+    def test_a_harness_self_pin_is_kept(self):
+        """A harness pin is the interpreter layer's, never this layer's to leave to the tree."""
+        harness = bake_mod.ResolvedDep(
+            name="pandas",
+            spec="pandas==1.0.4",
+            sources=(),
+            pin="pandas==1.0.4",
+            harness=True,
+        )
+        assert bake_mod.drop_self_pin(
+            (harness,),
+            tree_names={"pandas"},
+            classify=self._gap_classifier(gaps={("pandas", "1.0.4")}),
+            python_minor="3.8",
+        ) == [harness]
+
     def test_resolve_deps_flags_by_raising_when_the_graded_tests_import_the_pin(self):
         refs = (bake_mod.dep_ref("pyarrow==0.17.1", "requirements.txt line 12"),)
         with pytest.raises(bake_mod.BakeError, match="imports it"):

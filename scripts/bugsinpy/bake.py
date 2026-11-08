@@ -10767,6 +10767,52 @@ def drop_stdlib_backports(
     return kept
 
 
+def drop_self_pin(
+    deps: Sequence[ResolvedDep],
+    *,
+    tree_names: Container[str],
+    classify: Callable[[str, str, str], PreflightPin],
+    python_minor: str,
+) -> list[ResolvedDep]:
+    """Drop a pin for the project under test that this layer would build from its sdist.
+
+    [VANTA-WHY] :data:`TREE_SATISFIED_RULE` already says a requirement that names the
+    tree's own distribution is the tree's and the layer installs nothing for it — but it
+    is a rule about the closure walk, and the walk only reaches a name a *release*
+    declares. A bug whose own ``requirements.txt`` pins the project it grades
+    (``pandas==1.0.4``) has that name in ``installs`` before the walk runs, so the walk
+    sees it *pinned* and never asks the tree question at all: measured, ``pandas/154``
+    and ``pandas/160`` each declared ``pandas==1.0.4`` as an ordinary layer pin, the walk
+    therefore recorded no ``tree_satisfied`` entry, and ``statsmodels==0.10.1`` — which
+    declares ``pandas`` — stayed in the *resolving* pass beside ``scipy==1.4.1`` and died
+    at ``setup.py egg_info`` because its ``kalman_loglike.pyx`` cimports a ``scipy``
+    header ``scipy``'s own build had not installed yet. ``pandas/120`` declares no such
+    pin, so its ``statsmodels`` declares a name the layer installs nothing for and is
+    moved into the ``--no-deps`` pass *after* ``scipy`` — and builds.
+
+    So a declared self-pin is read the way the walk reads a declared name: a pin whose
+    name the tree provides is left to the tree. Removing it here, before the walk, is what
+    lets the walk record it (:class:`TreeSatisfied`) and what routes the pins that declare
+    it into the ``--no-deps`` pass (:func:`no_deps_dependents`) — the two effects the
+    tree's own name is supposed to have.
+
+    The condition is deliberately narrow. A pin is dropped only when it names the tree
+    **and** this image would build it from an **unreviewed sdist** (:attr:`PreflightPin.gap`).
+    A wheel self-pin needs no exemption — ``fastapi`` and ``scrapy`` each install their own
+    project from a wheel, which is harmless — and a reviewed sdist has a table entry saying
+    what its build needs. The gap qualifier keeps the rule a no-op for every layer measured
+    but these two, which is what makes "only these two resolve differently" checkable rather
+    than asserted.
+    """
+    kept: list[ResolvedDep] = []
+    for dep in deps:
+        if not dep.harness and canonicalize_name(dep.name) in tree_names:
+            if classify(dep.name, _pin_version(dep.pin), python_minor).gap is not None:
+                continue
+        kept.append(dep)
+    return kept
+
+
 def drop_unresolvable_deps(
     resolved: Sequence[ResolvedDep],
     *,
@@ -12367,6 +12413,22 @@ def resolve_bug_deps(
                 audit=audit,
                 dropped=dropped,
                 safeguard=safeguard,
+            )
+            # §8.6's round-11 self-pin rule, and it has to run here — before ``own_pins``
+            # is built and before the closure walk — because the walk reads the pin list
+            # and a name still in it is *pinned*, so the tree question is never asked of
+            # it (:func:`drop_self_pin`). A declared pin that names the project under test
+            # and that this image would build from an unreviewed sdist is the tree's, so it
+            # leaves the list and the walk records it (:class:`TreeSatisfied`), exactly as
+            # it does for a name a *release* declares.
+            resolved = drop_self_pin(
+                resolved,
+                tree_names={
+                    canonicalize_name(name)
+                    for name in (sources.import_name, *sources.tree_modules)
+                },
+                classify=classifier,
+                python_minor=minor,
             )
             built = resolve_build_pins(
                 sources.build_refs,

@@ -6857,6 +6857,28 @@ recorded like the others, and it reaches the rule from the **retry**
 build.
 """
 
+STDLIB_BACKPORT = "stdlib-backport-shadow"
+"""§8.6's round-11 finding: a stdlib backport installed on an interpreter that ships it.
+
+[VANTA-WHY] Unlike the three findings above, this pin **is** installable here — the
+wheel exists and pip takes it — so no preflight could ever mark it and the date rule is
+right to pick it (``hypothesis`` declares ``enum34`` bare, with no marker, in every
+release of its era). It is dropped because installing the backport puts its top-level
+module *ahead of the stdlib one* on ``sys.path``: the layer's interpreter already ships
+the real module, so the backport does not add a capability, it shadows the one the
+interpreter has. Measured on ``luigi/7`` and ``luigi/5``, whose full prepare dies at
+pytest start-up with ``TypeError: an integer is required (got type bytes)`` — an old
+``enum`` backport reading bytes the 3.8 stdlib hands it — while ``luigi/9`` and
+``luigi/12``, whose ``hypothesis`` pins are older still but which carry no ``enum34``,
+run.
+
+The list is closed and named (:data:`STDLIB_BACKPORTS`) rather than a rule over PYPI
+names: the drop happens by name, on evidence, and only for a distribution that is a
+backport of a module the layer's own interpreter already has. It is a recorded outcome
+like the others — what it says is *why* the layer does not install the pin, not what pip
+would have tried.
+"""
+
 FAILED_BUILD_PREFIX = "Failed to build "
 """How the layer's ``pip`` opens the one line that names what it could not build.
 
@@ -10640,6 +10662,111 @@ def drop_unresolvable_refs(
     return tuple(kept), dropped
 
 
+@dataclass(frozen=True)
+class StdlibBackport:
+    """One entry of §8.6's closed stdlib-shadow list (:data:`STDLIB_BACKPORTS`)."""
+
+    distribution: str
+    """The distribution's canonical name, e.g. ``enum34``."""
+    module: str
+    """The stdlib module it backports, e.g. ``enum``."""
+    since: str
+    """The first minor Python whose stdlib carries ``module``, e.g. ``"3.4"``."""
+    evidence: str
+    """Where the finding is recorded (§8.6) and what the bug measured."""
+
+
+STDLIB_BACKPORTS: Mapping[str, StdlibBackport] = {
+    "enum34": StdlibBackport(
+        distribution="enum34",
+        module="enum",
+        since="3.4",
+        evidence=(
+            "§8.6 round 11: the date rule pins enum34==1.1.6 transitively for luigi/7, "
+            "luigi/5 and luigi/8 (hypothesis==3.17.0/3.42.2/3.11.6 each declare it bare), "
+            "and luigi/7's and luigi/5's full prepare dies at pytest start-up with "
+            "'TypeError: an integer is required (got type bytes)'; luigi/9 and luigi/12, "
+            "whose hypotheses are older but which carry no enum34, run, and the frozen "
+            "issue's own text opens '# no mo enum 34'"
+        ),
+    ),
+}
+"""The closed list of stdlib backports §8.6 refuses on this image (:data:`STDLIB_BACKPORT`).
+
+An entry belongs here only when it is a backport of a module **the layer's own
+interpreter already ships** — the ``since`` field is that debut — and the evidence names
+the measurement. It is a mapping, not a rule: a dependency that merely *looks* like a
+stdlib shadow (``argparse==1.3.0``, which 15 layers carry and which does no harm here) is
+not on it, so it is installed exactly as written.
+"""
+
+
+def _stdlib_present(since: str, python_minor: str) -> bool:
+    """Whether ``python_minor`` already ships the stdlib module that debuted in ``since``.
+
+    Both arguments are ``"3.8"``-shaped. A malformed one is refused rather than guessed,
+    the same way :func:`minor_version` refuses it.
+    """
+
+    def key(value: str) -> tuple[int, int]:
+        parts = str(value).split(".")
+        if len(parts) < 2 or not all(part.isdigit() for part in parts[:2]):
+            raise BakeError(f"cannot read a minor version out of {value!r}")
+        return int(parts[0]), int(parts[1])
+
+    return key(python_minor) >= key(since)
+
+
+def drop_stdlib_backports(
+    deps: Sequence[ResolvedDep],
+    *,
+    python_minor: str,
+    dropped: Optional[list[DroppedPin]] = None,
+    audit: Optional[Callable[[str], ImportAudit]] = None,
+) -> list[ResolvedDep]:
+    """Drop every §8.6-listed stdlib backport the layer's interpreter already carries.
+
+    [VANTA-WHY] This is the one drop that is *by name* rather than by installability: the
+    pin installs fine here, so neither :func:`drop_unresolvable_refs` nor
+    :func:`drop_unresolvable_deps` can reach it — :func:`uninstallable_reason` answers
+    ``None`` and the pin is kept. The fix is not to weaken the date rule, which is right
+    to pick what the release declared, but to refuse a pin the interpreter makes
+    redundant; and it is not :func:`decide_unresolvable`, whose whole question is "does
+    the module the graded tests reach disappear", because here the module does **not**
+    disappear — the stdlib provides it, and only the backport's copy is removed. The
+    refusal is conditional on the layer's own Python: on an interpreter older than the
+    module's debut the backport *is* the module and must stay (:data:`STDLIB_BACKPORTS`
+    carries the debut), so the rule asks before it drops. A caller that passes no
+    ``dropped`` list — every caller that wants the raw resolution — gets nothing dropped,
+    exactly as the other two passes do.
+    """
+    if dropped is None or not python_minor:
+        return list(deps)
+    kept: list[ResolvedDep] = []
+    for dep in deps:
+        entry = STDLIB_BACKPORTS.get(canonicalize_name(dep.name))
+        if entry is None or not _stdlib_present(entry.since, python_minor):
+            kept.append(dep)
+            continue
+        dropped.append(
+            DroppedPin(
+                name=dep.name,
+                spec=dep.spec,
+                sources=tuple(dep.sources or dep.required_by),
+                version=_pin_version(dep.pin),
+                outcome=STDLIB_BACKPORT,
+                reason=(
+                    f"{entry.distribution} backports the stdlib module {entry.module!r}, "
+                    f"which this layer's Python {python_minor} already ships (since "
+                    f"{entry.since}); installing it shadows the stdlib and breaks pytest "
+                    f"at collection. {entry.evidence}"
+                ),
+                audit=audit(dep.name) if audit is not None else None,
+            )
+        )
+    return kept
+
+
 def drop_unresolvable_deps(
     resolved: Sequence[ResolvedDep],
     *,
@@ -11039,6 +11166,12 @@ def resolve_deps(
             resolved, reason_of=reason_of, audit=audit, safeguard=safeguard
         )
         dropped.extend(dropped_deps)
+        # §8.6's round-11 stdlib-shadow rule, over the same pins. A backport the
+        # interpreter already ships installs fine, so it is not one of the drops above;
+        # this is where the recorded name list refuses it.
+        resolved = drop_stdlib_backports(
+            resolved, python_minor=python_minor or "", dropped=dropped, audit=audit
+        )
     return resolved
 
 
@@ -12336,6 +12469,14 @@ def resolve_bug_deps(
                 transitive, reason_of=reason_of, audit=audit, safeguard=safeguard
             )
             dropped.extend(dropped_transitive)
+            # §8.6's round-11 stdlib-shadow rule reaches the walk's picks too, and it is
+            # the one that matters here: enum34 is a *transitive* pick the date rule took
+            # from each hypothesis in the layer, so the closure walk is where it arrives
+            # (:func:`drop_stdlib_backports`). This is before ``deps`` and ``installs``
+            # below, which is what keeps it out of the pin list and the recipe.
+            transitive = drop_stdlib_backports(
+                transitive, python_minor=minor, dropped=dropped, audit=audit
+            )
             # The transitive picks are installed, recorded and gated exactly as the
             # declared ones are: they are the same kind of pin, chosen by the same rule,
             # and the only thing that distinguishes them is that no file in the bug's tree

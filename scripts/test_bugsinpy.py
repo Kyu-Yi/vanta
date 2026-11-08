@@ -16851,6 +16851,57 @@ class TestUnresolvablePins:
         )
         assert [dep.pin for dep in resolved] == ["requests-async==0.2.4"]
 
+    # ---- §8.6's round-11 stdlib-shadow drop --------------------------------
+    def test_a_stdlib_backport_the_interpreter_ships_is_dropped(self):
+        """``enum34`` on 3.8: the date rule is right to pick it (hypothesis declares it
+        bare), the interpreter makes it redundant, and its ``enum`` shadows the stdlib's.
+
+        ``luigi/7`` and ``luigi/5`` die at pytest start-up with ``TypeError: an integer
+        is required (got type bytes)`` while ``luigi/9`` and ``luigi/12``, whose
+        hypotheses are older but which carry no ``enum34``, run.
+        """
+        enum = bake_mod.ResolvedDep(
+            name="enum34",
+            spec="",
+            sources=(),
+            pin="enum34==1.1.6",
+            harness=False,
+            required_by=("hypothesis==3.17.0",),
+        )
+        dropped: list[bake_mod.DroppedPin] = []
+        kept = bake_mod.drop_stdlib_backports(
+            (enum,), python_minor="3.8", dropped=dropped, audit=self._audit()
+        )
+        assert kept == []
+        assert [record.name for record in dropped] == ["enum34"]
+        assert dropped[0].outcome == bake_mod.STDLIB_BACKPORT
+        assert dropped[0].sources == ("hypothesis==3.17.0",), "the record names what asked"
+        # …and it stays on an interpreter older than the module it backports, where the
+        # backport *is* the module.
+        assert bake_mod.drop_stdlib_backports((enum,), python_minor="3.3", dropped=[]) == [
+            enum
+        ]
+
+    def test_a_pin_that_merely_looks_like_a_shadow_is_kept(self):
+        """``argparse==1.3.0`` is a stdlib name 15 layers carry and no layer needs dropped.
+
+        The list is closed and named (:data:`STDLIB_BACKPORTS`), so a dependency that is
+        only *shaped* like a stdlib shadow is installed exactly as written.
+        """
+        argparse = bake_mod.ResolvedDep(
+            name="argparse",
+            spec="argparse==1.3.0",
+            sources=("requirements.txt line 4",),
+            pin="argparse==1.3.0",
+            harness=False,
+        )
+        dropped: list[bake_mod.DroppedPin] = []
+        kept = bake_mod.drop_stdlib_backports(
+            (argparse,), python_minor="3.8", dropped=dropped, audit=self._audit()
+        )
+        assert kept == [argparse]
+        assert dropped == []
+
     def test_resolve_deps_flags_by_raising_when_the_graded_tests_import_the_pin(self):
         refs = (bake_mod.dep_ref("pyarrow==0.17.1", "requirements.txt line 12"),)
         with pytest.raises(bake_mod.BakeError, match="imports it"):

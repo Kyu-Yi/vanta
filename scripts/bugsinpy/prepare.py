@@ -1870,12 +1870,27 @@ def declared_test_files(bug: BugInfo) -> list[str]:
     suite run. That is the whole point (§2.4): the freeze step's inputs come from git
     alone, so a measure-only run — which has no ``FAIL_TO_PASS`` — reads a text gated
     exactly as a real run's would have been.
+
+    [VANTA-WHY] One declared token may name *several* files with ``;``. ``fastapi/11``'s
+    ``bug.info`` carries ``tests/test_union_body.py;tests/test_union_inherited_body.py``
+    and its ``run_test.sh`` the same pair as ``::nodeid`` lines. Read as a single path the
+    token was no file at all: :func:`read_declared_test_files` skipped it, so the report
+    was gated against a smaller answer than the bug has and the frozen gate named a file
+    that does not exist, and the collect gate's closure found no root. Splitting each
+    token on ``;`` — after the whitespace split, so a shell ``;`` separator is not
+    mistaken for the whitespace split — reads the declaration BugsInPy actually wrote. It
+    changes only a bug whose declaration carries a ``;``; every other token splits to
+    itself.
     """
-    files = [bug.test_file] if bug.test_file else []
-    for token in (bug.run_test_command() or "").split():
-        name = token.strip("'\"")
-        if name.endswith(".py") and "::" not in name and name not in files:
-            files.append(name)
+    declared = [bug.test_file] if bug.test_file else []
+    declared.extend(
+        token.strip("'\"") for token in (bug.run_test_command() or "").split()
+    )
+    files: list[str] = []
+    for token in declared:
+        for name in token.split(";"):
+            if name.endswith(".py") and "::" not in name and name not in files:
+                files.append(name)
     return files
 
 

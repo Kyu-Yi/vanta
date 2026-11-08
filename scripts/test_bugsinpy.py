@@ -5281,6 +5281,22 @@ class TestTheFreezeGatesTheText:
             "tests/test_other.py",
         ]
 
+    def test_declared_test_files_splits_a_semicolon_joined_declaration(self):
+        """fastapi/11's ``bug.info`` names two files in one ``;``-joined token."""
+        both = bug_info(test_file="tests/test_a.py;tests/test_b.py")
+        assert prepare_mod.declared_test_files(both) == [
+            "tests/test_a.py",
+            "tests/test_b.py",
+        ]
+        runner = bug_info(run_test_sh="pytest tests/test_a.py;tests/test_b.py\n")
+        assert prepare_mod.declared_test_files(runner) == [
+            "tests/test_demo.py",
+            "tests/test_a.py",
+            "tests/test_b.py",
+        ]
+        noise = bug_info(run_test_sh="cd tests; pytest tests/test_demo.py\n")
+        assert prepare_mod.declared_test_files(noise) == ["tests/test_demo.py"]
+
     def test_the_gate_strips_a_token_only_the_answer_has(self, tmp_path):
         prep = self._prep(
             tmp_path,

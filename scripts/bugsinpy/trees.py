@@ -737,6 +737,15 @@ def _strip_source(
     for node in ast.walk(module):
         if not isinstance(node, ast.ClassDef) or not node.body:
             continue
+        if node.lineno in drop:
+            # [VANTA-WHY] The class *statement* is itself being removed — a nested
+            # class whose whole span a removed outer definition covers. There is no
+            # block left for the `pass` to live in: emitting one at the body's
+            # indent leaves the surrounding scope with nothing to indent under, and
+            # the file dies `unexpected indent` (measured on pandas/90 and pandas/158,
+            # whose hidden classes nest). The enclosing definition's own removal
+            # already accounts for the lines, so nothing is inserted here.
+            continue
         body_lines = {stmt.lineno for stmt in node.body}
         if body_lines and body_lines <= drop:
             indent = " " * (node.body[0].col_offset)

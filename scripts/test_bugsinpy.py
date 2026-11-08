@@ -2054,6 +2054,47 @@ class TestStripHiddenTests:
         assert report.removed_nodeids == [f"{rel}::TestThing::test_hidden"]
         ast.parse(new)
 
+    def test_a_removed_class_carrying_a_nested_class_gets_no_pass(self, tmp_path):
+        """pandas/90, pandas/158: a nested class's header is dropped with its outer.
+
+        The emptied-class rule used to insert a ``pass`` for the *nested* class too,
+        at the nested body's deeper indent, while the class statement that block
+        belonged to was itself being removed — the file then died ``unexpected
+        indent``. The outer removal already accounts for every line, so nothing is
+        emitted for either class.
+        """
+        rel = "tests/test_x.py"
+        write(
+            tmp_path / rel,
+            "import unittest\n"
+            "\n"
+            "\n"
+            "class TestOuter(unittest.TestCase):\n"
+            "    class TestInner(unittest.TestCase):\n"
+            "        def test_hidden(self):\n"
+            '            self.fail("boom")\n'
+            "\n"
+            "    def test_also_hidden(self):\n"
+            '        self.fail("boom")\n'
+            "\n"
+            "\n"
+            "class TestKept(unittest.TestCase):\n"
+            "    def test_kept(self):\n"
+            "        pass\n",
+        )
+        report = tree_mod.strip_hidden_tests(
+            tmp_path,
+            [f"{rel}::TestOuter"],
+            {rel: {f"{rel}::TestOuter", f"{rel}::TestKept::test_kept"}},
+        )
+        new = (tmp_path / rel).read_text()
+        assert "class TestOuter" not in new
+        assert "class TestInner" not in new
+        assert "class TestKept" in new
+        assert new.count("pass") == 1, "only the kept test's own body survives"
+        assert report.removed_nodeids == [f"{rel}::TestOuter"]
+        ast.parse(new)
+
     def test_missing_nodeid_is_fatal(self, tmp_path):
         """A hidden test the strip cannot find stays visible in Vanta's tree."""
         rel = "tests/test_x.py"

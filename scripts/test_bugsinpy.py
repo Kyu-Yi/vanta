@@ -6487,11 +6487,13 @@ class TestExitPluginScript:
         assert (
             'export PYTHONPATH="'
             + suite_mod.EXIT_PLUGIN_GUEST_DIR
-            + ':${PYTHONPATH:-}"'
+            + '${PYTHONPATH:+:$PYTHONPATH}"'
         ) in script, (
             "the project's own PYTHONPATH (fastapi/2's ./docs_src, recorded per "
             "commit) is preserved: the plugin's directory is prepended to it, never "
-            "substituted for it"
+            "substituted for it. The ``:+`` form adds nothing when PYTHONPATH is "
+            "unset or empty, where a bare trailing ':' would append an empty entry "
+            "the interpreter reads as the current directory."
         )
 
     def test_the_staged_plugin_compiles(self):

@@ -482,9 +482,12 @@ def exit_plugin_lines() -> list[str]:
         f"cat > {EXIT_PLUGIN_GUEST_DIR}/{EXIT_PLUGIN_NAME}.py <<'{EXIT_PLUGIN_HEREDOC}'",
         source.rstrip("\n"),
         EXIT_PLUGIN_HEREDOC,
-        # A plain concatenation, not an f-string: ``${PYTHONPATH:-}`` has to reach the
-        # shell as written, not be read as a format placeholder.
-        'export PYTHONPATH="' + EXIT_PLUGIN_GUEST_DIR + ':${PYTHONPATH:-}"',
+        # A plain concatenation, not an f-string: ``${PYTHONPATH:+:$PYTHONPATH}`` has to
+        # reach the shell as written, not be read as a format placeholder. The ``:+``
+        # form contributes nothing when ``PYTHONPATH`` is unset or empty, where a bare
+        # trailing ``:`` would append an empty entry — which the interpreter reads as
+        # the current directory, a path the project never asked for.
+        'export PYTHONPATH="' + EXIT_PLUGIN_GUEST_DIR + '${PYTHONPATH:+:$PYTHONPATH}"',
     ]
 
 

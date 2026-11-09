@@ -24,6 +24,7 @@ never by booting a VM.
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
 import inspect
 import io
@@ -31,6 +32,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tarfile
@@ -6379,6 +6381,19 @@ class TestPrecompileLines:
         assert "'pkg/a b.py'" in line
 
 
+def _alive(pid: int) -> bool:
+    """Whether *pid* still exists (``kill(pid, 0)``, the portable probe)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # pragma: no cover - a live process we may not signal
+        return True
+    return True
+
+
 class TestExitPluginScript:
     """The run-time exit plugin that ends pytest's own interpreter (§8.6 round 13).
 
@@ -6405,6 +6420,43 @@ class TestExitPluginScript:
         "    threading.Thread(target=_spin).start()\n"
         "    assert True\n"
     )
+
+    FORKED_CHILDREN = (
+        "import multiprocessing, os, subprocess, sys, threading, time\n"
+        "def _spin():\n"
+        "    time.sleep(300)\n"
+        "def test_children():\n"
+        "    ctx = multiprocessing.get_context('fork')\n"
+        "    manager = ctx.Manager()\n"
+        "    manager.dict()\n"
+        "    threading.Thread(target=_spin).start()\n"
+        "    pids = [child.pid for child in multiprocessing.active_children()]\n"
+        "    pids.append(subprocess.Popen(\n"
+        "        [sys.executable, '-c', 'import time; time.sleep(300)']).pid)\n"
+        "    pid = os.fork()\n"
+        "    if pid == 0:\n"
+        "        time.sleep(300)\n"
+        "        os._exit(0)\n"
+        "    pids.append(pid)\n"
+        "    with open('children.txt', 'w') as fh:\n"
+        "        fh.write(' '.join(str(p) for p in pids))\n"
+        "    assert manager is not None\n"
+    )
+    """Reproduces the round-13 regression with all three of its faces.
+
+    [VANTA-WHY] The Linux VM's ``multiprocessing`` default start method is
+    ``fork``, so luigi's ``mock.py`` ``Manager()`` server is a *forked* child that
+    inherits pytest fd-capture's non-``CLOEXEC`` ``os.dup`` of the run's real
+    stdout/stderr and therefore holds the pipe the host reads to EOF. macOS's
+    default is ``spawn`` (a ``Popen`` that closes fds), so the fork context is
+    requested explicitly. The three faces the toy covers are the ones normal
+    shutdown handles but ``os._exit`` does not: the **daemon Manager** (terminated
+    by ``multiprocessing``'s ``atexit`` hook, skipped by ``os._exit``), the
+    **non-daemon thread** (waited for by interpreter shutdown, which ``os._exit``
+    bypasses), and the **raw ``os.fork`` grandchild** (invisible to
+    ``multiprocessing``, so nothing reaped it in either round). The bare ``Popen``
+    sleeper covers the grandchild case that is also in the group.
+    """
 
     @staticmethod
     def _script(cmd: str = "python -m pytest tests") -> str:
@@ -6529,6 +6581,97 @@ class TestExitPluginScript:
         )
         summary = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))["summary"]
         assert summary["passed"] == 1, "the report is complete and written before the exit"
+
+    def test_the_plugin_reaps_its_own_process_group(self):
+        """Structural: the cleanup no longer depends on ``atexit``.
+
+        [VANTA-WHY] The round-13 regression was that ``os._exit`` skipped
+        ``atexit``, so ``multiprocessing``'s exit hook never terminated the
+        children that held the run's pipe. The replacement has to create its own
+        group, leave that group (``setsid``) before signalling it, escalate
+        ``SIGTERM``→``SIGKILL``, and say so on stderr when it cannot.
+        """
+        source = suite_mod.EXIT_PLUGIN_SOURCE.read_text(encoding="utf-8")
+        assert "os.setpgrp()" in source, "the run gets a group of its own"
+        assert "os.killpg(" in source, "the whole group is signalled, not one child"
+        assert "signal.SIGTERM" in source and "signal.SIGKILL" in source
+        assert "os.setsid()" in source, (
+            "the reaper must leave the group before it signals the group, or it "
+            "kills itself"
+        )
+        assert "__VANTA_PGRP_FALLBACK__" in source, (
+            "a run that cannot take the group path must be loud, so its frequency "
+            "is observable in the next prepare"
+        )
+        assert "multiprocessing.active_children()" in source, "the documented fallback"
+
+    def test_forked_children_holding_the_pipe_no_longer_stall_the_run(self, tmp_path):
+        """The round-13 regression itself: a *forked* ``Manager`` server holds the pipe.
+
+        Without the plugin, pytest finishes and writes its report, but the forked
+        ``Manager`` server keeps the fd-capture dup of stdout/stderr open, so
+        ``subprocess.run(capture_output=True)`` waits until the timeout — exactly
+        what the host-side reader does. With the plugin the reaper kills the group
+        and the run returns at once, leaving no descendant behind.
+        """
+        if not hasattr(os, "fork"):  # pragma: no cover - POSIX-only reproduction
+            pytest.skip("no os.fork on this platform")
+        (tmp_path / "test_children.py").write_text(self.FORKED_CHILDREN, encoding="utf-8")
+        try:
+            with pytest.raises(subprocess.TimeoutExpired):
+                subprocess.run(
+                    self._child_command("test_children.py", plugin=False),
+                    cwd=tmp_path,
+                    env=self._child_env(plugin=False),
+                    capture_output=True,
+                    timeout=5,
+                )
+
+            started = time.monotonic()
+            proc = subprocess.run(
+                self._child_command("test_children.py", plugin=True),
+                cwd=tmp_path,
+                env=self._child_env(plugin=True),
+                capture_output=True,
+                timeout=30,
+            )
+            elapsed = time.monotonic() - started
+            stderr = proc.stderr.decode("utf-8", "replace")
+            assert proc.returncode == 0, stderr[-2000:]
+            assert "__VANTA_PGRP_FALLBACK__" not in stderr, (
+                "the group path must be the one taken, not the fallback"
+            )
+            assert elapsed < 20, (
+                f"the reaper must end the run promptly; this took {elapsed:.1f}s, so "
+                "a forked child is still holding the pipe"
+            )
+            summary = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))["summary"]
+            assert summary["passed"] == 1, "the report is complete and written before the exit"
+
+            children = [
+                int(pid) for pid in (tmp_path / "children.txt").read_text().split()
+            ]
+            assert children, "the toy recorded the children it started"
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and any(_alive(pid) for pid in children):
+                time.sleep(0.1)
+            assert not any(_alive(pid) for pid in children), (
+                "every process the run started must be gone once its report is on disk"
+            )
+        finally:
+            self._kill_recorded(tmp_path / "children.txt")
+
+    @staticmethod
+    def _kill_recorded(path: Path) -> None:
+        """Best-effort cleanup so a failing assertion cannot leak a sleeping child."""
+        try:
+            pids = [int(pid) for pid in path.read_text().split()]
+        except (OSError, ValueError):
+            return
+        for pid in pids:
+            if _alive(pid):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(pid, signal.SIGKILL)
 
     @pytest.mark.parametrize(
         "source",
@@ -30319,6 +30462,29 @@ class TestStaleBinary:
         assert "src" in runner_mod.VANTA_SOURCE_PATHS
         assert "build.rs" in runner_mod.VANTA_SOURCE_PATHS
         assert not any(path.startswith("scripts") for path in runner_mod.VANTA_SOURCE_PATHS)
+
+    def test_the_embedded_exit_plugin_is_an_exception_that_does_go_into_the_binary(self):
+        """The exit plugin is compiled in with `include_str!`, so a `scripts/` edit is
+        a binary edit — the one path the otherwise-blanket exclusion must not hide."""
+        assert runner_mod.VANTA_EMBEDDED_SOURCES == (
+            "scripts/bugsinpy/vanta_exit_plugin.py",
+        )
+
+    def test_editing_the_embedded_plugin_makes_the_binary_stale(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(runner_mod, "git_revision", lambda *a, **k: self.HEAD)
+        monkeypatch.setattr(runner_mod, "binary_revision", lambda path: self.BUILD)
+        seen: list[tuple[str, ...]] = []
+
+        def fake_changed(root, commit, paths):
+            seen.append(tuple(paths))
+            return ["scripts/bugsinpy/vanta_exit_plugin.py"]
+
+        monkeypatch.setattr(runner_mod, "changed_since", fake_changed)
+        warning = runner_mod.stale_binary_warning(tmp_path / "vanta_m3")
+        assert seen and "scripts/bugsinpy/vanta_exit_plugin.py" in seen[0], (
+            "the staleness diff must cover the embedded plugin, not only the Rust paths"
+        )
+        assert warning is not None and "vanta_exit_plugin.py" in warning
 
     def test_prepare_refuses_to_size_the_gate_against_a_stale_binary(self, monkeypatch):
         """`run` warns about a stale binary; `prepare` has to refuse one (§1.6.2 item 5).

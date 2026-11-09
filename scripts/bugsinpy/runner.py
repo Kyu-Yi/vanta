@@ -106,6 +106,18 @@ untouched. Conflating the two is the bug that produced ``44f58ab`` in a digest
 whose HEAD was ``b2efa49``.
 """
 
+VANTA_EMBEDDED_SOURCES = ("scripts/bugsinpy/vanta_exit_plugin.py",)
+"""The one ``scripts/`` path that DOES go into the binary — the exception (§7.3).
+
+[VANTA-WHY] M3 §8.6 round 13 follow-up. ``src/pipeline/harness.rs`` compiles the
+exit plugin into ``vanta_m3`` with ``include_str!``, so editing that Python file
+changes the binary exactly as editing a ``.rs`` file does. It is kept out of
+:data:`VANTA_SOURCE_PATHS` — whose whole point is that the harness tree is
+separate from the Rust it builds — and named here instead, so the staleness check
+still fires when the plugin moves on and a stale binary cannot silently measure a
+plugin older than the tree.
+"""
+
 # §8.1's worst single run is ~30 min for a vanta repair; 3 h is a backstop, not an
 # estimate. A run that hits it is a failure to report, not a result to grade.
 RUN_TIMEOUT_SECS = 3 * 60 * 60
@@ -503,7 +515,7 @@ def stale_binary_message(
         return (
             "the vanta_m3 binary's build commit could not be read (no cargo "
             "build-script output beside it, or no git to diff with), so this batch "
-            f"cannot check whether the Rust sources moved on since it was built "
+            f"cannot check whether the sources it was built from moved on since it was built "
             f"({head_text}). Rows still carry the binary's own commit from "
             "run.summary; rebuilding with `cargo build --release --bin vanta_m3` "
             "restores the check."
@@ -513,7 +525,7 @@ def stale_binary_message(
     reasons = []
     if changed:
         shown = ", ".join(changed[:8]) + ("…" if len(changed) > 8 else "")
-        reasons.append(f"{len(changed)} Rust source path(s) changed since: {shown}")
+        reasons.append(f"{len(changed)} path(s) the binary is built from changed since: {shown}")
     if binary.dirty:
         reasons.append(
             "it was built from a dirty tree, so no commit describes the sources it "
@@ -533,7 +545,9 @@ def stale_binary_warning(vanta_bin: Path, *, repo_root: Path = REPO_ROOT) -> Opt
     binary = binary_revision(vanta_bin)
     head = git_revision(repo_root)
     changed = (
-        changed_since(repo_root, binary.commit, VANTA_SOURCE_PATHS)
+        changed_since(
+            repo_root, binary.commit, VANTA_SOURCE_PATHS + VANTA_EMBEDDED_SOURCES
+        )
         if binary.commit
         else None
     )

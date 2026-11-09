@@ -162,7 +162,14 @@ the suite itself may legitimately read. A cache key has to describe every byte
 the run can see, so it skips only what cannot be read as source.
 """
 
-_HARNESS_FILES = ("suite.py", "shuru.py", "suite_cache.py", "compact.py", "budget.py")
+_HARNESS_FILES = (
+    "suite.py",
+    "shuru.py",
+    "suite_cache.py",
+    "compact.py",
+    "budget.py",
+    "vanta_exit_plugin.py",
+)
 """The harness files that decide how a suite is run.
 
 [VANTA-WHY] The stored value describes a run performed by THIS code, so a change
@@ -177,6 +184,11 @@ outcome — so a change to that rule changes what a cached pair is a measurement
 of. It is deliberately conservative: a scheduler-only change invalidates entries
 whose bytes did not move, which costs one repeat measurement and cannot serve a
 result produced under a different concurrency.
+
+``vanta_exit_plugin.py`` is here because ``suite.py`` stages its bytes into every
+run's VM (M3 §8.6 round 13, item 1): the file is *code that runs in the measured
+tree*, so a change to it changes the run, and a stamp that hashed only the reader
+would serve one plugin's result for another's.
 """
 
 

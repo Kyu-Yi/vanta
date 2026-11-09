@@ -6379,6 +6379,199 @@ class TestPrecompileLines:
         assert "'pkg/a b.py'" in line
 
 
+class TestExitPluginScript:
+    """The run-time exit plugin that ends pytest's own interpreter (§8.6 round 13).
+
+    [VANTA-WHY] luigi/8, 9, 11 and 12 (round 12) start a non-daemon worker thread in
+    their own ``test/worker_test.py`` and never stop it, so ``python`` blocked in
+    interpreter shutdown *after* pytest had written its report and printed its
+    summary. The harness measures a run by the markers the script prints after the
+    pytest command returns, so those markers never arrived and every run was
+    recorded as "timed out (hit the cap)" with ``run_secs=null`` — a complete,
+    readable report beside a null measurement.
+
+    These tests pin the four properties that make the fix both safe and effective:
+    the plugin is staged outside the tree, the command registers it, the staging is
+    outside the measured window, and it moves neither the report nor the exit code.
+    The last two run pytest in a child process — the only way to prove neutrality
+    and the only way to reproduce a *lingering* thread.
+    """
+
+    LINGERING_THREAD = (
+        "import threading, time\n"
+        "def _spin():\n"
+        "    time.sleep(300)\n"
+        "def test_x():\n"
+        "    threading.Thread(target=_spin).start()\n"
+        "    assert True\n"
+    )
+
+    @staticmethod
+    def _script(cmd: str = "python -m pytest tests") -> str:
+        return suite_mod._run_script(
+            "1", cmd, (), ["python", "-m", "pytest", "tests"]
+        )
+
+    @staticmethod
+    def _plugin_dir() -> Path:
+        return Path(suite_mod.__file__).resolve().parent
+
+    @classmethod
+    def _child_env(cls, *, plugin: bool) -> dict[str, str]:
+        """The environment a child pytest runs in, with the plugin importable.
+
+        ``PYTEST_PLUGINS``/``PYTEST_ADDOPTS`` are dropped because the *outer* run's
+        configuration must not leak; ``PYTHONPATH`` names the directory the plugin
+        file sits in, exactly as the staged guest directory does.
+        """
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in ("PYTEST_PLUGINS", "PYTEST_ADDOPTS")
+        }
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        if plugin:
+            existing = env.get("PYTHONPATH")
+            here = str(cls._plugin_dir())
+            env["PYTHONPATH"] = here if not existing else here + os.pathsep + existing
+        return env
+
+    @classmethod
+    def _child_command(cls, test_file: str, *, plugin: bool) -> list[str]:
+        cmd = [
+            sys.executable,
+            "-m",
+            "pytest",
+            test_file,
+            "-p",
+            "no:cacheprovider",
+            "--json-report",
+            "--json-report-file=report.json",
+            "-q",
+        ]
+        if plugin:
+            cmd += ["-p", suite_mod.EXIT_PLUGIN_NAME]
+        return cmd
+
+    def test_the_script_stages_the_plugin_outside_the_tree(self):
+        script = self._script()
+        source = suite_mod.EXIT_PLUGIN_SOURCE.read_text(encoding="utf-8").rstrip("\n")
+
+        assert suite_mod.EXIT_PLUGIN_GUEST_DIR.startswith("/tmp/"), (
+            "the plugin is staged in the guest's temp dir: not the tree the Creator "
+            "reads, and not the layer a re-bake would have to rebuild"
+        )
+        assert f"mkdir -p {suite_mod.EXIT_PLUGIN_GUEST_DIR}" in script
+        assert f"<<'{suite_mod.EXIT_PLUGIN_HEREDOC}'" in script, (
+            "a QUOTED heredoc, so nothing inside the source is expanded"
+        )
+        assert script.count(suite_mod.EXIT_PLUGIN_HEREDOC) == 2, "the heredoc opens and closes"
+        assert source in script, "the plugin's own bytes are what the guest receives"
+
+    def test_the_staging_precedes_the_measured_window(self):
+        script = self._script()
+        assert script.index(suite_mod.EXIT_PLUGIN_GUEST_DIR) < script.index("__VANTA_T0_1__="), (
+            "staging a file is not part of the run this harness measures: it must not "
+            "fall inside the clock the derived cap is computed from"
+        )
+
+    def test_the_command_registers_the_plugin(self):
+        script = self._script("python -m pytest tests")
+        assert f"\npython -m pytest tests -p {suite_mod.EXIT_PLUGIN_NAME}\n" in script, (
+            "the pytest command carries the registration; `cmd` is an already-quoted "
+            "string, so the flag is appended to it"
+        )
+
+    def test_pythonpath_keeps_the_projects_own_entry(self):
+        script = self._script()
+        assert (
+            'export PYTHONPATH="'
+            + suite_mod.EXIT_PLUGIN_GUEST_DIR
+            + ':${PYTHONPATH:-}"'
+        ) in script, (
+            "the project's own PYTHONPATH (fastapi/2's ./docs_src, recorded per "
+            "commit) is preserved: the plugin's directory is prepended to it, never "
+            "substituted for it"
+        )
+
+    def test_the_staged_plugin_compiles(self):
+        source = suite_mod.EXIT_PLUGIN_SOURCE.read_text(encoding="utf-8")
+        compile(source, suite_mod.EXIT_PLUGIN_SOURCE.name, "exec")
+
+    def test_a_lingering_worker_thread_no_longer_holds_the_interpreter(self, tmp_path):
+        """The regression itself: the thread is still running when the process ends."""
+        (tmp_path / "test_hang.py").write_text(self.LINGERING_THREAD, encoding="utf-8")
+
+        with pytest.raises(subprocess.TimeoutExpired):
+            subprocess.run(
+                self._child_command("test_hang.py", plugin=False),
+                cwd=tmp_path,
+                env=self._child_env(plugin=False),
+                capture_output=True,
+                timeout=5,
+            )
+        # …and with the plugin the run ends as soon as its report is on disk.
+        started = time.monotonic()
+        proc = subprocess.run(
+            self._child_command("test_hang.py", plugin=True),
+            cwd=tmp_path,
+            env=self._child_env(plugin=True),
+            capture_output=True,
+            timeout=30,
+        )
+        elapsed = time.monotonic() - started
+        assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")[-2000:]
+        assert elapsed < 20, (
+            f"the plugin must end the interpreter promptly; this took {elapsed:.1f}s, so "
+            "the thread is still being waited for"
+        )
+        summary = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))["summary"]
+        assert summary["passed"] == 1, "the report is complete and written before the exit"
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "def test_a():\n    assert True\n\ndef test_b():\n    assert True\n",
+            "def test_a():\n    assert True\n\ndef test_b():\n    assert False\n",
+        ],
+        ids=["clean-exit", "one-failure"],
+    )
+    def test_the_plugin_moves_neither_the_report_nor_the_exit_code(self, tmp_path, source):
+        """Neutrality, both directions: the same status and the same outcomes."""
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        (plain / "test_sample.py").write_text(source, encoding="utf-8")
+        with_plugin = tmp_path / "with_plugin"
+        with_plugin.mkdir()
+        (with_plugin / "test_sample.py").write_text(source, encoding="utf-8")
+
+        runs = {}
+        for name, directory, plugin in (
+            ("plain", plain, False),
+            ("plugin", with_plugin, True),
+        ):
+            proc = subprocess.run(
+                self._child_command("test_sample.py", plugin=plugin),
+                cwd=directory,
+                env=self._child_env(plugin=plugin),
+                capture_output=True,
+                timeout=60,
+            )
+            report = json.loads((directory / "report.json").read_text(encoding="utf-8"))
+            runs[name] = (
+                proc.returncode,
+                {test["nodeid"]: test["outcome"] for test in report["tests"]},
+                report["summary"],
+            )
+
+        assert runs["plugin"][0] == runs["plain"][0], (
+            "the exit code is pytest's own status in both runs: the plugin reports the "
+            "status pytest was about to exit with, it does not invent one"
+        )
+        assert runs["plugin"][1] == runs["plain"][1], "the per-test outcomes are identical"
+        assert runs["plugin"][2] == runs["plain"][2], "the summary counts are identical"
+
+
 class TestSuiteReport:
     """The reader must handle both plugin schemas, because which one is written
     depends on the bug's own pytest pin (§3.2): 0.1/0.2 write a flat list, 0.3+

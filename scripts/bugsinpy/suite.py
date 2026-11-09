@@ -425,6 +425,69 @@ def precompile_lines(
     return [_shell_quote([python, "-m", "compileall", "-q", "-f", *precompile])]
 
 
+# ---------------------------------------------------------------------------
+# the run-time exit plugin (M3 §8.6 round 13, item 1)
+# ---------------------------------------------------------------------------
+EXIT_PLUGIN_NAME = "vanta_exit_plugin"
+"""The import name of the plugin that ends pytest's interpreter.
+
+[VANTA-WHY] M3 §8.6 round 13, item 1. luigi/8, 9, 11 and 12 (round 12) start a
+non-daemon worker thread in their own ``test/worker_test.py`` and never stop it,
+so ``python`` blocks in orderly interpreter shutdown *after* pytest has written
+its JSON report and printed its summary. The harness measures a run by the
+markers its script prints after the pytest command returns, so those markers never
+arrive, the host-side cap fires, and a suite whose report is complete and readable
+is recorded as ``timed out (hit the cap)`` with ``run_secs=null``. The plugin ends
+the process in ``pytest_unconfigure`` — after every other hook, above all
+``pytest_jsonreport``'s, has run — with the status pytest itself would have exited
+with.
+"""
+
+EXIT_PLUGIN_GUEST_DIR = "/tmp/vanta-exit-plugin"
+"""Where the plugin is staged inside the VM.
+
+[VANTA-WHY] A temp dir in the guest, never the tree and never the layer. In the
+tree it would sit exactly where the Creator reads and would move the tree
+fingerprint the suite cache keys on; in the layer it would need a re-bake. The
+temp dir is neither — it exists for the life of one run's VM and nothing else.
+"""
+
+EXIT_PLUGIN_SOURCE = Path(__file__).resolve().with_name(f"{EXIT_PLUGIN_NAME}.py")
+"""The ONE source of the plugin's bytes.
+
+[VANTA-WHY] ``src/pipeline/harness.rs`` compiles in the same file with
+``include_str!`` for the Rust native suite. One source, two spellings of how it
+travels; a second *copy* of the rule would drift.
+"""
+
+EXIT_PLUGIN_HEREDOC = "__VANTA_EXIT_PLUGIN_EOF__"
+"""The heredoc delimiter, quoted so the shell expands nothing inside the source."""
+
+
+def exit_plugin_lines() -> list[str]:
+    """The shell lines that stage the exit plugin in the guest and register it.
+
+    The plugin is written with a *quoted* heredoc, so the source reaches the guest
+    byte for byte and no ``$`` or backtick inside it is ever expanded. ``PYTHONPATH``
+    keeps the project's own entry (fastapi/2's ``./docs_src``, recorded per commit)
+    after the plugin's directory, so the project's value still resolves and the
+    plugin is found whatever that value is.
+
+    The lines come *before* the ``T0`` marker: staging a file is not part of the run
+    this harness measures, and none of it may fall inside the clock.
+    """
+    source = EXIT_PLUGIN_SOURCE.read_text(encoding="utf-8")
+    return [
+        f"mkdir -p {EXIT_PLUGIN_GUEST_DIR}",
+        f"cat > {EXIT_PLUGIN_GUEST_DIR}/{EXIT_PLUGIN_NAME}.py <<'{EXIT_PLUGIN_HEREDOC}'",
+        source.rstrip("\n"),
+        EXIT_PLUGIN_HEREDOC,
+        # A plain concatenation, not an f-string: ``${PYTHONPATH:-}`` has to reach the
+        # shell as written, not be read as a format placeholder.
+        'export PYTHONPATH="' + EXIT_PLUGIN_GUEST_DIR + ':${PYTHONPATH:-}"',
+    ]
+
+
 def _run_script(
     suffix: str, cmd: str, precompile: Sequence[str], test_cmd: Sequence[str]
 ) -> str:
@@ -444,13 +507,22 @@ def _run_script(
     cannot corrupt one another; and a second run that skipped the step could race
     the first and import the module under pytest's warning filters — exactly the
     failure the step exists to prevent.
+
+    [VANTA-WHY] M3 §8.6 round 13, item 1 — :func:`exit_plugin_lines` stages the
+    exit plugin and the pytest command carries its own ``-p``: the plugin ends the
+    interpreter in ``pytest_unconfigure`` so a suite that leaves a non-daemon thread
+    behind still prints the markers this script measures by. ``cmd`` is an
+    already-quoted *string*, not an argv, so the flag is appended here rather than
+    spliced into a token list; the staging sits before ``T0`` so nothing of it
+    enters the measurement.
     """
     return "\n".join(
         [
             "set +e",
             *precompile_lines(precompile, test_cmd),
+            *exit_plugin_lines(),
             f"echo __VANTA_T0_{suffix}__=$(date +%s)",
-            cmd,
+            f"{cmd} -p {EXIT_PLUGIN_NAME}",
             # ``echo …=$(date +%s)`` consumes ``$?``, so the exit marker has to be
             # emitted before the closing time marker or the code read back would be
             # the marker's own.

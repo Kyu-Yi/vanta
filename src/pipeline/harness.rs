@@ -469,6 +469,61 @@ pub fn stderr_tail(text: &str) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// The run-time pytest exit plugin (M3 §8.6 round 13, item 1)
+// ---------------------------------------------------------------------------
+//
+// [VANTA-WHY] A repository whose own tests start a non-daemon worker thread and
+// never stop it leaves the interpreter alive *after* pytest has finished: the
+// JSON report is on disk and the summary is printed, then `python` blocks in
+// orderly interpreter shutdown waiting for that thread. The harness reads a run's
+// exit status from the process's own ending, so a suite that outlives its pytest
+// session reads as a timeout even though it measured everything. The plugin ends
+// the process in `pytest_unconfigure` — after `pytest_jsonreport` has written the
+// report in `pytest_sessionfinish` — with the status pytest itself would have
+// exited with.
+//
+// The Rust native suite and the Python wrapper (`scripts/bugsinpy/suite.py`) must
+// register the SAME rule, so both read ONE source of bytes: this `include_str!`
+// and that module's `EXIT_PLUGIN_SOURCE`. The file is written into the sandbox
+// root at run time and never into the graded tree or the layer, exactly as
+// `write_conftest` below does — so it cannot reach the Creator's context, the tree
+// fingerprints or the cache keys.
+/// The module name the native suite registers with `-p`.
+pub const EXIT_PLUGIN_NAME: &str = "vanta_exit_plugin";
+
+/// The plugin's source, the same file `scripts/bugsinpy/suite.py` stages in a VM.
+pub const EXIT_PLUGIN_SOURCE: &str = include_str!("../../scripts/bugsinpy/vanta_exit_plugin.py");
+
+/// Write the exit plugin into a sandbox root.
+///
+/// [VANTA-WHY] The root, beside `conftest.py`, and for the same reason: the suite
+/// runs `python -m pytest` with the root as its working directory, and `-m` puts
+/// that directory on `sys.path`, so the file is importable by the very `-p` flag
+/// the command line carries. It is written at run time into a per-run sandbox, so
+/// it is never part of the graded tree, the tree hash or the cache key.
+fn write_exit_plugin(root: &Path) -> std::io::Result<()> {
+    fs::write(root.join(format!("{EXIT_PLUGIN_NAME}.py")), EXIT_PLUGIN_SOURCE)
+}
+
+/// The native suite's command line: the recorded command, Vanta's own report
+/// flags, and the run-time exit plugin.
+///
+/// [VANTA-WHY] Split out of `run_native_suite` so the injection is a pure function
+/// of the recorded command and can be asserted without a sandbox. `runner.py`'s
+/// `vanta_test_cmd` already strips the split's report flags before they reach the
+/// binary, so everything appended here is Vanta's own and the recorded command is
+/// passed through unchanged.
+pub fn native_suite_command(test_cmd: &TestCommand) -> Vec<String> {
+    let mut cmd = test_cmd.as_cmd_vec();
+    cmd.push("-p".to_string());
+    cmd.push(EXIT_PLUGIN_NAME.to_string());
+    cmd.push("--json-report".to_string());
+    cmd.push("--json-report-file=report.json".to_string());
+    cmd.push("-q".to_string());
+    cmd
+}
+
 /// Run the repository's own test suite against a source tree.
 ///
 /// The source tree includes the repo's `tests/`, so pytest discovers them from
@@ -501,12 +556,17 @@ pub async fn run_native_suite(
         sb.destroy();
         return NativeSuiteReport::not_run();
     }
+    // [VANTA-WHY] M3 §8.6 round 13, item 1 — the exit plugin, written into the
+    // per-run root exactly as `write_conftest` is. A discarded failure here would
+    // grade a tree whose suite can outlive its own pytest session, which is the
+    // failure this write exists to remove.
+    if write_exit_plugin(sb.root()).is_err() {
+        sb.destroy();
+        return NativeSuiteReport::not_run();
+    }
 
     // No test-file argument: pytest collects the repo's own tests from rootdir.
-    let mut cmd = test_cmd.as_cmd_vec();
-    cmd.push("--json-report".to_string());
-    cmd.push("--json-report-file=report.json".to_string());
-    cmd.push("-q".to_string());
+    let cmd = native_suite_command(test_cmd);
     let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
     let exec = sb
         .execute(
@@ -2548,10 +2608,12 @@ pub async fn heal_dependencies(
 #[cfg(test)]
 mod tests {
     use super::{
-        CollectionFailure, NativeSuiteReport, RUFF_ARGS, StaticDiagnostic, build_single_test_cmd,
+        CollectionFailure, EXIT_PLUGIN_NAME, EXIT_PLUGIN_SOURCE, NativeSuiteReport, RUFF_ARGS,
+        StaticDiagnostic, build_single_test_cmd,
         copy_static_configs, copy_tree_excluding, empty_report_note, interpreter_for,
         is_native_test_path, is_tooling_package, native_collection_summary, native_gate_vacuous,
         native_outcome, native_regressions, native_results_index, native_suite_collapsed,
+        native_suite_command,
         native_tree_with_original_tests,
         native_vacuous_reason, new_diagnostics, parse_mypy_line, parse_native_report,
         parse_pytest_report_detailed, parse_ruff_line, project_package, prune_keeps,
@@ -2559,7 +2621,7 @@ mod tests {
         ruff_is_error_class, run_single_test, run_tests_parallel, seed_and_write,
         seed_and_write_from, seed_method, seed_root, seed_sandbox_from, seed_source_and_conftest,
         set_seed_root,
-        static_tool_runner, write_source_files, write_tree_snapshot,
+        static_tool_runner, write_exit_plugin, write_source_files, write_tree_snapshot,
     };
     use crate::agents::attacker::GeneratedTest;
     use crate::core::{TestIntent, TestResult};
@@ -4409,6 +4471,106 @@ mod tests {
         assert!(
             in_session.iter().any(|a| a.starts_with("--json-report-file=")),
             "the in-session run still writes a JSON report for the driver to read: {in_session:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // M3 §8.6 round 13 (item 1) — the run-time pytest exit plugin
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_native_argv_registers_the_exit_plugin_and_leaves_the_recorded_command_alone() {
+        // [VANTA-WHY] The recorded command is what `runner.py::vanta_test_cmd`
+        // handed over, minus its report flags. Vanta appends its own report flags
+        // and the plugin registration, and NOTHING else may move: a suite that runs
+        // with one fewer flag than it was recorded with is not the same experiment.
+        let tc = TestCommand {
+            program: "python".to_string(),
+            args: vec![
+                "-m".to_string(),
+                "pytest".to_string(),
+                "test".to_string(),
+                "-p".to_string(),
+                "no:cacheprovider".to_string(),
+            ],
+            env: vec![("PYTHONPATH".to_string(), "./docs_src".to_string())],
+            precompile: vec!["pkg/mod.py".to_string()],
+        };
+        let recorded = tc.as_cmd_vec();
+        let cmd = native_suite_command(&tc);
+
+        assert_eq!(
+            &cmd[..recorded.len()],
+            recorded.as_slice(),
+            "the recorded command must be a prefix of the native argv, unchanged: {cmd:?}"
+        );
+        assert_eq!(
+            &cmd[recorded.len()..],
+            [
+                "-p",
+                EXIT_PLUGIN_NAME,
+                "--json-report",
+                "--json-report-file=report.json",
+                "-q",
+            ],
+            "the native argv adds the plugin registration and Vanta's own report flags, \
+             and nothing else: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn the_exit_plugin_lands_in_the_sandbox_root_and_only_there() {
+        // [VANTA-WHY] The write is the whole delivery mechanism for the Rust side:
+        // it goes into the per-run root, where `python -m pytest` finds it through
+        // the working directory `-m` puts on `sys.path` — never into the graded
+        // tree, the tree hash or the layer.
+        let root = tempfile::tempdir().unwrap();
+        write_exit_plugin(root.path()).unwrap();
+
+        let written = fs::read_to_string(root.path().join(format!("{EXIT_PLUGIN_NAME}.py")))
+            .expect("the plugin is written at the root under its import name");
+        assert_eq!(
+            written, EXIT_PLUGIN_SOURCE,
+            "the bytes come from the one source `include_str!` names, so the two \
+             implementations cannot drift"
+        );
+        let mut names: Vec<String> = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![format!("{EXIT_PLUGIN_NAME}.py")],
+            "the plugin write puts exactly one file in the root: {names:?}"
+        );
+    }
+
+    #[test]
+    fn the_exit_plugin_ends_the_interpreter_after_the_report_is_written() {
+        // [VANTA-WHY] The plugin is only correct because of WHERE it ends the
+        // process: `pytest_jsonreport` writes the report in `pytest_sessionfinish`
+        // (`tryfirst`), so the hard exit has to sit in `pytest_unconfigure`, and the
+        // status it exits with has to be the one pytest itself would have exited
+        // with. A `tryfirst` unconfigure hook or an exit inside `sessionfinish`
+        // would move the measurement, which is the failure this guards.
+        for needle in [
+            "def pytest_sessionfinish",
+            "def pytest_unconfigure",
+            "os._exit(",
+            "sys.stdout.flush()",
+            "sys.stderr.flush()",
+        ] {
+            assert!(
+                EXIT_PLUGIN_SOURCE.contains(needle),
+                "the exit plugin must still contain {needle:?}"
+            );
+        }
+        assert_eq!(
+            EXIT_PLUGIN_SOURCE.matches("trylast=True").count(),
+            2,
+            "both hooks are `trylast`: the exit must run after every other hook, \
+             above all the one that writes the report"
         );
     }
 }

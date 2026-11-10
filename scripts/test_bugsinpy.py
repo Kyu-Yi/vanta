@@ -8443,6 +8443,28 @@ class TestCompareBatches:
         )
         assert code == 2
 
+    def test_a_report_that_cannot_be_written_is_exit_two_with_its_own_message(
+        self, tmp_path, capsys
+    ):
+        # M3 item T3 — a report write that raises OSError must be exit 2 ("cannot
+        # read or write the batches") with its own message, never an uncaught
+        # traceback and never exit 1 (which means "the batches differ"). A parent
+        # that is a FILE, not a directory, makes `write_report`'s `mkdir` raise.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row()])
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("x", encoding="utf-8")
+        code = compare_batches_mod.main(
+            [
+                "--serial", str(serial),
+                "--parallel", str(parallel),
+                "--report", str(blocker / "compare.json"),
+            ]
+        )
+        assert code == 2
+        assert "cannot write the report" in capsys.readouterr().err
+
     def test_a_missing_directory_raises_compare_error(self, tmp_path):
         with pytest.raises(compare_batches_mod.CompareError):
             compare_batches_mod.compare_batches(tmp_path / "nope", tmp_path)

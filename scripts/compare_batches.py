@@ -159,9 +159,12 @@ OUTPUT
 ------
 One verdict line, and a JSON report at ``<parallel>/compare_batches.json`` unless
 ``--report`` names one (``--no-report`` writes none). Exit codes: ``0`` identical,
-``1`` not identical, ``2`` the two batches could not be read, ``3``
-``identical_unverified`` (the batches agree, but one side's cache isolation could
-not be verified).
+``1`` not identical, ``2`` the two batches could not be read (or a report could
+not be written), ``3`` ``identical_unverified`` (the batches agree, but one side's
+cache isolation could not be verified), ``4`` ``identical_except_flaky`` (the
+batches agree apart from a flaky-set difference proven inert — M3 item AA5), and
+``5`` ``incomparable`` (a group's candidate bytes exist on one side only, so its
+rows were never compared — M3 item AB1).
 """
 
 from __future__ import annotations
@@ -1026,15 +1029,19 @@ def compare_batches(
     # The flaky set is the SERIAL batch's, per the spec ("apart from the tests the
     # serial pair marked flaky"), unioned with the parallel batch's so a nodeid
     # flaky on either side is dropped from both maps.
-    def flaky(batch_dir: Path) -> dict[str, set[str]]:
-        payload = read_prepare(batch_dir)
+    #
+    # [VANTA-WHY] T3 — read from the prepare payloads ALREADY loaded above rather
+    # than re-reading ``prepare.json`` from disk. It is the same file the rest of
+    # this comparison was built from, and a second read is a second chance to see a
+    # batch that differs from the one being compared.
+    def flaky_nodeids_by_bug(payload: Mapping[str, Any]) -> dict[str, set[str]]:
         return {
             bug: set(block.get("flaky_nodeids") or [])
             for bug, block in prepare_bugs(payload).items()
         }
 
-    serial_flaky = flaky(serial_dir)
-    parallel_flaky = flaky(parallel_dir)
+    serial_flaky = flaky_nodeids_by_bug(serial_prepare)
+    parallel_flaky = flaky_nodeids_by_bug(parallel_prepare)
     excluded_by_bug = {
         bug: serial_flaky.get(bug, set()) | parallel_flaky.get(bug, set()) for bug in wanted
     }
@@ -1314,20 +1321,21 @@ def bug_slug(bug: str) -> str:
 
 
 def write_per_bug_reports(
-    serial_dir: Path, parallel_dir: Path, bugs: Sequence[str]
+    parallel_dir: Path, payloads: Mapping[str, Mapping[str, Any]]
 ) -> dict[str, Path]:
-    """Write one `--bug`-scoped report per bug, and return bug → path.
+    """Write one ``--bug``-scoped report per bug, and return bug → path.
 
-    Each file is a real re-run of :func:`compare_batches` scoped to that one bug,
-    not a slice of the whole report: scoping also narrows the cache half (M3 item
-    X3) and the row set, so a slice would quietly disagree with what ``--bug``
-    prints. The comparison is pure file reading, so re-running it per bug is cheap.
+    Each payload is a real re-run of :func:`compare_batches` scoped to one bug, not
+    a slice of the whole report: scoping also narrows the cache half (M3 item X3)
+    and the row set, so a slice would quietly disagree with what ``--bug`` prints.
+    The comparison is pure file reading, so re-running it per bug is cheap; the
+    comparisons happen in ``main``'s read phase and only the WRITES happen here, so
+    a write failure carries its own code and message.
     """
     directory = Path(parallel_dir) / PER_BUG_DIRNAME
     out: dict[str, Path] = {}
-    for bug in bugs:
-        scoped = compare_batches(serial_dir, parallel_dir, bugs=[bug])
-        out[bug] = write_report(scoped, directory / f"{bug_slug(bug)}.json")
+    for bug, payload in payloads.items():
+        out[bug] = write_report(payload, directory / f"{bug_slug(bug)}.json")
     return out
 
 
@@ -1364,14 +1372,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parse_args(argv)
     try:
         report = compare_batches(args.serial, args.parallel, bugs=args.bug)
-        # M3 item AA5 — the per-bug reports are computed inside the `try` with the
-        # main comparison: they re-read the same two batches, so a read failure must
+        # M3 item AA5/T3 — the per-bug reports are the same `--bug`-scoped
+        # comparison, re-run over the same two batches, so a READ failure here must
         # be exit 2 ("cannot read"), never a half-written run that already printed a
-        # verdict. `--no-report` writes nothing at all, as it always has.
-        per_bug = (
+        # verdict. Only the COMPARISONS happen here; every WRITE is deferred to the
+        # write phase below, where a write failure gets its own code and message.
+        # `--no-report` writes nothing at all, as it always has.
+        per_bug_payloads = (
             {}
             if args.no_report
-            else write_per_bug_reports(args.serial, args.parallel, report["bugs"])
+            else {
+                bug: compare_batches(args.serial, args.parallel, bugs=[bug])
+                for bug in report["bugs"]
+            }
         )
     except CompareError as exc:
         print(f"compare-batches: {exc}", file=sys.stderr)
@@ -1388,7 +1401,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(verdict_line(report))
     if not args.no_report:
         path = args.report or (Path(args.parallel) / "compare_batches.json")
-        print(f"report: {write_report(report, path)}")
+        # [VANTA-WHY] T3 — a report that could not be *written* is "cannot read or
+        # write the batches" (exit 2), not "the batches differ" (exit 1) and not a
+        # verdict code. Before this the report write sat outside every `try`, so a
+        # report path under an unwritable directory escaped `main` as an uncaught
+        # traceback and a status a caller could not tell from a real difference.
+        try:
+            written = write_report(report, path)
+            per_bug = write_per_bug_reports(args.parallel, per_bug_payloads)
+        except OSError as exc:
+            print(f"compare-batches: cannot write the report: {exc!r}", file=sys.stderr)
+            return 2
+        print(f"report: {written}")
         for bug in report["bugs"]:
             print(f"report [{bug}]: {per_bug[bug]}")
     # [VANTA-WHY] M3 item Z2/AA5/AB1 — five outcomes need five codes: 0 identical,

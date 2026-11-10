@@ -200,6 +200,64 @@ fn git_apply(root: &std::path::Path, patch_arg: &str, extra: &[&str]) -> Result<
     Err(stderr.trim().lines().take(6).collect::<Vec<_>>().join(" | "))
 }
 
+/// Every tree-relative path `patch -p1` could WRITE from `patch_text`, or the
+/// reason its targets cannot be established (M3 item T1, strategy 5).
+///
+/// [VANTA-WHY] Strategy 5 is the only strategy that runs a tool which does not
+/// confine itself. `git apply` (strategies 3 and 4) refuses a destination
+/// outside the repository, so the entry guard's single check on the ONE `path`
+/// the cascade was handed was enough for them. `patch(1)` writes whatever name
+/// its `---`/`+++` headers give, so a MULTI-file diff's other names — never seen
+/// by the guard — are live: a `+++ b/../escape` becomes a write above `root`.
+/// Every header name is therefore checked with the same predicate the entry
+/// guard uses (`unsafe_relative_path_reason`), both as written and after the one
+/// leading component `-p1` strips, because that stripped form is what patch
+/// writes. A diff whose header names cannot be read — none present, a blank one,
+/// or one that strips to nothing — yields `Err`: confinement is NOT established,
+/// and the caller skips strategy 5 rather than running it unconfined.
+fn patch_target_paths(patch_text: &str) -> Result<Vec<String>, String> {
+    let mut paths: Vec<String> = Vec::new();
+    for line in patch_text.lines() {
+        let Some(rest) = line
+            .strip_prefix("+++ ")
+            .or_else(|| line.strip_prefix("--- "))
+        else {
+            continue;
+        };
+        // `patch` reads the name up to the first tab; a timestamp may follow it.
+        let name = rest.split('\t').next().unwrap_or("").trim();
+        if name == "/dev/null" {
+            // A deletion's destination (or a creation's source) — never written.
+            continue;
+        }
+        if let Some(why) = unsafe_relative_path_reason(name) {
+            return Err(format!("the diff names `{name}` ({why})"));
+        }
+        // `-p1` strips the leading component (`a/`, `b/`) before patch writes.
+        let target = name.split_once('/').map(|(_first, rest)| rest).unwrap_or(name);
+        if let Some(why) = unsafe_relative_path_reason(target) {
+            return Err(format!("the diff names `{name}` ({why})"));
+        }
+        paths.push(target.to_string());
+    }
+    // A `---`/`+++` pair names the same file twice; the SET of targets is what
+    // matters, in first-seen order.
+    let mut unique: Vec<String> = Vec::new();
+    for path in paths {
+        if !unique.contains(&path) {
+            unique.push(path);
+        }
+    }
+    if unique.is_empty() {
+        return Err(
+            "the diff's targets could not be read from its headers, so patch(1) could not be \
+             confined"
+                .to_string(),
+        );
+    }
+    Ok(unique)
+}
+
 /// Why a repair-mode cascade could not produce a usable candidate.
 ///
 /// [VANTA-WHY] The Creator needs the DISTINCTION, not just "failed". "I could
@@ -436,8 +494,10 @@ pub fn apply_patch_detailed(
     // [VANTA-WHY] T1 — `root.join(rel)` is a write, but the entry guard above
     // already refused every unsafe `path` and an EMPTY one is the fixed
     // `source.txt` fallback, and `root` is a freshly created temp dir with no
-    // symlink in it, so nothing can escape here. The confinement for this
-    // function is that one check, made before any strategy touches the disk.
+    // symlink in it, so nothing can escape through THIS join. Strategies 3 and 4
+    // (`git apply`) confine themselves to the repository `root` is made into.
+    // Strategy 5 (`patch(1)`) does not, so it carries its own check on every
+    // header name the diff could write (see `patch_target_paths`).
     if let Ok(dir) = tempfile::tempdir() {
         let root = dir.path();
         let rel = if path.trim().is_empty() {
@@ -530,39 +590,52 @@ pub fn apply_patch_detailed(
         // [PITFALL] macOS `patch` without --batch can hang waiting for
         // interactive input when hunks don't apply cleanly. --batch forces
         // non-interactive mode (skip hunks that fail, don't prompt).
-        let out = Command::new("patch")
-            .args(["-p1", "--fuzz=3", "--batch", "-i", "fix.diff"])
-            .current_dir(root)
-            .output();
-        match out {
-            Ok(o) if o.status.success() => match fs::read_to_string(&src_path) {
-                Ok(patched) => match accept(patched, "patch -p1") {
-                    Ok((patched, changed)) => {
-                        if changed {
-                            debug!("patch -p1 --fuzz=3 succeeded");
-                            return (patched, true, None);
-                        }
-                        // `patch -p1` applied but the text is identical.
-                        return no_change(patched);
+        // [VANTA-WHY] T1 — `patch(1)` is the ONE strategy whose tool does not
+        // confine itself. The entry guard saw only the single `path` this
+        // cascade was called with, so a multi-file diff's other names were never
+        // checked and a `+++ b/../escape` would be written above `root`. Every
+        // target the diff could name is validated with that same predicate
+        // first; if any is unsafe, or if the targets cannot be read from the
+        // headers at all, strategy 5 is SKIPPED. The git strategies above, which
+        // confine themselves, are unchanged.
+        match patch_target_paths(patch_text) {
+            Err(why) => tried.push(StrategyFailure::new("patch -p1 --fuzz=3", why)),
+            Ok(_targets) => {
+                let out = Command::new("patch")
+                    .args(["-p1", "--fuzz=3", "--batch", "-i", "fix.diff"])
+                    .current_dir(root)
+                    .output();
+                match out {
+                    Ok(o) if o.status.success() => match fs::read_to_string(&src_path) {
+                        Ok(patched) => match accept(patched, "patch -p1") {
+                            Ok((patched, changed)) => {
+                                if changed {
+                                    debug!("patch -p1 --fuzz=3 succeeded");
+                                    return (patched, true, None);
+                                }
+                                // `patch -p1` applied but the text is identical.
+                                return no_change(patched);
+                            }
+                            Err(refused) => failure = Some(refused),
+                        },
+                        Err(e) => tried.push(StrategyFailure::new(
+                            "patch -p1 --fuzz=3",
+                            format!("applied but the patched file could not be read: {e}"),
+                        )),
+                    },
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        tried.push(StrategyFailure::new(
+                            "patch -p1 --fuzz=3",
+                            stderr.trim().lines().take(6).collect::<Vec<_>>().join(" | "),
+                        ));
                     }
-                    Err(refused) => failure = Some(refused),
-                },
-                Err(e) => tried.push(StrategyFailure::new(
-                    "patch -p1 --fuzz=3",
-                    format!("applied but the patched file could not be read: {e}"),
-                )),
-            },
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                tried.push(StrategyFailure::new(
-                    "patch -p1 --fuzz=3",
-                    stderr.trim().lines().take(6).collect::<Vec<_>>().join(" | "),
-                ));
+                    Err(e) => tried.push(StrategyFailure::new(
+                        "patch -p1 --fuzz=3",
+                        format!("could not run patch: {e}"),
+                    )),
+                }
             }
-            Err(e) => tried.push(StrategyFailure::new(
-                "patch -p1 --fuzz=3",
-                format!("could not run patch: {e}"),
-            )),
         }
     }
 
@@ -1189,6 +1262,85 @@ mod tests {
         assert!(patch_deleted_paths(addition).is_empty());
         let edit = "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a - b\n+    return a + b\n";
         assert!(patch_deleted_paths(edit).is_empty());
+    }
+
+    // ---- M3 item T1: strategy 5's own confinement ----
+
+    /// [VANTA-WHY] T1 — `patch -p1` writes whatever name its headers give, so
+    /// the names are enumerated and each is stripped of the one component `-p1`
+    /// removes (what patch actually writes). A deletion's `/dev/null` is skipped.
+    #[test]
+    fn patch_target_paths_strips_one_component_from_every_header() {
+        let patch = concat!(
+            "diff --git a/pkg/mod.py b/pkg/mod.py\n",
+            "--- a/pkg/mod.py\t2020-01-01 00:00:00\n",
+            "+++ b/pkg/mod.py\n",
+            "diff --git a/new.py b/new.py\n",
+            "--- /dev/null\n",
+            "+++ b/new.py\n",
+        );
+        assert_eq!(
+            patch_target_paths(patch).unwrap(),
+            vec!["pkg/mod.py".to_string(), "new.py".to_string()]
+        );
+    }
+
+    /// The escape this item is about: `-p1` strips `b/`, leaving `../escape.py`
+    /// — exactly the shape the entry guard refuses, on a name the guard never
+    /// saw because it checks only the one `path` the cascade was handed.
+    #[test]
+    fn patch_target_paths_refuses_a_b_escape_target() {
+        let patch = "--- a/cart.py\n+++ b/../escape.py\n@@ -1,1 +1,1 @@\n-x = 1\n+x = 2\n";
+        let err = patch_target_paths(patch).expect_err("b/../escape.py leaves the tree");
+        assert!(err.contains("b/../escape.py"), "the reason names it: {err}");
+        assert!(err.contains("parent-directory component"), "got: {err}");
+    }
+
+    #[test]
+    fn patch_target_paths_refuses_an_absolute_target() {
+        let patch = "--- a/cart.py\n+++ /etc/passwd\n@@ -1,1 +1,1 @@\n-x = 1\n+x = 2\n";
+        let err = patch_target_paths(patch).expect_err("/etc/passwd is absolute");
+        assert!(err.contains("absolute"), "got: {err}");
+    }
+
+    /// A diff whose targets cannot be read is NOT a licence to run patch
+    /// unconfined: the helper says so, and the caller skips strategy 5.
+    #[test]
+    fn patch_target_paths_reports_a_diff_with_no_readable_target() {
+        assert!(patch_target_paths("").is_err());
+        assert!(patch_target_paths("@@ -1,1 +1,1 @@\n-x\n+y\n").is_err());
+    }
+
+    /// End to end: a patch only strategy 5 might have misplaced carries an
+    /// escaping header. The apply must NOT place it, and the recorded reason
+    /// must show strategy 5 refused to run rather than running unconfined.
+    #[test]
+    fn strategy_5_is_skipped_when_a_header_escapes_the_temp_tree() {
+        let original = "def add(a, b):\n    return a - b\n";
+        let patch = concat!(
+            "--- a/cart.py\n",
+            "+++ b/../escape.py\n",
+            "@@ -10,1 +10,1 @@\n",
+            "-no_such_line_here\n",
+            "+whatever\n",
+        );
+        let (patched, changed, failure) = apply_patch_detailed(original, patch, "cart.py");
+        assert_eq!(patched, original);
+        assert!(!changed);
+        let ApplyFailure::DidNotApply { strategies, .. } =
+            failure.expect("no strategy placed this patch")
+        else {
+            panic!("expected DidNotApply, got a different failure class");
+        };
+        let step = strategies
+            .iter()
+            .find(|s| s.strategy == "patch -p1 --fuzz=3")
+            .expect("strategy 5 must be recorded as tried");
+        assert!(
+            step.reason.contains("parent-directory component"),
+            "the reason must record WHY it was skipped: {}",
+            step.reason
+        );
     }
 
     #[test]

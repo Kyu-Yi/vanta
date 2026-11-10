@@ -696,15 +696,19 @@ def preflight(
         files = _changed_py_files(mutant.text)
         if not files:
             return Preflight(applied=True, compiled=True, detail="no python file changed")
-        result = shuru_mod.run(
-            checkpoint=checkpoint,
-            host_root=batch_dir,
-            command=[_interpreter(prep.test_cmd), "-m", "py_compile", *files],
-            disk_mb=disk_mb,
-            memory_mb=prep.vm_memory_mb,
-            guest_cwd=f"/workspace/{work_rel}",
-            timeout_secs=compile_timeout_secs,
-        )
+        # [VANTA-WHY] M3 item V8 — the compile VM mounts a clone of the patched tree,
+        # never the batch directory, so a mutant's own source cannot read the oracle,
+        # the pool or another mutant's tree even by absolute path.
+        with suite_mod.VmRoot(batch_dir=batch_dir, tree_rel=work_rel) as root:
+            result = shuru_mod.run(
+                checkpoint=checkpoint,
+                host_root=root.host,
+                command=[_interpreter(prep.test_cmd), "-m", "py_compile", *files],
+                disk_mb=disk_mb,
+                memory_mb=prep.vm_memory_mb,
+                guest_cwd=f"/workspace/{work_rel}",
+                timeout_secs=compile_timeout_secs,
+            )
         compiled = result.exit_code == 0
         detail = "" if compiled else (result.stdout + result.stderr).strip()[-2000:]
         return Preflight(applied=True, compiled=compiled, detail=detail)

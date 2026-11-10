@@ -24,6 +24,7 @@ never by booting a VM.
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
 import inspect
 import io
@@ -31,15 +32,20 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tarfile
 import threading
+import time
 import zipfile
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -49,6 +55,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from bugsinpy import arms as arms_mod  # noqa: E402
 from bugsinpy import bake as bake_mod  # noqa: E402
+from bugsinpy import budget as budget_mod  # noqa: E402
 from bugsinpy import bugsinpy_meta as meta_mod  # noqa: E402
 from bugsinpy import compact as compact_mod  # noqa: E402
 from bugsinpy import context as ctx  # noqa: E402
@@ -68,11 +75,14 @@ from bugsinpy import runner as runner_mod  # noqa: E402
 from bugsinpy import shuru as shuru_mod  # noqa: E402
 from bugsinpy import split as split_mod  # noqa: E402
 from bugsinpy import suite as suite_mod  # noqa: E402
+from bugsinpy import suite_cache as suite_cache_mod  # noqa: E402
 from bugsinpy import trees as tree_mod  # noqa: E402
 from bugsinpy import version_pin as version_pin_mod  # noqa: E402
 from bugsinpy.split import SplitError, load_split  # noqa: E402
 import analyse as analyse_mod  # noqa: E402
 import bugsinpy_run as run_mod  # noqa: E402
+import compare_batches as compare_batches_mod  # noqa: E402
+import probe_xdist as probe_xdist_mod  # noqa: E402
 
 SPLIT_PATH = REPO_ROOT / "plans" / "bugsinpy_split.json"
 DEV_SPLIT_PATH = REPO_ROOT / "plans" / "bugsinpy_dev_split.json"
@@ -1630,6 +1640,165 @@ class TestTrackedPaths:
         }
 
 
+class TestProjectCloneIsOnceUnderConcurrency:
+    """M3 item Y1 — "clone once" must hold when callers overlap, not only in sequence.
+
+    ``prepare`` now overlaps different bugs, and the dev split holds two bugs of one
+    project (``fastapi``, ``luigi``, ``matplotlib``), so two callers can reach an
+    absent clone destination at the same moment. Without a lock both would run
+    ``git clone`` into it and git refuses the second — failing a bug for a race
+    rather than for anything about the bug.
+    """
+
+    def test_two_concurrent_callers_clone_the_project_once(self, tmp_path, monkeypatch):
+        cache_root = tmp_path / "repos"
+        at_the_gate = threading.Barrier(2)
+        clones: list[str] = []
+        clone_lock = threading.Lock()
+
+        def fake_git(args, *, cwd):
+            """Stand in for ``git clone``: record it, hold it open, make the dest."""
+            with clone_lock:
+                clones.append(args[-1])
+            time.sleep(0.05)  # a real clone is slow; keep the window open
+            Path(args[-1]).mkdir(parents=True, exist_ok=True)
+            return ""
+
+        monkeypatch.setattr(tree_mod, "_git", fake_git)
+
+        results: list[Path] = []
+        errors: list[BaseException] = []
+
+        def worker():
+            try:
+                at_the_gate.wait(timeout=5.0)
+                results.append(
+                    tree_mod.ensure_project_clone(cache_root, "Demo", "https://x/y.git")
+                )
+            except BaseException as exc:  # noqa: BLE001 — reported, not raised here
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10.0)
+
+        assert not errors, errors
+        assert clones == [str(cache_root / "Demo.git")], (
+            f"the project was cloned {len(clones)} time(s) for two callers: {clones}"
+        )
+        assert results == [cache_root / "Demo.git", cache_root / "Demo.git"]
+
+
+class TestCloneMirror:
+    """M3 item AA2 — the local mirror is the batch's only network writer, a
+    checkout reads it and never writes it, and every export is verified to have
+    landed on the commit it claims.
+
+    ``runs/bugsinpy/repos/<project>.git`` is cloned once from upstream; the three
+    trees of a bug, and every later bug of the project, are cloned from that path.
+    A commit the mirror does not hold (a PR merge, a tag-only commit) is fetched
+    into it by :func:`ensure_commit_available` — and only then.
+    """
+
+    def _repo_with_commit(self, tmp_path, name: str = "repo"):
+        """A real one-commit repository and its commit id."""
+        repo = tmp_path / name
+        repo.mkdir()
+        tree_mod._git(["init", "--quiet"], cwd=repo)
+        tree_mod._git(["config", "user.email", "t@example.com"], cwd=repo)
+        tree_mod._git(["config", "user.name", "T"], cwd=repo)
+        write(repo / "pkg" / "mod.py", "VALUE = 1\n")
+        tree_mod._git(["add", "-A"], cwd=repo)
+        tree_mod._git(["commit", "--quiet", "-m", "one"], cwd=repo)
+        return repo, tree_mod._git(["rev-parse", "HEAD"], cwd=repo).strip()
+
+    def test_a_commit_the_mirror_holds_is_never_fetched(self, tmp_path, monkeypatch):
+        """The mirror already has the commit: putting it there is a local read.
+
+        A ``git fetch`` here would be the network being touched for a bug whose
+        commit the batch already cloned — the cost AA2 exists to remove.
+        """
+        repo, commit = self._repo_with_commit(tmp_path)
+        calls: list[list[str]] = []
+        real_run = subprocess.run
+
+        def spy(cmd, *args, **kwargs):
+            calls.append(list(cmd))
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(tree_mod.subprocess, "run", spy)
+        tree_mod.ensure_commit_available(repo, commit)
+
+        assert calls, "the check itself should have asked git"
+        assert [call for call in calls if "fetch" in call] == [], calls
+
+    def test_a_commit_missing_from_the_mirror_is_fetched_from_origin(self, tmp_path):
+        """A commit the mirror does not hold is fetched, by sha, into the mirror.
+
+        This is the PR-merge / tag-only case the old ``export_tree`` fallback
+        handled by fetching into the *checkout*; AA2 moves it into the mirror, so
+        the next bug of the project pays nothing. The local origin is given the
+        same sha-fetch permission GitHub grants, or the fetch would be refused for
+        a reason that has nothing to do with the harness.
+        """
+        origin, _ = self._repo_with_commit(tmp_path, "origin")
+        tree_mod._git(["config", "uploadpack.allowAnySHA1InWant", "true"], cwd=origin)
+        mirror = tmp_path / "mirror.git"
+        tree_mod._git(["clone", "--quiet", "--", str(origin), str(mirror)], cwd=None)
+
+        # a commit origin gains *after* the mirror was cloned
+        write(origin / "pkg" / "mod.py", "VALUE = 2\n")
+        tree_mod._git(["add", "-A"], cwd=origin)
+        tree_mod._git(["commit", "--quiet", "-m", "two"], cwd=origin)
+        second = tree_mod._git(["rev-parse", "HEAD"], cwd=origin).strip()
+
+        assert not tree_mod._has_commit(mirror, second)
+        tree_mod.ensure_commit_available(mirror, second)
+        assert tree_mod._has_commit(mirror, second)
+
+    def test_a_commit_that_cannot_be_fetched_is_refused(self, tmp_path):
+        """A commit neither held nor obtainable is a refusal, not a silent pass."""
+        origin, _ = self._repo_with_commit(tmp_path, "origin")
+        mirror = tmp_path / "mirror.git"
+        tree_mod._git(["clone", "--quiet", "--", str(origin), str(mirror)], cwd=None)
+
+        with pytest.raises(tree_mod.TreeError, match="not in the local clone mirror"):
+            tree_mod.ensure_commit_available(mirror, "0" * 40)
+
+    def test_export_tree_lands_exactly_on_the_requested_commit(self, tmp_path):
+        """The happy path still checks out, and the checkout is verified."""
+        repo, commit = self._repo_with_commit(tmp_path)
+        dest = tmp_path / "out"
+        tree_mod.export_tree(repo, commit, dest)
+        assert tree_mod._git(["rev-parse", "HEAD"], cwd=dest).strip() == commit
+
+    def test_export_tree_refuses_a_tree_that_is_not_the_commit(
+        self, tmp_path, monkeypatch
+    ):
+        """A checkout that lands elsewhere is a refusal, never a recorded tree."""
+        dest = tmp_path / "out"
+
+        def fake_git(args, *, cwd):
+            if args[0] == "clone":
+                Path(args[-1]).mkdir(parents=True, exist_ok=True)
+                return ""
+            if args[0] == "rev-parse" and args[1] == "HEAD":
+                return "1111111111111111111111111111111111111111\n"
+            if args[0] == "rev-parse":
+                return "2222222222222222222222222222222222222222\n"
+            return ""
+
+        monkeypatch.setattr(tree_mod, "ensure_commit_available", lambda mirror, commit: None)
+        monkeypatch.setattr(tree_mod, "_git", fake_git)
+
+        with pytest.raises(tree_mod.TreeError, match="checked out"):
+            tree_mod.export_tree(
+                tmp_path / "mirror", "2222222222222222222222222222222222222222", dest
+            )
+
+
 class TestBuildTreesRefusesALeakedOracle:
     """The permanent guard, at the one place both trees are composed."""
 
@@ -1887,6 +2056,47 @@ class TestStripHiddenTests:
         assert report.removed_nodeids == [f"{rel}::TestThing::test_hidden"]
         ast.parse(new)
 
+    def test_a_removed_class_carrying_a_nested_class_gets_no_pass(self, tmp_path):
+        """pandas/90, pandas/158: a nested class's header is dropped with its outer.
+
+        The emptied-class rule used to insert a ``pass`` for the *nested* class too,
+        at the nested body's deeper indent, while the class statement that block
+        belonged to was itself being removed — the file then died ``unexpected
+        indent``. The outer removal already accounts for every line, so nothing is
+        emitted for either class.
+        """
+        rel = "tests/test_x.py"
+        write(
+            tmp_path / rel,
+            "import unittest\n"
+            "\n"
+            "\n"
+            "class TestOuter(unittest.TestCase):\n"
+            "    class TestInner(unittest.TestCase):\n"
+            "        def test_hidden(self):\n"
+            '            self.fail("boom")\n'
+            "\n"
+            "    def test_also_hidden(self):\n"
+            '        self.fail("boom")\n'
+            "\n"
+            "\n"
+            "class TestKept(unittest.TestCase):\n"
+            "    def test_kept(self):\n"
+            "        pass\n",
+        )
+        report = tree_mod.strip_hidden_tests(
+            tmp_path,
+            [f"{rel}::TestOuter"],
+            {rel: {f"{rel}::TestOuter", f"{rel}::TestKept::test_kept"}},
+        )
+        new = (tmp_path / rel).read_text()
+        assert "class TestOuter" not in new
+        assert "class TestInner" not in new
+        assert "class TestKept" in new
+        assert new.count("pass") == 1, "only the kept test's own body survives"
+        assert report.removed_nodeids == [f"{rel}::TestOuter"]
+        ast.parse(new)
+
     def test_missing_nodeid_is_fatal(self, tmp_path):
         """A hidden test the strip cannot find stays visible in Vanta's tree."""
         rel = "tests/test_x.py"
@@ -1930,7 +2140,9 @@ class TestDeclaredFailToPass:
         monkeypatch.setattr(
             prepare_mod,
             "_suite",
-            lambda checkpoint, batch_dir, prep, tree_name, stem_suffix: pairs[tree_name],
+            lambda checkpoint, batch_dir, prep, tree_name, stem_suffix, **kwargs: (
+                pairs[tree_name]
+            ),
         )
 
     def test_the_bug_s_own_file_is_declared_and_anything_else_is_not(self):
@@ -2301,7 +2513,9 @@ class TestUnmeasuredRunRefusal:
         monkeypatch.setattr(
             prepare_mod,
             "_suite",
-            lambda checkpoint, batch_dir, prep, tree_name, stem_suffix: pairs[tree_name],
+            lambda checkpoint, batch_dir, prep, tree_name, stem_suffix, **kwargs: (
+                pairs[tree_name]
+            ),
         )
         bug_prep = prep(
             bug=bug_info(test_file="tests/test_demo.py"),
@@ -5110,6 +5324,22 @@ class TestTheFreezeGatesTheText:
             "tests/test_other.py",
         ]
 
+    def test_declared_test_files_splits_a_semicolon_joined_declaration(self):
+        """fastapi/11's ``bug.info`` names two files in one ``;``-joined token."""
+        both = bug_info(test_file="tests/test_a.py;tests/test_b.py")
+        assert prepare_mod.declared_test_files(both) == [
+            "tests/test_a.py",
+            "tests/test_b.py",
+        ]
+        runner = bug_info(run_test_sh="pytest tests/test_a.py;tests/test_b.py\n")
+        assert prepare_mod.declared_test_files(runner) == [
+            "tests/test_demo.py",
+            "tests/test_a.py",
+            "tests/test_b.py",
+        ]
+        noise = bug_info(run_test_sh="cd tests; pytest tests/test_demo.py\n")
+        assert prepare_mod.declared_test_files(noise) == ["tests/test_demo.py"]
+
     def test_the_gate_strips_a_token_only_the_answer_has(self, tmp_path):
         prep = self._prep(
             tmp_path,
@@ -5592,6 +5822,59 @@ class TestTheHintsAreKeptOutOfTheDefaultPrompt:
         bug_prep = self._prep_with_issue()
         assert runner_mod.issue_text_for(bug_prep, show_hints=True) == bug_prep.issue.text
 
+    def test_the_flag_absent_reads_the_committed_directory(self, tmp_path, monkeypatch):
+        """No ``--issues-dir`` is today's path, byte-for-byte (§2.4): the dev split omits it.
+
+        ``issues_dir=None`` must read ``issue_source.ISSUES_DIR`` — the committed
+        ``plans/bugsinpy_issues`` — and nothing about the read may change. This is the
+        same directory the two hint tests above read; here it is named explicitly so the
+        flag-absent case is pinned as *that* path rather than merely "some path".
+        """
+        issues = tmp_path / "issues"
+        self._frozen(issues, comments=self._hints())
+        monkeypatch.setattr(source_mod, "ISSUES_DIR", issues)
+        bug_prep = self._prep_with_issue()
+        text = runner_mod.issue_text_for(bug_prep, show_hints=True, issues_dir=None)
+        assert "the cause is parse_with_dots in pkg/mod.py" in text
+        # With the default, the batch premise is not a requirement and never refuses.
+        runner_mod.require_frozen_issues([bug_prep], issues_dir=None)
+
+    def test_the_flag_reads_the_directory_it_names(self, tmp_path, monkeypatch):
+        """With the flag given, the hints come from THAT directory, not the committed one."""
+        committed = tmp_path / "committed"
+        heldout = tmp_path / "heldout"
+        self._frozen(committed, comments=[])  # committed has no hints
+        self._frozen(heldout, comments=self._hints())  # the named directory does
+        monkeypatch.setattr(source_mod, "ISSUES_DIR", committed)
+        bug_prep = self._prep_with_issue()
+        runner_mod.require_frozen_issues([bug_prep], issues_dir=heldout)
+        text = runner_mod.issue_text_for(bug_prep, show_hints=True, issues_dir=heldout)
+        assert "the cause is parse_with_dots in pkg/mod.py" in text
+
+    def test_a_report_missing_under_the_flag_refuses_the_bug_by_name(
+        self, tmp_path, monkeypatch
+    ):
+        """``--issues-dir`` is a REQUIREMENT, not a hint (§2.4): a miss refuses, never falls back.
+
+        The bug is named so an operator reads which freeze is missing; and the populated
+        committed default is never consulted to paper over the gap, nor is a report
+        re-fetched live. Both entry points — the per-row hints read and the batch premise
+        check — refuse the same way.
+        """
+        committed = tmp_path / "committed"
+        self._frozen(committed, comments=self._hints())
+        monkeypatch.setattr(source_mod, "ISSUES_DIR", committed)
+        bug_prep = self._prep_with_issue()
+        empty = tmp_path / "heldout"
+        empty.mkdir()
+        with pytest.raises(runner_mod.RunnerError, match="Demo/1") as hints:
+            runner_mod.issue_text_for(bug_prep, show_hints=True, issues_dir=empty)
+        assert str(empty) in str(hints.value)
+        assert "never falls back" in str(hints.value)
+        with pytest.raises(runner_mod.RunnerError, match="Demo/1") as batch:
+            runner_mod.require_frozen_issues([bug_prep], issues_dir=empty)
+        assert str(empty) in str(batch.value)
+
 
 # ============================================================================
 # shuru.py — how an argv becomes a guest shell line (no VM)
@@ -5862,6 +6145,64 @@ class TestShuruRunMemory:
         assert shuru_mod.DEFAULT_RUN_MEMORY_MB == 2048, "shuru's own run default"
 
 
+class TestShuruMountMode:
+    """``--mount``'s mode must agree with ``--allow-host-writes``, or shuru refuses the boot.
+
+    [VANTA-WHY] M3 item P2. shuru's ``--mount <HOST:GUEST[:ro|:rw]>`` **defaults to
+    ``ro``**, and a ``:rw`` mount is only legal together with ``--allow-host-writes``.
+    ``run`` used to spell ``:rw`` unconditionally while adding the flag only when
+    writes were allowed, so its one read-only caller — the version probe (B7), the
+    reason the parameter exists — sent an argv shuru rejects *before booting anything*:
+
+        Error: read-write mount '<tree>:/workspace:rw' requires --allow-host-writes flag
+
+    Measured against pandas/1's ``vanta_tree``: exit code 1, empty stdout, no VM, so
+    the probe reported "could not be measured" and the pin was never frozen. The unit
+    test that covers the probe stubs ``shuru.run`` and so never saw the argv; these
+    assert the argv itself, which is the only place the two spellings can disagree.
+    """
+
+    def _argv(self, monkeypatch, **over):
+        seen: dict = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = args
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        monkeypatch.setattr(shuru_mod, "_shuru_bin", lambda: "/usr/bin/shuru")
+        monkeypatch.setattr(shuru_mod.subprocess, "run", fake_run)
+        args = dict(
+            checkpoint="vanta-bi-Demo-1",
+            host_root=Path.cwd(),
+            command=["python", "-c", "pass"],
+            disk_mb=8192,
+        )
+        args.update(over)
+        result = shuru_mod.run(**args)
+        assert result.ok
+        return seen["args"]
+
+    @staticmethod
+    def _mount(argv) -> str:
+        return argv[argv.index("--mount") + 1]
+
+    def test_a_read_only_run_mounts_read_only_and_passes_no_write_flag(self, monkeypatch):
+        argv = self._argv(monkeypatch, allow_host_writes=False)
+        assert self._mount(argv).endswith(":/workspace:ro")
+        assert "--allow-host-writes" not in argv
+
+    def test_a_writable_run_mounts_rw_and_passes_the_flag(self, monkeypatch):
+        argv = self._argv(monkeypatch, allow_host_writes=True)
+        assert self._mount(argv).endswith(":/workspace:rw")
+        assert "--allow-host-writes" in argv
+
+    def test_the_default_mount_is_writable(self, monkeypatch):
+        """Every caller but the probe keeps the argv it always had."""
+        argv = self._argv(monkeypatch)
+        assert self._mount(argv).endswith(":/workspace:rw")
+        assert "--allow-host-writes" in argv
+
+
 # ============================================================================
 # suite.py — command construction and report reading (no VM)
 # ============================================================================
@@ -5981,6 +6322,24 @@ class TestSuiteCommand:
         with pytest.raises(suite_mod.SuiteError, match="placeholder"):
             suite_mod.build_command(["python", "-m", "pytest", "tests"], "/workspace/r.json")
 
+    def test_it_appends_the_set_aside_files_as_ignores(self):
+        """M3 §8.6 round 12 (item 1) — the collect gate's set-aside list reaches the run."""
+        cmd = suite_mod.build_command(
+            ["python", "-m", "pytest", "tests", "--json-report-file={report}"],
+            "/workspace/reports/a.json",
+            ["test/_side.py", "test/other.py"],
+        )
+        assert cmd[-2:] == ["--ignore=test/_side.py", "--ignore=test/other.py"]
+
+    def test_no_set_aside_files_keeps_the_command_unchanged(self):
+        """Every bug whose strict gate passed has an empty list, so nothing is appended."""
+        cmd = suite_mod.build_command(
+            ["python", "-m", "pytest", "tests", "--json-report-file={report}"],
+            "/workspace/reports/a.json",
+        )
+        assert cmd[-1] == "--json-report-file=/workspace/reports/a.json"
+        assert not any(part.startswith("--ignore=") for part in cmd)
+
 
 class TestPrecompileLines:
     """The step that runs before pytest in *every* VM run of a bug with the rule (§3.4).
@@ -6020,6 +6379,342 @@ class TestPrecompileLines:
             ["pkg/a b.py"], ["python", "-m", "pytest", "t"]
         )[0]
         assert "'pkg/a b.py'" in line
+
+
+def _alive(pid: int) -> bool:
+    """Whether *pid* still exists (``kill(pid, 0)``, the portable probe)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # pragma: no cover - a live process we may not signal
+        return True
+    return True
+
+
+class TestExitPluginScript:
+    """The run-time exit plugin that ends pytest's own interpreter (§8.6 round 13).
+
+    [VANTA-WHY] luigi/8, 9, 11 and 12 (round 12) start a non-daemon worker thread in
+    their own ``test/worker_test.py`` and never stop it, so ``python`` blocked in
+    interpreter shutdown *after* pytest had written its report and printed its
+    summary. The harness measures a run by the markers the script prints after the
+    pytest command returns, so those markers never arrived and every run was
+    recorded as "timed out (hit the cap)" with ``run_secs=null`` — a complete,
+    readable report beside a null measurement.
+
+    These tests pin the four properties that make the fix both safe and effective:
+    the plugin is staged outside the tree, the command registers it, the staging is
+    outside the measured window, and it moves neither the report nor the exit code.
+    The last two run pytest in a child process — the only way to prove neutrality
+    and the only way to reproduce a *lingering* thread.
+    """
+
+    LINGERING_THREAD = (
+        "import threading, time\n"
+        "def _spin():\n"
+        "    time.sleep(300)\n"
+        "def test_x():\n"
+        "    threading.Thread(target=_spin).start()\n"
+        "    assert True\n"
+    )
+
+    FORKED_CHILDREN = (
+        "import multiprocessing, os, subprocess, sys, threading, time\n"
+        "def _spin():\n"
+        "    time.sleep(300)\n"
+        "def test_children():\n"
+        "    ctx = multiprocessing.get_context('fork')\n"
+        "    manager = ctx.Manager()\n"
+        "    manager.dict()\n"
+        "    threading.Thread(target=_spin).start()\n"
+        "    pids = [child.pid for child in multiprocessing.active_children()]\n"
+        "    pids.append(subprocess.Popen(\n"
+        "        [sys.executable, '-c', 'import time; time.sleep(300)']).pid)\n"
+        "    pid = os.fork()\n"
+        "    if pid == 0:\n"
+        "        time.sleep(300)\n"
+        "        os._exit(0)\n"
+        "    pids.append(pid)\n"
+        "    with open('children.txt', 'w') as fh:\n"
+        "        fh.write(' '.join(str(p) for p in pids))\n"
+        "    assert manager is not None\n"
+    )
+    """Reproduces the round-13 regression with all three of its faces.
+
+    [VANTA-WHY] The Linux VM's ``multiprocessing`` default start method is
+    ``fork``, so luigi's ``mock.py`` ``Manager()`` server is a *forked* child that
+    inherits pytest fd-capture's non-``CLOEXEC`` ``os.dup`` of the run's real
+    stdout/stderr and therefore holds the pipe the host reads to EOF. macOS's
+    default is ``spawn`` (a ``Popen`` that closes fds), so the fork context is
+    requested explicitly. The three faces the toy covers are the ones normal
+    shutdown handles but ``os._exit`` does not: the **daemon Manager** (terminated
+    by ``multiprocessing``'s ``atexit`` hook, skipped by ``os._exit``), the
+    **non-daemon thread** (waited for by interpreter shutdown, which ``os._exit``
+    bypasses), and the **raw ``os.fork`` grandchild** (invisible to
+    ``multiprocessing``, so nothing reaped it in either round). The bare ``Popen``
+    sleeper covers the grandchild case that is also in the group.
+    """
+
+    @staticmethod
+    def _script(cmd: str = "python -m pytest tests") -> str:
+        return suite_mod._run_script(
+            "1", cmd, (), ["python", "-m", "pytest", "tests"]
+        )
+
+    @staticmethod
+    def _plugin_dir() -> Path:
+        return Path(suite_mod.__file__).resolve().parent
+
+    @classmethod
+    def _child_env(cls, *, plugin: bool) -> dict[str, str]:
+        """The environment a child pytest runs in, with the plugin importable.
+
+        ``PYTEST_PLUGINS``/``PYTEST_ADDOPTS`` are dropped because the *outer* run's
+        configuration must not leak; ``PYTHONPATH`` names the directory the plugin
+        file sits in, exactly as the staged guest directory does.
+        """
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in ("PYTEST_PLUGINS", "PYTEST_ADDOPTS")
+        }
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        if plugin:
+            existing = env.get("PYTHONPATH")
+            here = str(cls._plugin_dir())
+            env["PYTHONPATH"] = here if not existing else here + os.pathsep + existing
+        return env
+
+    @classmethod
+    def _child_command(cls, test_file: str, *, plugin: bool) -> list[str]:
+        cmd = [
+            sys.executable,
+            "-m",
+            "pytest",
+            test_file,
+            "-p",
+            "no:cacheprovider",
+            "--json-report",
+            "--json-report-file=report.json",
+            "-q",
+        ]
+        if plugin:
+            cmd += ["-p", suite_mod.EXIT_PLUGIN_NAME]
+        return cmd
+
+    def test_the_script_stages_the_plugin_outside_the_tree(self):
+        script = self._script()
+        source = suite_mod.EXIT_PLUGIN_SOURCE.read_text(encoding="utf-8").rstrip("\n")
+
+        assert suite_mod.EXIT_PLUGIN_GUEST_DIR.startswith("/tmp/"), (
+            "the plugin is staged in the guest's temp dir: not the tree the Creator "
+            "reads, and not the layer a re-bake would have to rebuild"
+        )
+        assert f"mkdir -p {suite_mod.EXIT_PLUGIN_GUEST_DIR}" in script
+        assert f"<<'{suite_mod.EXIT_PLUGIN_HEREDOC}'" in script, (
+            "a QUOTED heredoc, so nothing inside the source is expanded"
+        )
+        assert script.count(suite_mod.EXIT_PLUGIN_HEREDOC) == 2, "the heredoc opens and closes"
+        assert source in script, "the plugin's own bytes are what the guest receives"
+
+    def test_the_staging_precedes_the_measured_window(self):
+        script = self._script()
+        assert script.index(suite_mod.EXIT_PLUGIN_GUEST_DIR) < script.index("__VANTA_T0_1__="), (
+            "staging a file is not part of the run this harness measures: it must not "
+            "fall inside the clock the derived cap is computed from"
+        )
+
+    def test_the_command_registers_the_plugin(self):
+        script = self._script("python -m pytest tests")
+        assert f"\npython -m pytest tests -p {suite_mod.EXIT_PLUGIN_NAME}\n" in script, (
+            "the pytest command carries the registration; `cmd` is an already-quoted "
+            "string, so the flag is appended to it"
+        )
+
+    def test_pythonpath_keeps_the_projects_own_entry(self):
+        script = self._script()
+        assert (
+            'export PYTHONPATH="'
+            + suite_mod.EXIT_PLUGIN_GUEST_DIR
+            + '${PYTHONPATH:+:$PYTHONPATH}"'
+        ) in script, (
+            "the project's own PYTHONPATH (fastapi/2's ./docs_src, recorded per "
+            "commit) is preserved: the plugin's directory is prepended to it, never "
+            "substituted for it. The ``:+`` form adds nothing when PYTHONPATH is "
+            "unset or empty, where a bare trailing ':' would append an empty entry "
+            "the interpreter reads as the current directory."
+        )
+
+    def test_the_staged_plugin_compiles(self):
+        source = suite_mod.EXIT_PLUGIN_SOURCE.read_text(encoding="utf-8")
+        compile(source, suite_mod.EXIT_PLUGIN_SOURCE.name, "exec")
+
+    def test_a_lingering_worker_thread_no_longer_holds_the_interpreter(self, tmp_path):
+        """The regression itself: the thread is still running when the process ends."""
+        (tmp_path / "test_hang.py").write_text(self.LINGERING_THREAD, encoding="utf-8")
+
+        with pytest.raises(subprocess.TimeoutExpired):
+            subprocess.run(
+                self._child_command("test_hang.py", plugin=False),
+                cwd=tmp_path,
+                env=self._child_env(plugin=False),
+                capture_output=True,
+                timeout=5,
+            )
+        # …and with the plugin the run ends as soon as its report is on disk.
+        started = time.monotonic()
+        proc = subprocess.run(
+            self._child_command("test_hang.py", plugin=True),
+            cwd=tmp_path,
+            env=self._child_env(plugin=True),
+            capture_output=True,
+            timeout=30,
+        )
+        elapsed = time.monotonic() - started
+        assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")[-2000:]
+        assert elapsed < 20, (
+            f"the plugin must end the interpreter promptly; this took {elapsed:.1f}s, so "
+            "the thread is still being waited for"
+        )
+        summary = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))["summary"]
+        assert summary["passed"] == 1, "the report is complete and written before the exit"
+
+    def test_the_plugin_reaps_its_own_process_group(self):
+        """Structural: the cleanup no longer depends on ``atexit``.
+
+        [VANTA-WHY] The round-13 regression was that ``os._exit`` skipped
+        ``atexit``, so ``multiprocessing``'s exit hook never terminated the
+        children that held the run's pipe. The replacement has to create its own
+        group, leave that group (``setsid``) before signalling it, escalate
+        ``SIGTERM``→``SIGKILL``, and say so on stderr when it cannot.
+        """
+        source = suite_mod.EXIT_PLUGIN_SOURCE.read_text(encoding="utf-8")
+        assert "os.setpgrp()" in source, "the run gets a group of its own"
+        assert "os.killpg(" in source, "the whole group is signalled, not one child"
+        assert "signal.SIGTERM" in source and "signal.SIGKILL" in source
+        assert "os.setsid()" in source, (
+            "the reaper must leave the group before it signals the group, or it "
+            "kills itself"
+        )
+        assert "__VANTA_PGRP_FALLBACK__" in source, (
+            "a run that cannot take the group path must be loud, so its frequency "
+            "is observable in the next prepare"
+        )
+        assert "multiprocessing.active_children()" in source, "the documented fallback"
+
+    def test_forked_children_holding_the_pipe_no_longer_stall_the_run(self, tmp_path):
+        """The round-13 regression itself: a *forked* ``Manager`` server holds the pipe.
+
+        Without the plugin, pytest finishes and writes its report, but the forked
+        ``Manager`` server keeps the fd-capture dup of stdout/stderr open, so
+        ``subprocess.run(capture_output=True)`` waits until the timeout — exactly
+        what the host-side reader does. With the plugin the reaper kills the group
+        and the run returns at once, leaving no descendant behind.
+        """
+        if not hasattr(os, "fork"):  # pragma: no cover - POSIX-only reproduction
+            pytest.skip("no os.fork on this platform")
+        (tmp_path / "test_children.py").write_text(self.FORKED_CHILDREN, encoding="utf-8")
+        try:
+            with pytest.raises(subprocess.TimeoutExpired):
+                subprocess.run(
+                    self._child_command("test_children.py", plugin=False),
+                    cwd=tmp_path,
+                    env=self._child_env(plugin=False),
+                    capture_output=True,
+                    timeout=5,
+                )
+
+            started = time.monotonic()
+            proc = subprocess.run(
+                self._child_command("test_children.py", plugin=True),
+                cwd=tmp_path,
+                env=self._child_env(plugin=True),
+                capture_output=True,
+                timeout=30,
+            )
+            elapsed = time.monotonic() - started
+            stderr = proc.stderr.decode("utf-8", "replace")
+            assert proc.returncode == 0, stderr[-2000:]
+            assert "__VANTA_PGRP_FALLBACK__" not in stderr, (
+                "the group path must be the one taken, not the fallback"
+            )
+            assert elapsed < 20, (
+                f"the reaper must end the run promptly; this took {elapsed:.1f}s, so "
+                "a forked child is still holding the pipe"
+            )
+            summary = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))["summary"]
+            assert summary["passed"] == 1, "the report is complete and written before the exit"
+
+            children = [
+                int(pid) for pid in (tmp_path / "children.txt").read_text().split()
+            ]
+            assert children, "the toy recorded the children it started"
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and any(_alive(pid) for pid in children):
+                time.sleep(0.1)
+            assert not any(_alive(pid) for pid in children), (
+                "every process the run started must be gone once its report is on disk"
+            )
+        finally:
+            self._kill_recorded(tmp_path / "children.txt")
+
+    @staticmethod
+    def _kill_recorded(path: Path) -> None:
+        """Best-effort cleanup so a failing assertion cannot leak a sleeping child."""
+        try:
+            pids = [int(pid) for pid in path.read_text().split()]
+        except (OSError, ValueError):
+            return
+        for pid in pids:
+            if _alive(pid):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(pid, signal.SIGKILL)
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "def test_a():\n    assert True\n\ndef test_b():\n    assert True\n",
+            "def test_a():\n    assert True\n\ndef test_b():\n    assert False\n",
+        ],
+        ids=["clean-exit", "one-failure"],
+    )
+    def test_the_plugin_moves_neither_the_report_nor_the_exit_code(self, tmp_path, source):
+        """Neutrality, both directions: the same status and the same outcomes."""
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        (plain / "test_sample.py").write_text(source, encoding="utf-8")
+        with_plugin = tmp_path / "with_plugin"
+        with_plugin.mkdir()
+        (with_plugin / "test_sample.py").write_text(source, encoding="utf-8")
+
+        runs = {}
+        for name, directory, plugin in (
+            ("plain", plain, False),
+            ("plugin", with_plugin, True),
+        ):
+            proc = subprocess.run(
+                self._child_command("test_sample.py", plugin=plugin),
+                cwd=directory,
+                env=self._child_env(plugin=plugin),
+                capture_output=True,
+                timeout=60,
+            )
+            report = json.loads((directory / "report.json").read_text(encoding="utf-8"))
+            runs[name] = (
+                proc.returncode,
+                {test["nodeid"]: test["outcome"] for test in report["tests"]},
+                report["summary"],
+            )
+
+        assert runs["plugin"][0] == runs["plain"][0], (
+            "the exit code is pytest's own status in both runs: the plugin reports the "
+            "status pytest was about to exit with, it does not invent one"
+        )
+        assert runs["plugin"][1] == runs["plain"][1], "the per-test outcomes are identical"
+        assert runs["plugin"][2] == runs["plain"][2], "the summary counts are identical"
 
 
 class TestSuiteReport:
@@ -6218,6 +6913,2314 @@ class TestSuitePair:
         pair = self._pair({"a": "failed"}, {"a": "error"})
         assert pair.stable_failures == set()
         assert pair.stable_collected == set()
+
+
+class TestProbeXdist:
+    """M3 item S4 — the xdist equivalence probe's pure parts.
+
+    [VANTA-WHY] S4 enables xdist nowhere; its whole value is a *reading* of whether
+    ``-n auto`` moves any nodeid's outcome. That reading is made in one pure
+    function (``outcome_diff``) and written by one pure function
+    (``verdict_line``), and both are where a mistake would hide: comparing counts
+    instead of nodeids would report "identical" for a swap, and reducing outcomes
+    to pass/fail would report "identical" for a test that moved between ``skipped``
+    and ``failed``. These tests pin those two rules, plus the offline wheel checks
+    the probe refuses on. Nothing here boots a VM.
+    """
+
+    @staticmethod
+    def _report(**over):
+        base = {
+            "bug": "PySnooper/3",
+            "verdict": probe_xdist_mod.VERDICT_IDENTICAL,
+            "excluded_flaky": 0,
+            "serial": {"collected": 2},
+            "xdist": {"collected": 2},
+            "diff": {
+                "identical": True,
+                "only_in_serial": [],
+                "only_in_xdist": [],
+                "different_outcome": [],
+            },
+            "note": "",
+        }
+        base.update(over)
+        return base
+
+    # -- outcome_diff -------------------------------------------------------
+    def test_outcome_diff_identical(self):
+        outcomes = {"t::a": "passed", "t::b": "failed"}
+        assert probe_xdist_mod.outcome_diff(outcomes, dict(outcomes)) == {
+            "identical": True,
+            "only_in_serial": [],
+            "only_in_xdist": [],
+            "different_outcome": [],
+        }
+
+    def test_outcome_diff_only_in_serial(self):
+        diff = probe_xdist_mod.outcome_diff(
+            {"t::a": "passed", "t::b": "passed"}, {"t::a": "passed"}
+        )
+        assert diff["only_in_serial"] == ["t::b"]
+        assert diff["only_in_xdist"] == []
+        assert diff["different_outcome"] == []
+        assert diff["identical"] is False
+
+    def test_outcome_diff_only_in_xdist(self):
+        diff = probe_xdist_mod.outcome_diff(
+            {"t::a": "passed"}, {"t::a": "passed", "t::b": "passed"}
+        )
+        assert diff["only_in_xdist"] == ["t::b"]
+        assert diff["only_in_serial"] == []
+        assert diff["identical"] is False
+
+    def test_outcome_diff_different_outcome_lands_only_there(self):
+        diff = probe_xdist_mod.outcome_diff({"t::a": "passed"}, {"t::a": "failed"})
+        # a nodeid on both sides with different outcomes is *only* in the third list
+        assert diff["different_outcome"] == ["t::a"]
+        assert diff["only_in_serial"] == []
+        assert diff["only_in_xdist"] == []
+        assert diff["identical"] is False
+
+    def test_outcome_diff_drops_excluded_from_both_sides(self):
+        diff = probe_xdist_mod.outcome_diff(
+            {"t::a": "passed", "t::flaky": "failed"},
+            {"t::a": "passed", "t::flaky": "passed"},
+            excluded={"t::flaky"},
+        )
+        assert diff["identical"] is True
+        assert diff["different_outcome"] == []
+
+    def test_outcome_diff_compares_outcomes_raw(self):
+        # skipped -> passed, and xfailed -> passed, are both *movement*
+        diff = probe_xdist_mod.outcome_diff(
+            {"t::skip": "skipped", "t::xf": "xfailed", "t::err": "error"},
+            {"t::skip": "passed", "t::xf": "passed", "t::err": "error"},
+        )
+        assert diff["different_outcome"] == ["t::skip", "t::xf"]
+        assert diff["identical"] is False
+
+    def test_outcome_diff_lists_are_sorted(self):
+        diff = probe_xdist_mod.outcome_diff(
+            {"t::z": "passed", "t::a": "passed"}, {"t::z": "passed"}
+        )
+        assert diff["only_in_serial"] == ["t::a"]
+
+    # -- verdict_line -------------------------------------------------------
+    def test_verdict_line_identical_names_verdict_and_counts(self):
+        line = probe_xdist_mod.verdict_line(self._report())
+        assert line.startswith("probe-xdist PySnooper/3: identical")
+        assert "serial 2" in line and "xdist 2" in line
+        assert "[" not in line  # nothing differs, so no nodeid list
+
+    def test_verdict_line_different_lists_the_nodeids(self):
+        report = self._report(
+            verdict=probe_xdist_mod.VERDICT_DIFFERENT,
+            diff={
+                "identical": False,
+                "only_in_serial": ["t::gone"],
+                "only_in_xdist": ["t::new"],
+                "different_outcome": ["t::moved"],
+            },
+        )
+        line = probe_xdist_mod.verdict_line(report)
+        assert line.startswith("probe-xdist PySnooper/3: not_identical")
+        assert "t::gone" in line and "t::new" in line and "t::moved" in line
+        assert "only_in_serial=1" in line
+
+    def test_verdict_line_caps_and_counts_the_remainder(self):
+        report = self._report(
+            verdict=probe_xdist_mod.VERDICT_DIFFERENT,
+            diff={
+                "identical": False,
+                "only_in_serial": [f"t::{i}" for i in range(8)],
+                "only_in_xdist": [],
+                "different_outcome": [],
+            },
+        )
+        line = probe_xdist_mod.verdict_line(report, cap=3)
+        assert "t::0" in line and "t::2" in line
+        assert "t::3" not in line
+        assert "+5 more" in line
+
+    def test_verdict_line_unavailable_carries_the_note(self):
+        report = self._report(
+            verdict=probe_xdist_mod.VERDICT_UNAVAILABLE,
+            note="no importable xdist and no wheel dir",
+        )
+        line = probe_xdist_mod.verdict_line(report)
+        assert line.startswith("probe-xdist PySnooper/3: unavailable")
+        assert "no importable xdist" in line
+
+    # -- wheel metadata -----------------------------------------------------
+    def test_requires_dist_reads_the_lines(self):
+        metadata = (
+            "Metadata-Version: 2.1\n"
+            "Name: pytest-xdist\n"
+            "Requires-Dist: pytest>=7.0\n"
+            "Requires-Dist: execnet>=2.1\n"
+            "Classifier: x\n"
+        )
+        assert probe_xdist_mod.requires_dist(metadata) == ["pytest>=7.0", "execnet>=2.1"]
+
+    def test_requirement_for_matches_case_insensitively(self):
+        assert (
+            probe_xdist_mod.requirement_for(["execnet>=2.1", "Pytest>=7.0"], "pytest")
+            == "Pytest>=7.0"
+        )
+
+    def test_requirement_for_skips_unparsable_and_returns_none(self):
+        assert probe_xdist_mod.requirement_for(["<nonsense", "execnet"], "pytest") is None
+
+    def test_requirement_satisfied_pandas_case(self):
+        # pandas/1's checkpoint installs pytest==5.4.2; an xdist built for >=7 cannot load
+        assert probe_xdist_mod.requirement_satisfied("pytest>=7.0", "5.4.2") is False
+        assert probe_xdist_mod.requirement_satisfied("pytest>=5", "5.4.2") is True
+
+    def test_requirement_satisfied_unreadable_is_none(self):
+        assert probe_xdist_mod.requirement_satisfied(None, "5.4.2") is None
+        assert probe_xdist_mod.requirement_satisfied("pytest>=7.0", None) is None
+        assert probe_xdist_mod.requirement_satisfied("pytest>=7.0", "not-a-version") is None
+
+    def test_metadata_of_reads_a_wheel(self, tmp_path):
+        wheel = tmp_path / "xdist-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr(
+                "xdist-1.0.dist-info/METADATA",
+                "Name: pytest-xdist\nRequires-Dist: pytest>=7.0\n",
+            )
+        assert "pytest>=7.0" in probe_xdist_mod.metadata_of(wheel)
+
+    def test_metadata_of_refuses_a_wheel_without_metadata(self, tmp_path):
+        wheel = tmp_path / "bare-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("bare/__init__.py", "x = 1\n")
+        with pytest.raises(shuru_mod.ShuruError):
+            probe_xdist_mod.metadata_of(wheel)
+
+    def test_unpack_wheels_refuses_an_escaping_member(self, tmp_path):
+        wheel = tmp_path / "bad-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("../escape.py", "x = 1\n")
+        with pytest.raises(shuru_mod.ShuruError):
+            probe_xdist_mod.unpack_wheels([wheel], tmp_path / "stage", root=tmp_path)
+
+    def test_unpack_wheels_publishes_importable_files(self, tmp_path):
+        wheel = tmp_path / "xdist-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("xdist/__init__.py", "__version__ = '1.0'\n")
+            archive.writestr("xdist-1.0.dist-info/METADATA", "Name: pytest-xdist\n")
+        dest = tmp_path / "stage"
+        assert probe_xdist_mod.unpack_wheels([wheel], dest, root=tmp_path) == [wheel.name]
+        assert (dest / "xdist" / "__init__.py").is_file()
+
+    def test_unpack_wheels_clears_a_stale_staging_directory(self, tmp_path):
+        """[VANTA-WHY] M3 item U9 — the staging directory is CLEARED, not merged.
+
+        ``dest`` goes on ``PYTHONPATH`` and ``extractall`` only ever adds files, so a
+        wheel staged by a previous probe run keeps its packages there. A run whose wheel
+        set changed (or whose wheel was removed) would then import a stale plugin from a
+        directory the operator no longer names.
+        """
+        dest = tmp_path / "stage"
+        stale = dest / "stale_plugin"
+        stale.mkdir(parents=True)
+        (stale / "__init__.py").write_text("__version__ = '0.0'\n", encoding="utf-8")
+        wheel = tmp_path / "xdist-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("xdist/__init__.py", "__version__ = '1.0'\n")
+        assert probe_xdist_mod.unpack_wheels([wheel], dest, root=tmp_path) == [wheel.name]
+        assert not stale.exists(), "a stale package from a prior run must not survive"
+        assert (dest / "xdist" / "__init__.py").is_file()
+
+    # -- V5: the clear-and-extract is confined to the batch directory -------
+    def test_unpack_wheels_refuses_a_destination_outside_the_root(self, tmp_path):
+        """[VANTA-WHY] M3 item V5 — the clear only ever runs inside ``root``."""
+        wheel = tmp_path / "xdist-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("xdist/__init__.py", "__version__ = '1.0'\n")
+        outside = tmp_path / "outside" / "stage"
+        with pytest.raises(shuru_mod.ShuruError):
+            probe_xdist_mod.unpack_wheels([wheel], outside, root=tmp_path / "batch")
+        assert not (tmp_path / "outside").exists(), "nothing may be created outside root"
+
+    def test_unpack_wheels_refuses_a_symlinked_component_under_the_root(self, tmp_path):
+        """[VANTA-WHY] M3 item V5 — a planted symlink cannot move the cleanup out.
+
+        ``rmtree`` follows symlinks, so ``probe_xdist`` being a link would send the clear
+        into whatever it points at. The component is refused and the target survives.
+        """
+        root = tmp_path / "batch"
+        root.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        (elsewhere / "keep").mkdir(parents=True)
+        sentinel = elsewhere / "keep" / "file.txt"
+        sentinel.write_text("must survive\n", encoding="utf-8")
+        (root / "probe_xdist").symlink_to(elsewhere, target_is_directory=True)
+        wheel = tmp_path / "xdist-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("xdist/__init__.py", "__version__ = '1.0'\n")
+        dest = root / "probe_xdist" / "Demo_1" / "_wheels"
+        with pytest.raises(shuru_mod.ShuruError):
+            probe_xdist_mod.unpack_wheels([wheel], dest, root=root)
+        assert sentinel.is_file(), "the symlink target must not have been cleared"
+        assert not (elsewhere / "Demo_1").exists(), "nothing may be extracted there"
+
+    # -- V5: the wheel directory the operator names -------------------------
+    @staticmethod
+    def _staged_wheel(dir_path, *, requires: str = "pytest>=7.0"):
+        wheel = dir_path / "xdist-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("xdist/__init__.py", "__version__ = '1.0'\n")
+            archive.writestr(
+                "xdist-1.0.dist-info/METADATA",
+                f"Name: pytest-xdist\nRequires-Dist: {requires}\n",
+            )
+        return wheel
+
+    def _resolve_staged(self, batch_dir, monkeypatch, *, wheel_dir, dry_run, pytest_version):
+        monkeypatch.setattr(
+            probe_xdist_mod,
+            "_preflight",
+            lambda **kwargs: {"pytest": pytest_version, "xdist": None, "python": "3.10"},
+        )
+        args = SimpleNamespace(xdist_wheel_dir=wheel_dir, dry_run=dry_run)
+        return probe_xdist_mod._resolve_xdist(
+            args,
+            checkpoint="ckpt",
+            interpreter="python3",
+            batch_dir=batch_dir,
+            tree_rel="worktrees/Demo_1/src_buggy",
+            disk_mb=16384,
+            memory_mb=8192,
+            sandbox_env={},
+        )
+
+    def test_a_dry_run_reads_wheel_metadata_without_unpacking(self, tmp_path, monkeypatch):
+        """[VANTA-WHY] M3 item V5 — resolving the plan is a pure read.
+
+        ``_run_bug`` resolves xdist *before* its ``--dry-run`` branch, so when the wheels
+        were unpacked inside ``_resolve_xdist`` a dry run cleared and rewrote
+        ``<batch>/probe_xdist/<tree>/_wheels`` — the opposite of what ``--dry-run``
+        documents. Nothing about the plan needs the unpack: the pytest requirement comes
+        straight out of each wheel's ``METADATA``.
+        """
+        wheels_dir = tmp_path / "wheels"
+        wheels_dir.mkdir()
+        wheel = self._staged_wheel(wheels_dir)
+        block = self._resolve_staged(
+            tmp_path, monkeypatch, wheel_dir=wheels_dir, dry_run=True, pytest_version="8.0.2"
+        )
+        assert block["source"] == probe_xdist_mod.SOURCE_STAGED_WHEEL
+        assert block["wheels"] == [wheel.name]
+        assert block["stance"][wheel.name]["satisfied"] is True
+        assert not (tmp_path / "probe_xdist").exists(), (
+            "a dry run must not create the staging directory"
+        )
+
+    def test_the_staging_directory_is_unpacked_only_when_the_run_will_boot(
+        self, tmp_path, monkeypatch
+    ):
+        """The complement of the dry run: a real run still stages the wheels."""
+        wheels_dir = tmp_path / "wheels"
+        wheels_dir.mkdir()
+        self._staged_wheel(wheels_dir)
+        block = self._resolve_staged(
+            tmp_path, monkeypatch, wheel_dir=wheels_dir, dry_run=False, pytest_version="8.0.2"
+        )
+        staging = tmp_path / "probe_xdist" / "Demo_1" / "_wheels"
+        assert block["source"] == probe_xdist_mod.SOURCE_STAGED_WHEEL
+        assert block["staging"] == str(staging)
+        assert (staging / "xdist" / "__init__.py").is_file()
+        assert block["extra_env"]["PYTHONPATH"] == "/workspace/probe_xdist/Demo_1/_wheels"
+
+    def test_an_unusable_wheel_set_leaves_the_batch_untouched(self, tmp_path, monkeypatch):
+        """The stance loop reads METADATA only, so an unsatisfiable wheel set is refused
+        before anything is written — not after it has been staged."""
+        wheels_dir = tmp_path / "wheels"
+        wheels_dir.mkdir()
+        self._staged_wheel(wheels_dir, requires="pytest>=99.0")
+        block = self._resolve_staged(
+            tmp_path, monkeypatch, wheel_dir=wheels_dir, dry_run=False, pytest_version="8.0.2"
+        )
+        assert block["source"] is None
+        assert "pytest>=99.0" in block["reason"]
+        assert not (tmp_path / "probe_xdist").exists(), (
+            "an unusable wheel set must not have been staged"
+        )
+
+    def test_resolve_xdist_refuses_a_wheel_dir_inside_the_staging_area(
+        self, tmp_path, monkeypatch
+    ):
+        """[VANTA-WHY] M3 item V5 — the staging area is where ``unpack_wheels`` clears."""
+        inside = tmp_path / "probe_xdist" / "Demo_1" / "_wheels"
+        inside.mkdir(parents=True)
+        with pytest.raises(shuru_mod.ShuruError) as caught:
+            self._resolve_staged(
+                tmp_path, monkeypatch, wheel_dir=inside, dry_run=True, pytest_version="8.0.2"
+            )
+        assert "staging area" in str(caught.value)
+
+    def test_resolve_xdist_refuses_a_symlinked_wheel_dir(self, tmp_path, monkeypatch):
+        """[VANTA-WHY] M3 item V5 — the containment test uses resolved paths, so a link
+        into the staging area would read as a directory outside it; the link is refused
+        instead of followed."""
+        real = tmp_path / "wheels"
+        real.mkdir()
+        link = tmp_path / "link-wheels"
+        link.symlink_to(real, target_is_directory=True)
+        with pytest.raises(shuru_mod.ShuruError) as caught:
+            self._resolve_staged(
+                tmp_path, monkeypatch, wheel_dir=link, dry_run=True, pytest_version="8.0.2"
+            )
+        assert "symlink" in str(caught.value)
+
+    # -- the dry run (M3 item U10) ------------------------------------------
+    def _dry_report(self, **over) -> dict:
+        return self._report(
+            verdict=probe_xdist_mod.VERDICT_UNAVAILABLE,
+            note="dry run: the preflight resolved xdist and nothing was booted",
+            checkpoint="ckpt",
+            tree="worktrees/Demo_1/src_buggy",
+            command=["python", "-m", "pytest"],
+            xdist_args=["-n", "auto"],
+            timeout_secs=1800,
+            disk_mb=16384,
+            memory_mb=8192,
+            xdist={
+                "source": probe_xdist_mod.SOURCE_CHECKPOINT,
+                "version": "3.6.1",
+                "pytest": "8.0.2",
+            },
+            **over,
+        )
+
+    def test_a_dry_run_prints_the_plan_and_writes_nothing(self, tmp_path, capsys):
+        """[VANTA-WHY] M3 item U10 — the dry run is a pure read of the batch.
+
+        It resolves xdist and prints the plan, but must not leave a report behind:
+        without ``--report`` the operator asked for a look, not an artifact, and a
+        written ``<batch>/probe_xdist/<slug>-xdist.json`` would be indistinguishable
+        from one a real probe produced.
+        """
+        out_path = tmp_path / "probe_xdist" / "x-xdist.json"
+        args = probe_xdist_mod._parse_args(
+            ["--batch", str(tmp_path), "--bug", "Demo/1", "--dry-run"]
+        )
+        assert probe_xdist_mod._stop(self._dry_report(), out_path, args) == 0
+        assert not out_path.exists(), "a dry run must not write a report without --report"
+        printed = capsys.readouterr().out
+        assert "dry run" in printed
+        assert "-n auto" in printed
+        assert "3.6.1" in printed
+
+    def test_a_dry_run_with_report_writes_it(self, tmp_path):
+        out_path = tmp_path / "x-xdist.json"
+        args = probe_xdist_mod._parse_args(
+            [
+                "--batch",
+                str(tmp_path),
+                "--bug",
+                "Demo/1",
+                "--dry-run",
+                "--report",
+                str(out_path),
+            ]
+        )
+        assert probe_xdist_mod._stop(self._dry_report(), out_path, args) == 0
+        assert out_path.is_file()
+        written = json.loads(out_path.read_text(encoding="utf-8"))
+        assert written["verdict"] == probe_xdist_mod.VERDICT_UNAVAILABLE
+        assert written["note"].startswith("dry run:")
+
+    def test_an_early_exit_that_is_not_a_dry_run_still_writes_the_report(self, tmp_path):
+        """U10 suppresses the report only for a dry run; ``unavailable`` is a result."""
+        out_path = tmp_path / "x-xdist.json"
+        args = probe_xdist_mod._parse_args(["--batch", str(tmp_path), "--bug", "Demo/1"])
+        report = self._report(
+            verdict=probe_xdist_mod.VERDICT_UNAVAILABLE,
+            note="the checkpoint has no importable pytest-xdist",
+        )
+        assert probe_xdist_mod._stop(report, out_path, args) == 0
+        assert out_path.is_file()
+
+    # -- preflight parsing --------------------------------------------------
+    def test_parse_preflight_takes_the_last_marker_line(self):
+        marker = probe_xdist_mod.PROBE_MARKER
+        stdout = (
+            "start-up banner\n"
+            + marker
+            + '{"pytest": "5.4.2"}\n'
+            + marker
+            + '{"pytest": "5.4.2", "xdist": null}\n'
+        )
+        assert probe_xdist_mod.parse_preflight(stdout) == {"pytest": "5.4.2", "xdist": None}
+
+    def test_parse_preflight_raises_without_a_marker(self):
+        with pytest.raises(shuru_mod.ShuruError):
+            probe_xdist_mod.parse_preflight("nothing here\n")
+
+
+class TestCompareBatches:
+    """M3 item S6 — the pandas/1 equivalence check's pure parts.
+
+    [VANTA-WHY] The gate before S5/S6 may be used for real is a comparison of two
+    batches produced by the *same build*: one serial reference, one parallel. The
+    comparison has one hard problem — the two batches are two ``run`` invocations,
+    so the model answered twice and the patches differ by construction — and the
+    whole shape of this module follows from solving it: only the tree-and-schedule
+    facts are comparable, a row's identity includes its candidate's bytes, and the
+    only rows whose label/oracle may be compared are the ones whose candidate bytes
+    match. These tests pin that rule plus the six things a difference *does* fail
+    on (a prepare nodeid, a matched row's **oracle**, a matched row's **label**, a
+    missing group, a time limit, and a shared cache root), and the `incomparable`
+    verdict for a group whose candidate bytes exist on one side only. M3 item AB1:
+    a matched row's **label** is graded (rule (b), overruled: the Attacker writes
+    new tests each run, but they must not change how the same patch bytes are
+    graded). Nothing here boots a VM; every row is a hand-built dict in a
+    ``tmp_path`` batch.
+    """
+
+    @staticmethod
+    def _oracle(**over: Any) -> dict[str, Any]:
+        base = {
+            "apply_ok": True,
+            "apply_outcome": "applied",
+            "hidden_pass": True,
+            "patch_good": True,
+            "inconclusive": False,
+            "suite_regressions_count": 0,
+            "hidden_outcomes": {"t::a": "passed"},
+        }
+        base.update(over)
+        return base
+
+    def _row(self, **over: Any) -> dict[str, Any]:
+        rec: dict[str, Any] = {
+            "bug": "pandas/1",
+            "config": "attack",
+            "mode": "repair",
+            "seed": 2,
+            "label": "true_approval",
+            "label_rule": "rule",
+            "label_reason": "reason",
+            "verdict": "Fixed",
+            "timed_out": False,
+            "native_timeout": False,
+            "stop_reason": "none",
+            "native_timeout_secs": 1647,
+            "deadline_secs": 10200,
+            "timings": {"run_s": 100.0},
+            "scheduler": None,
+            "oracle": self._oracle(),
+        }
+        rec.update(over)
+        return rec
+
+    @staticmethod
+    def _write_batch(batch_dir: Path, *, rows: list[dict[str, Any]], prepare: Any = None) -> None:
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        payload = prepare if prepare is not None else {
+            "bugs": [
+                {
+                    "bug": "pandas/1",
+                    "fail_to_pass": ["t::a"],
+                    "f2p_undeclared": [],
+                    "flaky_nodeids": [],
+                    "preexisting_failures": [],
+                    "native_failure_baseline": [],
+                    "collect_flip_nodeids": [],
+                    "native_skips_buggy": 0,
+                    "native_skips_fixed": 0,
+                    "pass_to_pass_count": 5,
+                    "native_green_on_vanta_tree": True,
+                    "prepare_mode": "none",
+                    "vm_memory_mb": 8192,
+                    "native_secs": 549.0,
+                }
+            ],
+        }
+        (batch_dir / "prepare.json").write_text(json.dumps(payload), encoding="utf-8")
+        manifest = manifest_mod.Manifest(batch_dir)
+        for row in rows:
+            manifest.append(row)
+
+    # -- identity -----------------------------------------------------------
+    def test_row_identity_is_the_job_key_without_the_batch(self):
+        # `manifest.job_key` embeds the batch dir's id, so two batches' keys can
+        # never be equal; the identity is every other component, in the same order.
+        key = manifest_mod.job_key(
+            batch_id="m3-eq-a", bug="pandas/1", config="attack", mode="repair", seed=2
+        )
+        assert key.startswith("m3-eq-a#pandas/1#attack#repair#2")
+        assert compare_batches_mod.row_identity(self._row()) == (
+            "pandas/1",
+            "attack",
+            "repair",
+            2,
+            "",
+        )
+
+    def test_a_review_rows_identity_carries_its_candidate_bytes(self):
+        a = self._row(mode="review", candidate={"patch_sha256": "aa"})
+        b = self._row(mode="review", candidate={"patch_sha256": "bb"})
+        assert compare_batches_mod.row_identity(a) != compare_batches_mod.row_identity(b)
+
+    def test_group_identity_drops_the_candidate(self):
+        a = self._row(mode="review", candidate={"patch_sha256": "aa"})
+        b = self._row(mode="review", candidate={"patch_sha256": "bb"})
+        assert compare_batches_mod.group_identity(a) == compare_batches_mod.group_identity(b)
+
+    def test_a_repair_row_has_no_candidate_sha(self):
+        assert compare_batches_mod.candidate_sha(self._row()) == ""
+
+    # -- the `stop_reason` sentinel ----------------------------------------
+    def test_a_row_that_ran_to_its_verdict_did_not_hit_a_limit(self):
+        # driver.rs writes `stop_reason="none"` (unwrap_or("none")); reading that as
+        # a hit would make every ordinary row look like a timeout.
+        assert compare_batches_mod._hit_a_time_limit(self._row()) is False
+
+    def test_each_real_time_limit_counts(self):
+        assert compare_batches_mod._hit_a_time_limit(self._row(timed_out=True)) is True
+        assert compare_batches_mod._hit_a_time_limit(self._row(native_timeout=True)) is True
+        assert compare_batches_mod._hit_a_time_limit(self._row(stop_reason="budget_exhausted")) is True
+
+    def test_the_scheduler_numbers_are_recorded_beside_the_flags(self):
+        a = self._row()
+        b = self._row(
+            scheduler={
+                "wall_s": 999.0,
+                "deadline_remaining_s": 12.0,
+                "peak_sandboxes": 3,
+                "provider_retries": 1,
+            }
+        )
+        left, right = compare_batches_mod._time_limits(a), compare_batches_mod._time_limits(b)
+        # the three flags agree...
+        assert all(left[name] == right[name] for name in compare_batches_mod.TIME_LIMIT_FLAGS)
+        # ...and the calibration numbers are recorded separately, never folded in
+        assert right["peak_sandboxes"] == 3
+        assert left["peak_sandboxes"] is None  # `--jobs 1` writes no scheduler block
+
+    # -- prepare ------------------------------------------------------------
+    def test_prepare_identical_when_the_nodeid_sets_match(self):
+        report = compare_batches_mod.compare_prepare(
+            self._prepare(), self._prepare(), ["pandas/1"]
+        )
+        assert report["identical"] is True
+        assert report["bugs"]["pandas/1"]["nodeid_differences"] == {}
+
+    def test_prepare_reports_a_nodeid_that_moved(self):
+        serial = self._prepare(fail_to_pass=["t::a", "t::b"])
+        parallel = self._prepare(fail_to_pass=["t::a"])
+        report = compare_batches_mod.compare_prepare(serial, parallel, ["pandas/1"])
+        assert report["identical"] is False
+        moved = report["bugs"]["pandas/1"]["nodeid_differences"]["fail_to_pass"]
+        assert moved == {"only_in_serial": ["t::b"], "only_in_parallel": []}
+
+    def test_prepare_records_timing_but_never_fails_on_it(self):
+        report = compare_batches_mod.compare_prepare(
+            self._prepare(native_secs=549.0), self._prepare(native_secs=1310.0), ["pandas/1"]
+        )
+        assert report["identical"] is True  # a slower prepare is not a difference
+        assert report["bugs"]["pandas/1"]["timing"]["native_secs"] == [549.0, 1310.0]
+
+    def test_prepare_names_a_bug_that_was_only_prepared_once(self):
+        report = compare_batches_mod.compare_prepare({"bugs": [{"bug": "pandas/1"}]}, {"bugs": []}, ["pandas/1"])
+        assert report["identical"] is False
+        assert "only one batch" in report["bugs"]["pandas/1"]["reason"]
+
+    # -- M3 item AA5: the flaky set is its own category ----------------------
+    def test_a_flaky_only_difference_is_not_a_plain_nodeid_difference(self):
+        # Which tests a batch catches being flaky is a fact about the clock, so a
+        # difference there must not read as `fail_to_pass` moving.
+        report = compare_batches_mod.compare_prepare(
+            self._prepare(flaky_nodeids=["t::flaky"]), self._prepare(), ["pandas/1"]
+        )
+        bug = report["bugs"]["pandas/1"]
+        assert bug["nodeid_differences"] == {}
+        assert bug["flaky_differences"] == {"only_in_serial": ["t::flaky"], "only_in_parallel": []}
+        assert report["identical"] is False
+        assert report["identical_except_flaky"] is True
+
+    def test_a_flaky_difference_beside_a_real_one_is_not_excused(self):
+        serial = self._prepare(flaky_nodeids=["t::flaky"], fail_to_pass=["t::a", "t::b"])
+        parallel = self._prepare(fail_to_pass=["t::a"])
+        report = compare_batches_mod.compare_prepare(serial, parallel, ["pandas/1"])
+        assert report["identical_except_flaky"] is False
+
+    def test_a_bug_prepared_once_never_reads_identical_except_flaky(self):
+        report = compare_batches_mod.compare_prepare({"bugs": [{"bug": "pandas/1"}]}, {"bugs": []}, ["pandas/1"])
+        assert report["identical_except_flaky"] is False
+
+    @staticmethod
+    def _prepare(**over: Any) -> dict[str, Any]:
+        block = {
+            "bug": "pandas/1",
+            "fail_to_pass": ["t::a"],
+            "f2p_undeclared": [],
+            "flaky_nodeids": [],
+            "preexisting_failures": [],
+            "native_failure_baseline": [],
+            "collect_flip_nodeids": [],
+            "native_skips_buggy": 0,
+            "native_skips_fixed": 0,
+            "pass_to_pass_count": 5,
+            "native_green_on_vanta_tree": True,
+            "prepare_mode": "none",
+            "vm_memory_mb": 8192,
+            "native_secs": 549.0,
+        }
+        block.update(over)
+        return {"bugs": [block]}
+
+    # -- rows ---------------------------------------------------------------
+    def test_matched_rows_are_identical_when_everything_agrees(self):
+        report = compare_batches_mod.compare_rows([self._row()], [self._row()], {})
+        assert report["identical"] is True
+        assert len(report["matched"]) == 1
+        assert report["matched"][0]["identical"] is True
+
+    def test_a_matched_row_whose_label_moved_is_not_identical(self, tmp_path):
+        # M3 item AB1, rule (b) overruled: a matched row is the SAME candidate bytes
+        # on both sides, so its label — what the run concluded about those bytes — is
+        # graded, exactly as its oracle is. The values are still reported side by
+        # side, but a moved label fails the row and the gate.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row(label="true_reject")])
+
+        report = compare_batches_mod.compare_rows(
+            [self._row()], [self._row(label="true_reject")], {}
+        )
+        assert report["identical"] is False
+        assert report["matched"][0]["identical"] is False
+        assert report["matched"][0]["label_differences"]["label"] == [
+            "true_approval",
+            "true_reject",
+        ]
+        assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == "not_identical"
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 1
+
+    def test_a_matched_row_whose_label_rule_moved_is_also_not_identical(self):
+        report = compare_batches_mod.compare_rows(
+            [self._row()], [self._row(label_rule="other_rule", verdict="NotFixed")], {}
+        )
+        assert report["identical"] is False
+        assert sorted(report["matched"][0]["label_differences"]) == ["label_rule", "verdict"]
+
+    def test_the_reported_label_is_resolved_under_the_one_precedence(self):
+        """M3-E follow-up — the label is the EFFECTIVE one, and the source is named."""
+        measured = compare_batches_mod._label_of(
+            self._row(
+                label="unobservable",
+                label_relabelled_measured={"label": "true_approval", "oracle_rerun": True},
+            )
+        )
+        assert measured["label"] == "true_approval"
+        assert measured["label_source"] == manifest_mod.LABEL_SOURCE_MEASURED
+        plain = compare_batches_mod._label_of(self._row())
+        assert plain["label_source"] == manifest_mod.LABEL_SOURCE_ORIGINAL
+
+    def test_a_matched_row_reports_both_sources_without_grading_the_source(self):
+        """The same value read from two copies is the same conclusion about the same
+        bytes, so the source is reported beside the grade, never graded."""
+        report = compare_batches_mod.compare_rows(
+            [self._row()],
+            [self._row(label_relabelled={"label": "true_approval"})],
+            {},
+        )
+        assert report["identical"] is True
+        assert report["matched"][0]["label_differences"] == {}
+        assert report["matched"][0]["label_sources"] == {
+            "serial": manifest_mod.LABEL_SOURCE_ORIGINAL,
+            "parallel": manifest_mod.LABEL_SOURCE_DERIVED,
+        }
+
+    def test_a_matched_row_whose_hidden_outcome_moved_is_not_identical(self):
+        moved = self._row(oracle=self._oracle(hidden_outcomes={"t::a": "failed"}))
+        report = compare_batches_mod.compare_rows([self._row()], [moved], {})
+        assert report["identical"] is False
+        nodeids = report["matched"][0]["oracle"]["hidden_outcomes"]
+        assert nodeids["different_outcome"] == ["t::a"]
+
+    def test_differing_candidate_bytes_read_incomparable(self, tmp_path):
+        # M3 item AB1. The two batches' review rows reviewed different patches: the
+        # group matched, but the candidate bytes did not, so those rows were never
+        # compared. That is neither a difference nor agreement, so it has its own
+        # verdict (`incomparable`) and its own exit code (5) — it must not read as a
+        # plain pass, which would claim a comparison that never happened.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(
+            serial, rows=[self._row(mode="review", candidate={"patch_sha256": "aa"})]
+        )
+        self._write_batch(
+            parallel,
+            rows=[
+                self._row(
+                    mode="review", candidate={"patch_sha256": "bb"}, label="true_reject"
+                )
+            ],
+        )
+
+        report = compare_batches_mod.compare_rows(
+            [self._row(mode="review", candidate={"patch_sha256": "aa"})],
+            [self._row(mode="review", candidate={"patch_sha256": "bb"}, label="true_reject")],
+            {},
+        )
+        assert report["missing_groups"] == []
+        assert report["matched"] == []
+        assert report["unmatched_candidates"]["only_in_serial"][0]["identity"][4] == "aa"
+        assert report["unmatched_candidates"]["only_in_parallel"][0]["label"] == "true_reject"
+
+        assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == "incomparable"
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 5
+
+    def test_a_group_present_in_only_one_batch_fails(self):
+        report = compare_batches_mod.compare_rows([self._row()], [], {})
+        assert report["identical"] is False
+        assert report["missing_groups"] == [
+            {"identity": ["pandas/1", "attack", "repair", 2], "present_in": "serial"}
+        ]
+
+    def test_a_group_that_hit_a_limit_only_in_the_parallel_batch_fails(self):
+        serial = [self._row(seed=1)]
+        parallel = [self._row(seed=1, timed_out=True)]
+        report = compare_batches_mod.compare_rows(serial, parallel, {})
+        assert report["identical"] is False
+        groups = report["time_limit_differences"]["groups"]
+        assert groups[0]["parallel_rows_hitting_a_limit"] == 1
+        assert groups[0]["serial_rows_hitting_a_limit"] == 0
+
+    def test_the_serial_flaky_set_is_dropped_from_both_oracle_maps(self):
+        serial = [self._row(oracle=self._oracle(hidden_outcomes={"t::flaky": "failed"}))]
+        parallel = [self._row(oracle=self._oracle(hidden_outcomes={"t::flaky": "passed"}))]
+        report = compare_batches_mod.compare_rows(serial, parallel, {"pandas/1": {"t::flaky"}})
+        assert report["identical"] is True
+
+    # -- cache isolation ----------------------------------------------------
+    def _runs(self, **trees: Any) -> dict[str, Any]:
+        """A bug block whose ``scheduler.runs`` carries one cache record per tree."""
+        return self._prepare(scheduler={"runs": {name: {"cache": cache} for name, cache in trees.items()}})
+
+    @staticmethod
+    def _cache(*, key="", state="miss", source="", directory="") -> dict[str, Any]:
+        return {
+            "key": key,
+            "state": state,
+            "source": source,
+            "would_hit": False,
+            "dir": directory,
+        }
+
+    def test_prepare_suite_cache_reads_each_trees_state(self):
+        payload = self._runs(
+            src_buggy=self._cache(key="a" * 64, state="hit", source="pandas_1/src_buggy", directory="/tmp/cache-a"),
+            vanta_tree=self._cache(key="b" * 64, directory="/tmp/cache-a"),
+        )
+        records = compare_batches_mod.prepare_suite_cache(payload)
+        assert [r["where"] for r in records] == ["src_buggy", "vanta_tree"]
+        assert records[0]["state"] == "hit"
+        assert records[0]["source"] == "pandas_1/src_buggy"
+        assert compare_batches_mod.cache_dirs(records) == [str(Path("/tmp/cache-a").resolve())]
+        summary = compare_batches_mod.cache_summary(records)
+        assert (summary["hits"], summary["misses"], summary["other"]) == (1, 1, 0)
+        assert summary["hit_sources"] == {"pandas_1/src_buggy": 1}
+
+    def test_the_states_beside_a_miss_are_not_counted_as_misses(self):
+        # `off:no_cache` and friends are a different reason for not consulting the
+        # cache; folding them into `miss` would hide which one happened.
+        records = compare_batches_mod.prepare_suite_cache(
+            self._runs(vanta_tree=self._cache(state="off:unknown_checkpoint"))
+        )
+        summary = compare_batches_mod.cache_summary(records)
+        assert (summary["hits"], summary["misses"], summary["other"]) == (0, 0, 1)
+        assert summary["states"] == {"off:unknown_checkpoint": 1}
+
+    def test_cache_isolation_is_not_claimed_when_no_root_was_recorded(self):
+        report = compare_batches_mod.compare_cache(self._prepare(), self._prepare(), [], [])
+        assert report["checked"] is False
+        assert report["identical"] is True, "absence of a root is not a shared root"
+
+    def test_two_batches_on_one_cache_root_fail(self):
+        payload = self._runs(vanta_tree=self._cache(directory="/tmp/one-cache"))
+        report = compare_batches_mod.compare_cache(payload, payload, [], [])
+        assert report["checked"] is True
+        assert report["identical"] is False
+        assert "same suite cache directory" in report["problems"][0]
+
+    def test_two_batches_on_their_own_roots_pass(self):
+        serial = self._runs(vanta_tree=self._cache(key="a" * 64, directory="/tmp/cache-serial"))
+        parallel = self._runs(vanta_tree=self._cache(key="b" * 64, directory="/tmp/cache-parallel"))
+        report = compare_batches_mod.compare_cache(serial, parallel, [], [])
+        assert report["identical"] is True
+        assert report["serial"]["prepare"]["misses"] == 1
+        assert report["parallel"]["prepare"]["misses"] == 1
+        assert report["serial"]["dirs"] != report["parallel"]["dirs"]
+
+    def test_a_hit_under_the_batchs_own_root_is_isolated(self, tmp_path):
+        # The check must not be a blanket refusal: a re-prepared tree inside one
+        # batch legitimately hits its own entry.
+        root = tmp_path / "parallel-cache"
+        key = "c" * 64
+        entry = suite_cache_mod.entry_path_in(root, key)
+        entry.parent.mkdir(parents=True)
+        entry.write_text("{}", encoding="utf-8")
+        serial = self._runs(vanta_tree=self._cache(directory=str(tmp_path / "serial-cache")))
+        parallel = self._runs(
+            vanta_tree=self._cache(key=key, state="hit", source="pandas_1/vanta_tree", directory=str(root))
+        )
+        report = compare_batches_mod.compare_cache(serial, parallel, [], [])
+        assert report["identical"] is True
+        assert report["parallel"]["prepare"]["hit_sources"] == {"pandas_1/vanta_tree": 1}
+
+    def test_a_parallel_hit_served_from_the_other_batchs_root_fails(self, tmp_path):
+        serial_root, parallel_root = tmp_path / "serial-cache", tmp_path / "parallel-cache"
+        key = "d" * 64
+        # The entry exists under the SERIAL root only — i.e. the parallel batch was
+        # served the serial batch's measurement, the vacuous pass this check exists
+        # to stop.
+        entry = suite_cache_mod.entry_path_in(serial_root, key)
+        entry.parent.mkdir(parents=True)
+        entry.write_text("{}", encoding="utf-8")
+        serial = self._runs(vanta_tree=self._cache(directory=str(serial_root)))
+        parallel = self._runs(
+            vanta_tree=self._cache(key=key, state="hit", source="pandas_1/vanta_tree", directory=str(parallel_root))
+        )
+        report = compare_batches_mod.compare_cache(serial, parallel, [], [])
+        assert report["identical"] is False
+        assert "not an entry under parallel's own cache directory" in report["problems"][0]
+
+    def test_native_gate_hits_are_read_from_the_evidence_file(self, tmp_path):
+        session = tmp_path / "vanta_sessions" / "sid-1"
+        session.parent.mkdir(parents=True)
+        (session.parent / "sid-1_evidence.json").write_text(
+            json.dumps(
+                {
+                    "native_cache": [
+                        {
+                            "attempt": 1,
+                            "side": "original",
+                            "state": "hit",
+                            "key": "e" * 64,
+                            "source": "sid-1/a1/original",
+                            "would_hit": False,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        records = compare_batches_mod.native_cache_records(
+            [self._row(artifacts={"session_dir": str(session)})]
+        )
+        assert records == [
+            {
+                "bug": "pandas/1",
+                "where": "sid-1/a1/original",
+                "key": "e" * 64,
+                "state": "hit",
+                "source": "sid-1/a1/original",
+                "dir": "",
+                "would_hit": False,
+            }
+        ]
+
+    def test_a_native_hit_served_from_the_other_batchs_root_fails(self, tmp_path):
+        serial_root, parallel_root = tmp_path / "serial-cache", tmp_path / "parallel-cache"
+        key = "f" * 64
+        # The entry exists under the SERIAL root only — the parallel batch's native
+        # gate was served the serial batch's measurement. A definite leak, because the
+        # key resolves under the other batch's root.
+        entry = suite_cache_mod.entry_path_in(serial_root, key)
+        entry.parent.mkdir(parents=True)
+        entry.write_text("{}", encoding="utf-8")
+        serial = self._runs(vanta_tree=self._cache(directory=str(serial_root)))
+        parallel = self._runs(vanta_tree=self._cache(directory=str(parallel_root)))
+        session = tmp_path / "vanta_sessions" / "sid-2"
+        session.parent.mkdir(parents=True)
+        (session.parent / "sid-2_evidence.json").write_text(
+            json.dumps(
+                {
+                    "native_cache": [
+                        {
+                            "attempt": 1,
+                            "side": "patched",
+                            "state": "hit",
+                            "key": key,
+                            "source": "sid-2/a1/patched",
+                            "would_hit": False,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        report = compare_batches_mod.compare_cache(
+            serial,
+            parallel,
+            [self._row()],
+            [self._row(artifacts={"session_dir": str(session)})],
+        )
+        assert report["identical"] is False
+        assert "parallel native cache hit" in report["problems"][0]
+
+    def test_a_hit_that_resolves_nowhere_is_unverifiable_not_a_failure(self, tmp_path):
+        # M3 item Z2 / Nathan's rule: a recorded hit whose entry cannot be found
+        # anywhere — its root was cleaned — is `isolation unverifiable`, never a
+        # false `not_identical` that would blame the batches for a deleted directory.
+        key = "9" * 64
+        serial = self._runs(
+            vanta_tree=self._cache(
+                key=key,
+                state="hit",
+                source="pandas_1/vanta_tree",
+                directory=str(tmp_path / "gone-serial"),
+            )
+        )
+        parallel = self._runs(vanta_tree=self._cache(directory=str(tmp_path / "parallel-cache")))
+        report = compare_batches_mod.compare_cache(serial, parallel, [], [])
+        assert report["identical"] is True
+        assert report["verifiable"] is False
+        assert "cannot be verified" in report["unverified"][0]
+
+    def test_a_side_that_recorded_no_hit_passes_trivially(self, tmp_path):
+        # The other half of the rule, and the normal cross-build case: last night's
+        # serial ran with the cache off, so it recorded no hit and has nothing to
+        # resolve — its root, even a missing one, is not a problem and not a gap.
+        serial = self._runs(
+            vanta_tree=self._cache(
+                state="off:unknown_checkpoint", directory=str(tmp_path / "gone-serial")
+            )
+        )
+        parallel = self._runs(vanta_tree=self._cache(directory=str(tmp_path / "parallel-cache")))
+        report = compare_batches_mod.compare_cache(serial, parallel, [], [])
+        assert report["identical"] is True
+        assert report["unverified"] == []
+
+    # -- M3 item X3: --bug scopes the cache half too -------------------------
+    @staticmethod
+    def _bug_run(bug: str, *, key: str = "", state: str = "miss", directory: str = "") -> dict[str, Any]:
+        """One bug block carrying a single prepare-suite cache record."""
+        return {
+            "bug": bug,
+            "flaky_nodeids": [],
+            "scheduler": {
+                "runs": {
+                    "vanta_tree": {
+                        "cache": {
+                            "key": key,
+                            "state": state,
+                            "source": "",
+                            "would_hit": False,
+                            "dir": directory,
+                        }
+                    }
+                }
+            },
+        }
+
+    def test_the_bug_flag_scopes_the_cache_hit_checks(self, tmp_path):
+        # M3 item X3 — `other/2` recorded a hit whose entry is nowhere, but the
+        # operator asked about `pandas/1`, so that gap must not be reported as this
+        # comparison's.
+        def payload(prefix: str, *, other_hit: bool) -> dict[str, Any]:
+            return {
+                "bugs": [
+                    self._bug_run("pandas/1", directory=str(tmp_path / f"{prefix}-pandas")),
+                    self._bug_run(
+                        "other/2",
+                        key=("9" * 64) if other_hit else "",
+                        state="hit" if other_hit else "miss",
+                        directory=str(tmp_path / f"{prefix}-other"),
+                    ),
+                ]
+            }
+
+        serial = payload("serial", other_hit=True)
+        parallel = payload("parallel", other_hit=False)
+
+        scoped = compare_batches_mod.compare_cache(serial, parallel, [], [], bugs=["pandas/1"])
+        assert scoped["bugs"] == ["pandas/1"]
+        assert scoped["unverified"] == []
+        assert scoped["identical"] is True
+
+        # Unscoped, the same batches DO carry the unresolvable hit — the difference
+        # the scoping makes, stated as a fact rather than assumed.
+        unscoped = compare_batches_mod.compare_cache(serial, parallel, [], [])
+        assert unscoped["bugs"] is None
+        assert unscoped["unverified"] != []
+
+    def test_a_shared_root_is_still_found_when_the_named_bug_is_not_the_sharer(self, tmp_path):
+        # The root test is deliberately unscoped: sharing a cache directory is a fact
+        # about the whole batch, and `--bug` must not be able to hide it by leaving
+        # the sharing bug's records out of scope.
+        shared = str(tmp_path / "one-cache")
+
+        def payload(prefix: str) -> dict[str, Any]:
+            return {
+                "bugs": [
+                    self._bug_run("pandas/1", directory=str(tmp_path / f"{prefix}-pandas")),
+                    self._bug_run("other/2", directory=shared),
+                ]
+            }
+
+        report = compare_batches_mod.compare_cache(
+            payload("serial"), payload("parallel"), [], [], bugs=["pandas/1"]
+        )
+        assert report["problems"]
+        assert "same suite cache directory" in report["problems"][0]
+        assert report["identical"] is False
+
+    def test_without_the_bug_flag_the_cache_summaries_stay_unscoped(self, tmp_path):
+        payload = {
+            "bugs": [
+                self._bug_run("pandas/1", directory=str(tmp_path / "a")),
+                self._bug_run("other/2", directory=str(tmp_path / "b")),
+            ]
+        }
+        report = compare_batches_mod.compare_cache(payload, payload, [], [])
+        assert report["bugs"] is None
+        assert report["serial"]["prepare"]["total"] == 2
+
+    def test_the_bug_flag_keeps_an_unrelated_cache_gap_out_of_the_verdict(self, tmp_path):
+        # The end-to-end shape of X3: everything agrees for `pandas/1`, and the other
+        # bug's unresolvable hit — which the operator never asked about — must not
+        # turn the scoped verdict into `identical_unverified`.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+
+        def prepare(prefix: str, *, other_hit: bool) -> dict[str, Any]:
+            return {
+                "bugs": [
+                    self._bug_run("pandas/1", directory=str(tmp_path / f"{prefix}-pandas")),
+                    self._bug_run(
+                        "other/2",
+                        key=("9" * 64) if other_hit else "",
+                        state="hit" if other_hit else "miss",
+                        directory=str(tmp_path / f"{prefix}-other"),
+                    ),
+                ]
+            }
+
+        self._write_batch(serial, rows=[self._row()], prepare=prepare("serial", other_hit=True))
+        self._write_batch(parallel, rows=[self._row()], prepare=prepare("parallel", other_hit=False))
+
+        scoped = compare_batches_mod.compare_batches(serial, parallel, bugs=["pandas/1"])
+        assert scoped["verdict"] == "identical"
+        assert scoped["cache"]["unverified"] == []
+        assert compare_batches_mod.main(
+            [
+                "--serial",
+                str(serial),
+                "--parallel",
+                str(parallel),
+                "--bug",
+                "pandas/1",
+                "--no-report",
+            ]
+        ) == 0
+        # Unscoped, the same batches reach the honest third verdict.
+        assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == (
+            "identical_unverified"
+        )
+
+    # -- M3 item AA5: the flaky-only verdict --------------------------------
+    def test_a_flaky_only_difference_reads_identical_except_flaky_and_exit_four(self, tmp_path):
+        # The timing batch's pandas/1 was `not_identical` from a flaky Hypothesis test
+        # and nothing else. That difference is the clock's, so it gets its own verdict
+        # and its own exit code rather than failing a gate it did not break.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(
+            serial, rows=[self._row()], prepare=self._prepare(flaky_nodeids=["t::flaky"])
+        )
+        self._write_batch(parallel, rows=[self._row()])
+
+        report = compare_batches_mod.compare_batches(serial, parallel)
+
+        assert report["verdict"] == "identical_except_flaky"
+        assert report["flaky"]["bugs"] == ["pandas/1"]
+        assert report["flaky"]["differences"]["pandas/1"] == {
+            "only_in_serial": ["t::flaky"],
+            "only_in_parallel": [],
+        }
+        assert report["flaky"]["discounted"] is True
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 4
+
+    def test_the_flaky_carve_out_is_withheld_when_a_label_moved(self, tmp_path):
+        # M3 item AB1 — a matched row's label is now graded, so a moved label fails
+        # ``rows`` on its own; beside a flaky difference the flaky set is no longer
+        # the only difference, so the carve-out cannot excuse it. The result is the
+        # same `not_identical` as before, now for two reasons rather than one.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(
+            serial, rows=[self._row()], prepare=self._prepare(flaky_nodeids=["t::flaky"])
+        )
+        self._write_batch(parallel, rows=[self._row(label="true_reject")])
+
+        report = compare_batches_mod.compare_batches(serial, parallel)
+
+        assert report["rows"]["identical"] is False  # the label is graded (AB1)
+        assert report["flaky"]["label_changed"] is True
+        assert report["flaky"]["discounted"] is False
+        assert report["verdict"] == "not_identical"
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 1
+
+    def test_an_unverifiable_cache_side_outranks_the_flaky_carve_out(self, tmp_path):
+        # The carve-out's own rule is "nothing else differs", and an unresolvable cache
+        # side is something else: a proof the comparison could not make.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        gone = self._prepare(
+            flaky_nodeids=["t::flaky"],
+            scheduler={
+                "runs": {
+                    "vanta_tree": {
+                        "cache": self._cache(
+                            key="7" * 64,
+                            state="hit",
+                            source="pandas/1/vanta_tree",
+                            directory=str(tmp_path / "gone-serial"),
+                        )
+                    }
+                }
+            },
+        )
+        live = self._prepare(
+            scheduler={
+                "runs": {"vanta_tree": {"cache": self._cache(directory=str(tmp_path / "live"))}}
+            }
+        )
+        self._write_batch(serial, rows=[self._row()], prepare=gone)
+        self._write_batch(parallel, rows=[self._row()], prepare=live)
+
+        report = compare_batches_mod.compare_batches(serial, parallel)
+
+        assert report["cache"]["identical"] is True
+        assert report["cache"]["unverified"]
+        assert report["verdict"] == "identical_unverified"
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 3
+
+    def test_a_real_row_difference_beats_the_flaky_carve_out(self, tmp_path):
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(
+            serial, rows=[self._row()], prepare=self._prepare(flaky_nodeids=["t::flaky"])
+        )
+        self._write_batch(parallel, rows=[self._row(native_timeout=True)])
+        assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == "not_identical"
+
+    def test_a_bug_key_becomes_a_file_name_without_making_a_directory(self):
+        # `pandas/1` must become one file beside the others, not a `pandas`
+        # directory holding `1.json`.
+        assert compare_batches_mod.bug_slug("pandas/1") == "pandas__1"
+        assert "/" not in compare_batches_mod.bug_slug("pandas/1")
+        # Distinct bugs stay distinct files: the index is digits-only and a project
+        # name never contains `/`, so the joined slug is injective over real keys.
+        keys = ["pandas/1", "pandas/11", "pandas/2", "a/1", "a_/1", "a__b/1"]
+        slugs = [compare_batches_mod.bug_slug(key) for key in keys]
+        assert len(set(slugs)) == len(keys)
+
+    def test_a_per_bug_report_is_written_beside_the_main_one(self, tmp_path):
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row()])
+        assert compare_batches_mod.main(["--serial", str(serial), "--parallel", str(parallel)]) == 0
+        per_bug = parallel / "compare_batches" / "pandas__1.json"
+        assert per_bug.is_file()
+        written = json.loads(per_bug.read_text(encoding="utf-8"))
+        assert written["bugs"] == ["pandas/1"]
+        assert written["verdict"] == "identical"
+        # The per-bug file is the `--bug`-scoped comparison, so its cache half is
+        # scoped too (M3 item X3) and it never claims more than the main report.
+        assert written["cache"]["bugs"] == ["pandas/1"]
+
+    def test_no_report_writes_no_per_bug_files_either(self, tmp_path):
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row()])
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 0
+        assert not (parallel / "compare_batches").exists()
+
+    def test_verdict_line_names_the_flaky_nodeids_per_side(self):
+        report = {
+            "bugs": ["pandas/1"],
+            "verdict": "identical_except_flaky",
+            "prepare": {
+                "bugs": {
+                    "pandas/1": {
+                        "identical": False,
+                        "identical_except_flaky": True,
+                        "nodeid_differences": {},
+                        "scalar_differences": {},
+                        "flaky_differences": {
+                            "only_in_serial": ["t::flaky"],
+                            "only_in_parallel": ["t::other"],
+                        },
+                    }
+                }
+            },
+            "rows": {"matched": [{"identical": True}], "time_limit_differences": {"groups": []}},
+            "flaky": {"bugs": ["pandas/1"], "discounted": True},
+        }
+        line = compare_batches_mod.verdict_line(report)
+        assert line.startswith("compare-batches pandas/1: identical_except_flaky")
+        assert "flaky_diffs=1" in line
+        # The excused difference must not be counted as a prepare failure...
+        assert "prepare_diffs=0" in line
+        # ...and both sides' nodeids must be named.
+        assert "serial-only=[t::flaky]" in line
+        assert "parallel-only=[t::other]" in line
+
+    def test_verdict_line_says_when_the_carve_out_was_withheld(self):
+        report = {
+            "bugs": ["pandas/1"],
+            "verdict": "not_identical",
+            "prepare": {
+                "bugs": {
+                    "pandas/1": {
+                        "identical": False,
+                        "identical_except_flaky": True,
+                        "nodeid_differences": {},
+                        "scalar_differences": {},
+                        "flaky_differences": {"only_in_serial": ["t::flaky"], "only_in_parallel": []},
+                    }
+                }
+            },
+            "rows": {"matched": [{"identical": True}], "time_limit_differences": {"groups": []}},
+            "flaky": {"bugs": ["pandas/1"], "discounted": False},
+        }
+        line = compare_batches_mod.verdict_line(report)
+        assert "withheld: a label moved" in line
+        assert "serial-only=[t::flaky]" in line
+
+    # -- build stamps (M3 item Z2) ------------------------------------------
+    def test_build_stamps_are_read_per_field_and_per_bug(self):
+        rows = [
+            self._row(harness_commit="aaa", vanta_build_commit="bbb", checkpoint="ck-1"),
+            self._row(
+                mode="review",
+                candidate={"patch_sha256": "x"},
+                harness_commit="aaa",
+                vanta_build_commit="bbb",
+                checkpoint="ck-1",
+            ),
+        ]
+        stamps = compare_batches_mod.build_stamps(rows)
+        assert stamps["fields"]["harness_commit"] == ["aaa"]
+        assert stamps["fields"]["vanta_build_commit"] == ["bbb"]
+        assert stamps["checkpoints"] == {"pandas/1": ["ck-1"]}
+
+    def test_a_build_difference_is_reported_and_never_a_finding(self):
+        serial = [self._row(harness_commit="old", vanta_build_commit="old")]
+        parallel = [self._row(harness_commit="new", vanta_build_commit="new")]
+        build = compare_batches_mod.compare_build(serial, parallel, ["pandas/1"])
+        assert build["matches"] is False
+        assert any("harness_commit" in d for d in build["differences"])
+        assert any("vanta_build_commit" in d for d in build["differences"])
+
+    def test_a_checkpoint_difference_is_reported_too(self):
+        build = compare_batches_mod.compare_build(
+            [self._row(checkpoint="ck-old")], [self._row(checkpoint="ck-new")], ["pandas/1"]
+        )
+        assert build["matches"] is False
+        assert any("checkpoint" in d for d in build["differences"])
+
+    def test_an_end_to_end_build_difference_still_reads_identical(self, tmp_path):
+        # Z2's core: the serial reference is an OLDER build by construction, so the
+        # whole comparison must pass across builds — the build is reported, not graded.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(
+            serial, rows=[self._row(harness_commit="old", vanta_build_commit="old")]
+        )
+        self._write_batch(
+            parallel, rows=[self._row(harness_commit="new", vanta_build_commit="new")]
+        )
+        report = compare_batches_mod.compare_batches(serial, parallel)
+        assert report["verdict"] == "identical"
+        assert report["build"]["matches"] is False
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 0
+
+    # -- effective row concurrency -----------------------------------------
+    def test_row_concurrency_reads_the_peak_the_scheduler_recorded(self):
+        rows = [self._row(), self._row(seed=3, scheduler={"peak_cores": 4})]
+        assert compare_batches_mod.row_concurrency(rows) == {
+            "rows": 2,
+            "rows_with_a_scheduler_block": 1,
+            "peak_cores": 4,
+        }
+
+    def test_a_serial_batch_recorded_no_concurrency_at_all(self):
+        # A `--jobs 1` row writes no scheduler block, so the peak is `None` — "not
+        # recorded", never zero, exactly as `_time_limits` reads it.
+        assert compare_batches_mod.row_concurrency([self._row()]) == {
+            "rows": 1,
+            "rows_with_a_scheduler_block": 0,
+            "peak_cores": None,
+        }
+
+    def test_verdict_line_names_a_cache_problem_and_the_row_peak(self):
+        report = {
+            "bugs": ["pandas/1"],
+            "verdict": "not_identical",
+            "prepare": {"bugs": {}},
+            "rows": {"matched": [], "time_limit_differences": {"groups": []}},
+            "cache": {"problems": ["both batches used the same suite cache directory, so neither computed its own results: /tmp/c"]},
+            "serial": {"concurrency": {"peak_cores": None}},
+            "parallel": {"concurrency": {"peak_cores": 4}},
+        }
+        line = compare_batches_mod.verdict_line(report)
+        assert "cache_problems=1" in line
+        assert "same suite cache directory" in line
+        assert "rows peak: serial=None parallel=4" in line
+
+    def test_verdict_line_names_build_differences_as_information(self):
+        # M3 item Z2 — a cross-build comparison whose only difference is the build
+        # must still read `identical`, and the line must say WHICH stamp moved and
+        # that it is information rather than a failure.
+        report = {
+            "bugs": ["pandas/1"],
+            "verdict": "identical",
+            "prepare": {"bugs": {"pandas/1": {"identical": True}}},
+            "rows": {"matched": [{"identical": True}], "time_limit_differences": {"groups": []}},
+            "build": {
+                "differences": ["harness_commit: serial=['old'] parallel=['new']"],
+                "matches": False,
+            },
+        }
+        line = compare_batches_mod.verdict_line(report)
+        assert line.startswith("compare-batches pandas/1: identical")
+        assert "build_diffs=1" in line
+        assert "build (information, not a failure)" in line
+        assert "harness_commit" in line
+
+    def test_verdict_line_names_the_unverified_cache_side(self):
+        report = {
+            "bugs": ["pandas/1"],
+            "verdict": "identical_unverified",
+            "prepare": {"bugs": {"pandas/1": {"identical": True}}},
+            "rows": {"matched": [{"identical": True}], "time_limit_differences": {"groups": []}},
+            "cache": {
+                "problems": [],
+                "unverified": ["serial prepare cache hit abcd… cannot be verified"],
+            },
+        }
+        line = compare_batches_mod.verdict_line(report)
+        assert line.startswith("compare-batches pandas/1: identical_unverified")
+        assert "cache_unverified=1" in line
+        assert "cache unverified:" in line
+
+    # -- the whole thing ----------------------------------------------------
+    def test_compare_batches_end_to_end_is_identical(self, tmp_path):
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row()])
+        report = compare_batches_mod.compare_batches(serial, parallel)
+        assert report["verdict"] == "identical"
+        assert report["bugs"] == ["pandas/1"]
+        # The hand-built batches record no cache root, so isolation is un-checked
+        # rather than claimed — and the concurrency is "not recorded", not zero.
+        assert report["cache"]["checked"] is False
+        assert report["serial"]["concurrency"]["peak_cores"] is None
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 0
+
+    def test_a_shared_cache_root_makes_the_whole_verdict_not_identical(self, tmp_path):
+        # The end-to-end shape of fix #1: everything else agrees, and the batch is
+        # still not identical, because both batches were served one directory.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        shared = self._prepare(
+            scheduler={
+                "runs": {"vanta_tree": {"cache": self._cache(directory="/tmp/one-root")}}
+            }
+        )
+        self._write_batch(serial, rows=[self._row()], prepare=shared)
+        self._write_batch(parallel, rows=[self._row()], prepare=shared)
+        assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == "not_identical"
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 1
+
+    def test_an_unverifiable_cache_side_is_identical_unverified_and_exit_three(self, tmp_path):
+        # M3 item Z2 — everything agrees, but one side recorded a hit whose entry is
+        # nowhere to be found (its root was cleaned). Plain `identical` would overclaim
+        # a proof that was not made; `not_identical` would blame the batches for a
+        # deleted directory. The verdict is the honest third thing, and exit 3.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        gone = self._prepare(
+            scheduler={
+                "runs": {
+                    "vanta_tree": {
+                        "cache": self._cache(
+                            key="7" * 64,
+                            state="hit",
+                            source="pandas/1/vanta_tree",
+                            directory=str(tmp_path / "gone-serial"),
+                        )
+                    }
+                }
+            }
+        )
+        live = self._prepare(
+            scheduler={
+                "runs": {"vanta_tree": {"cache": self._cache(directory=str(tmp_path / "live"))}}
+            }
+        )
+        self._write_batch(serial, rows=[self._row()], prepare=gone)
+        self._write_batch(parallel, rows=[self._row()], prepare=live)
+        report = compare_batches_mod.compare_batches(serial, parallel)
+        assert report["verdict"] == "identical_unverified"
+        assert report["cache"]["identical"] is True  # no definite problem
+        assert report["cache"]["unverified"]  # but the proof was not available
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 3
+
+    def test_a_real_difference_wins_over_an_unverifiable_side(self, tmp_path):
+        # The fold runs before the unverified check: a genuine difference is
+        # `not_identical`, never softened to `identical_unverified`.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        gone = self._prepare(
+            scheduler={
+                "runs": {
+                    "vanta_tree": {
+                        "cache": self._cache(
+                            key="8" * 64,
+                            state="hit",
+                            source="pandas/1/vanta_tree",
+                            directory=str(tmp_path / "gone-serial"),
+                        )
+                    }
+                }
+            }
+        )
+        live = self._prepare(
+            scheduler={
+                "runs": {"vanta_tree": {"cache": self._cache(directory=str(tmp_path / "live"))}}
+            }
+        )
+        self._write_batch(serial, rows=[self._row()], prepare=gone)
+        self._write_batch(parallel, rows=[self._row(native_timeout=True)], prepare=live)
+        assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == "not_identical"
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 1
+
+    def test_compare_batches_end_to_end_reports_a_difference(self, tmp_path):
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row(native_timeout=True)])
+        assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == "not_identical"
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 1
+
+    def test_the_report_is_written_beside_the_parallel_batch(self, tmp_path):
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row()])
+        assert compare_batches_mod.main(["--serial", str(serial), "--parallel", str(parallel)]) == 0
+        written = json.loads((parallel / "compare_batches.json").read_text(encoding="utf-8"))
+        assert written["verdict"] == "identical"
+
+    def test_an_unreadable_batch_is_exit_two(self, tmp_path):
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        code = compare_batches_mod.main(
+            ["--serial", str(tmp_path / "a"), "--parallel", str(tmp_path / "b"), "--no-report"]
+        )
+        assert code == 2
+
+    def test_a_report_that_cannot_be_written_is_exit_two_with_its_own_message(
+        self, tmp_path, capsys
+    ):
+        # M3 item T3 — a report write that raises OSError must be exit 2 ("cannot
+        # read or write the batches") with its own message, never an uncaught
+        # traceback and never exit 1 (which means "the batches differ"). A parent
+        # that is a FILE, not a directory, makes `write_report`'s `mkdir` raise.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row()])
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("x", encoding="utf-8")
+        code = compare_batches_mod.main(
+            [
+                "--serial", str(serial),
+                "--parallel", str(parallel),
+                "--report", str(blocker / "compare.json"),
+            ]
+        )
+        assert code == 2
+        assert "cannot write the report" in capsys.readouterr().err
+
+    def test_a_missing_directory_raises_compare_error(self, tmp_path):
+        with pytest.raises(compare_batches_mod.CompareError):
+            compare_batches_mod.compare_batches(tmp_path / "nope", tmp_path)
+
+    # -- M3 item V2: a vacuous comparison is never "identical" --------------
+    def test_two_batches_with_nothing_to_compare_are_not_identical(self, tmp_path):
+        # `all([])` is True, so an empty `wanted` and an empty row set used to fold
+        # to `identical` — the one answer a gate must never give vacuously.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[], prepare={"bugs": []})
+        self._write_batch(parallel, rows=[], prepare={"bugs": []})
+
+        report = compare_batches_mod.compare_batches(serial, parallel)
+
+        assert report["compared"]["ran"] is False
+        assert report["verdict"] == "not_identical"
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 1
+        assert "nothing compared" in compare_batches_mod.verdict_line(report)
+
+    def test_two_batches_that_recorded_no_rows_are_not_identical(self, tmp_path):
+        # Preparing a bug but running no row is a batch that failed early, not two
+        # batches that agreed; it must not read as `identical` either.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[])
+        self._write_batch(parallel, rows=[])
+
+        report = compare_batches_mod.compare_batches(serial, parallel)
+
+        assert report["compared"] == {"bugs": 1, "rows": 0, "matched_rows": 0, "ran": False}
+        assert report["verdict"] == "not_identical"
+
+    def test_the_bug_flag_scopes_the_rows_half(self, tmp_path):
+        # `--bug` scoped only `compare_prepare`, so the rows half still compared
+        # every other bug and could answer `not_identical` for a bug the operator
+        # never named.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row(), self._row(bug="other/2")])
+        self._write_batch(
+            parallel, rows=[self._row(), self._row(bug="other/2", native_timeout=True)]
+        )
+
+        scoped = compare_batches_mod.compare_batches(serial, parallel, bugs=["pandas/1"])
+        assert scoped["bugs"] == ["pandas/1"]
+        assert scoped["verdict"] == "identical"
+        # The unscoped run still sees the other bug's moved limit.
+        assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == "not_identical"
+
+    def test_a_row_whose_seed_is_not_an_int_is_exit_two(self, tmp_path):
+        # Exit 1 means "the batches differ"; an unreadable row must not share it.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row(seed="not-a-number")])
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 2
+
+    def test_a_manifest_with_a_stray_byte_is_exit_two(self, tmp_path):
+        # A `UnicodeDecodeError` is a `ValueError`; both are "cannot read", never 1.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row()])
+        with (parallel / "manifest.jsonl").open("ab") as handle:
+            handle.write(b"\xff\xfe not utf-8\n")
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 2
+
+    # -- the verdict line ---------------------------------------------------
+    def test_verdict_line_names_the_bug_the_verdict_and_the_counts(self):
+        serial, parallel = Path("A"), Path("B")
+        report = {
+            "bugs": ["pandas/1"],
+            "verdict": "identical",
+            "prepare": {"bugs": {"pandas/1": {"identical": True}}},
+            "rows": {"matched": [{"identical": True}], "time_limit_differences": {"groups": []}},
+        }
+        line = compare_batches_mod.verdict_line(report)
+        assert line.startswith("compare-batches pandas/1: identical")
+        assert "prepare_diffs=0" in line and "matched=1" in line and "time_limit_diffs=0" in line
+        assert "[" not in line
+        assert serial != parallel
+
+    def test_verdict_line_names_a_moved_prepare_field(self):
+        report = {
+            "bugs": ["pandas/1"],
+            "verdict": "not_identical",
+            "prepare": {
+                "bugs": {
+                    "pandas/1": {
+                        "identical": False,
+                        "nodeid_differences": {"fail_to_pass": {}},
+                        "scalar_differences": {},
+                    }
+                }
+            },
+            "rows": {"matched": [], "time_limit_differences": {"groups": [{"identity": []}]}},
+        }
+        line = compare_batches_mod.verdict_line(report)
+        assert "prepare pandas/1:fail_to_pass" in line
+        assert "time limits: 1 group(s)" in line
+
+    def test_verdict_line_prints_a_bug_prepared_once_instead_of_raising(self):
+        # The `reason`-only block is the shape that most needs naming and the one a
+        # naive lookup would crash on.
+        prepare = compare_batches_mod.compare_prepare(
+            {"bugs": [{"bug": "pandas/1"}]}, {"bugs": []}, ["pandas/1"]
+        )
+        line = compare_batches_mod.verdict_line(
+            {"bugs": ["pandas/1"], "verdict": "not_identical", "prepare": prepare, "rows": {}}
+        )
+        assert "prepare_diffs=1" in line
+        assert "pandas/1" in line
+
+
+class TestSuiteCache:
+    """M3 items S1–S3 — the content-keyed cache for whole-suite runs.
+
+    [VANTA-WHY] The cache is only safe if a served pair IS the pair a fresh run
+    would have produced, and only useful if the key carries everything that can
+    move an outcome. These tests assert both, plus the three rules the mandate
+    names: a bad entry is never used, reuse is auditable (the key and the writer
+    ride the row), and ``--no-cache`` forces a fresh run while still reporting
+    what the cache would have returned. ``shuru.run`` is replaced, so no VM is
+    booted and every assertion is about the wrapper, not about a sandbox.
+
+    M3 item U2 adds the fourth rule, on both sides: a pair that measured nothing
+    is never stored, never served, and a ``--no-cache`` run replaces the entry it
+    could not use instead of leaving the bad one behind.
+    """
+
+    STEM = "reports/Demo_1-vanta"
+    OUTCOMES = {"tests/a.py::t": "failed", "tests/b.py::t": "passed"}
+
+    @staticmethod
+    def _host(tmp_path, monkeypatch, *, checkpoint_id="layer-1"):
+        """A batch directory holding one tree, and a private cache directory.
+
+        The cache directory is redirected so these tests never touch the real
+        ``runs/bugsinpy/suite_cache``, and ``VANTA_HARNESS_BUILD`` is pinned so a
+        key does not change with the sources under test (which the harness hash
+        otherwise covers on purpose — see ``suite_cache.harness_build``).
+
+        [VANTA-WHY] M3 item U3 — the LAYER's identity now rides the key too, and
+        it is read from the deps provenance ``bake`` writes, so these tests must
+        own that file as well: left alone, every lookup would answer from whatever
+        this checkout happens to have baked under the name ``chk``. ``deps_dir``
+        is redirected for the same reason ``CACHE_DIR_ENV`` is.
+        ``checkpoint_id=None`` writes a provenance with NO stamp, which is the
+        layer U3 refuses to cache at all.
+        """
+        batch = tmp_path / "batch"
+        write(batch / "vanta_tree" / "demo.py", "x = 1\n")
+        monkeypatch.setenv(suite_cache_mod.CACHE_DIR_ENV, str(tmp_path / "cache"))
+        monkeypatch.setenv("VANTA_HARNESS_BUILD", "py:test")
+        monkeypatch.delenv(suite_cache_mod.DISABLE_ENV, raising=False)
+        deps = tmp_path / "deps"
+        deps.mkdir()
+        provenance = {"installs": [], "checkpoint": "chk"}
+        if checkpoint_id is not None:
+            provenance[suite_cache_mod.CHECKPOINT_ID_KEY] = checkpoint_id
+        write(deps / "chk.json", json.dumps(provenance))
+        monkeypatch.setattr(suite_cache_mod, "deps_dir", lambda: deps)
+        return batch
+
+    @classmethod
+    def _vm_run(cls, calls, *, outcomes=None, report=True):
+        """A ``shuru.run`` that writes one run's report instead of booting a VM.
+
+        [VANTA-WHY] M3 item S5 — a pair is TWO VMs now, one script each, so this
+        fake answers per call: the suffix is read off the script the caller handed
+        us (``__VANTA_T0_<suffix>__``), only that run's report is written, and only
+        that run's marker block is returned. ``report=False`` is the other ending:
+        no report at all, which is what a VM that never booted, an OOM kill or a
+        capped run leaves behind — and what ``run_state`` refuses as a measurement.
+        """
+
+        def run(**kwargs):
+            calls.append(kwargs)
+            script = kwargs["command"][-1]
+            suffix = "1" if "__VANTA_T0_1__" in script else "2"
+            if report:
+                write(
+                    kwargs["host_root"] / f"{cls.STEM}.run{suffix}.json",
+                    json.dumps(
+                        {
+                            "tests": [
+                                {"nodeid": nodeid, "outcome": outcome}
+                                for nodeid, outcome in sorted(
+                                    (outcomes or cls.OUTCOMES).items()
+                                )
+                            ]
+                        }
+                    ),
+                )
+            start = 100 if suffix == "1" else 102
+            return shuru_mod.ExecResult(
+                stdout=(
+                    f"__VANTA_T0_{suffix}__={start}\n"
+                    f"__VANTA_EXIT_{suffix}__=0\n"
+                    f"__VANTA_T1_{suffix}__={start + 1}\n"
+                ),
+                stderr="",
+                exit_code=0,
+                timed_out=False,
+            )
+
+        return run
+
+    @classmethod
+    def _call(cls, batch, **over):
+        kwargs = dict(
+            checkpoint="chk",
+            batch_dir=batch,
+            tree_rel="vanta_tree",
+            test_cmd=[
+                "python",
+                "-m",
+                "pytest",
+                "tests",
+                "--json-report",
+                "--json-report-file={report}",
+            ],
+            report_rel_stem=cls.STEM,
+            disk_mb=1024,
+            timeout_secs=60,
+            origin="Demo_1/vanta_tree",
+        )
+        kwargs.update(over)
+        return suite_mod.run_suite_twice(**kwargs)
+
+    def test_a_served_pair_is_identical_to_the_fresh_one(self, tmp_path, monkeypatch):
+        """The mandate's cache-equivalence test, in PySnooper/3's shape (one bug,
+        one tree): run fresh, then again, and the second call must be served from
+        the entry with byte-identical outcomes and no second VM boot.
+
+        The pair is compared with ``to_json`` rather than field by field because
+        that is exactly the value the cache stores; if the two disagree anywhere
+        the stored value is not the measurement, and every later reader of a hit
+        would be reading a different experiment.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+
+        fresh = self._call(batch)
+        assert fresh.cache is not None
+        assert fresh.cache["state"] == "miss"
+        assert len(calls) == 2, "the fresh call must boot one VM per run of the pair"
+
+        served = self._call(batch)
+        assert served.cache is not None
+        assert served.cache["state"] == "hit"
+        assert served.cache["source"] == "Demo_1/vanta_tree"
+        assert served.cache["key"] == fresh.cache["key"]
+        assert served.cache["would_hit"] is False
+        assert len(calls) == 2, "a hit must not boot a VM"
+        assert served.to_json() == fresh.to_json()
+        assert served.stable_failures == fresh.stable_failures == {"tests/a.py::t"}
+        assert served.stable_collected == fresh.stable_collected
+        assert served.max_run_secs == fresh.max_run_secs
+
+    def test_two_callers_of_one_key_measure_it_once(self, tmp_path, monkeypatch):
+        """M3 items S5/S6 — the in-process single flight.
+
+        S5 runs three of a bug's suite runs at once and S6 runs rows at once, so
+        two callers wanting the SAME key at the same time is ordinary (one
+        candidate patch graded by two rows, or one tree demanded twice). One
+        measures and the other waits for the entry, instead of booting a second
+        pair of VMs for the same bytes.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        # A report-writing fake whose own bookkeeping is not the count under test:
+        # `calls` is appended by the gate below, once per VM the harness boots.
+        write_only = self._vm_run([])
+        entered = threading.Event()
+        release = threading.Event()
+
+        def run(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                entered.set()
+                release.wait(timeout=10)
+            return write_only(**kwargs)
+
+        monkeypatch.setattr(suite_mod.shuru, "run", run)
+
+        pairs: dict = {}
+
+        def call(name):
+            pairs[name] = self._call(batch)
+
+        leader = threading.Thread(target=call, args=("leader",))
+        leader.start()
+        assert entered.wait(timeout=10), "the leader never booted its first VM"
+
+        follower = threading.Thread(target=call, args=("follower",))
+        follower.start()
+        # While the leader holds the key the follower must not start a VM of its
+        # own: it is waiting for the leader's entry rather than measuring again.
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            assert len(calls) == 1, "the same key was measured twice at once"
+            time.sleep(0.01)
+
+        release.set()
+        leader.join(timeout=10)
+        follower.join(timeout=10)
+
+        assert len(calls) == 2, "one pair of VMs, for one key"
+        assert {pairs["leader"].cache["state"], pairs["follower"].cache["state"]} == {
+            "miss",
+            "hit",
+        }
+        assert pairs["leader"].to_json() == pairs["follower"].to_json()
+
+    def test_a_hit_restores_the_report_files(self, tmp_path, monkeypatch):
+        """A served pair must put its reports back where the other readers look.
+
+        ``prepare.strip_and_baseline`` reads ``reports/{slug}-oracle.run1.json`` and
+        ``replay`` reads ``reports/{slug}-vanta.run1/2.json`` directly. A hit that
+        skipped the run without restoring the files would leave those readers
+        deriving their answer from an absent report — a wrong answer out of a
+        correct hit.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+        self._call(batch)
+        for suffix in ("1", "2"):
+            (batch / f"{self.STEM}.run{suffix}.json").unlink()
+
+        self._call(batch)
+
+        assert len(calls) == 2
+        assert suite_mod.parse_report(batch / f"{self.STEM}.run1.json") == self.OUTCOMES
+        assert suite_mod.parse_report(batch / f"{self.STEM}.run2.json") == self.OUTCOMES
+
+    def test_without_an_origin_the_cache_is_never_touched(self, tmp_path, monkeypatch):
+        """Replay's call, and every call before this item: no lookup, no write.
+
+        The wrapper is opt-in per call site, which is what keeps ``replay`` out of
+        the cache without it having to know the cache exists.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+
+        pair = self._call(batch, origin=None)
+
+        assert pair.cache is None
+        assert len(calls) == 2
+        assert not (tmp_path / "cache").exists()
+
+    def test_no_cache_still_reports_what_it_would_have_hit(self, tmp_path, monkeypatch):
+        """``--no-cache`` forces a fresh run but does not hide the entry.
+
+        That is what lets the cache be verified on demand: the row still carries
+        the key and the writer of the entry it did not use.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+        fresh = self._call(batch)
+
+        monkeypatch.setenv(suite_cache_mod.DISABLE_ENV, "1")
+        forced = self._call(batch)
+
+        assert forced.cache["state"] == "off:no_cache"
+        assert forced.cache["would_hit"] is True
+        assert forced.cache["key"] == fresh.cache["key"]
+        assert forced.cache["source"] == "Demo_1/vanta_tree"
+        assert len(calls) == 4, "the flag forces a fresh run"
+        assert forced.to_json() == fresh.to_json()
+
+    @staticmethod
+    def _store_husk(path):
+        """Rewrite an entry so its payload is a pair that measured nothing.
+
+        Intact on purpose — schema, key, material and digest all agree — so
+        ``suite_cache.read_entry`` returns it and the U1/U2 rules are the only
+        thing standing between a husk and a reader. That is the entry an older
+        build could have written: the write gate that refuses one is new.
+        """
+        husk = suite_mod.compare_runs(
+            suite_mod.SuiteRun(outcomes={}, exit_code=0, report_found=False),
+            suite_mod.SuiteRun(outcomes={}, exit_code=0, report_found=False),
+        )
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["payload"] = husk.to_json()
+        document["payload_digest"] = suite_cache_mod.payload_digest(document["payload"])
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+    def test_an_unmeasured_fresh_pair_is_never_cached(self, tmp_path, monkeypatch):
+        """M3 item U2 — the write gate, the Python half of U1's.
+
+        A run whose VM never booted, that the OOM killer ended, or that hit the
+        cap leaves no report, and empty ``outcomes`` read as "no test fails". A
+        plain miss sets ``write`` for every fresh run, so the gate that saves the
+        cache from being the bug is ``run_state``, not ``write``.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls, report=False))
+
+        pair = self._call(batch)
+
+        assert pair.cache["state"] == "miss"
+        assert suite_mod.run_state(pair.first) is not None
+        assert suite_mod.run_state(pair.second) is not None
+        assert not suite_cache_mod.entry_path(pair.cache["key"]).exists()
+
+    def test_a_served_unmeasured_entry_is_refused_and_repaired(self, tmp_path, monkeypatch):
+        """M3 item U2 — the read-side mirror, so an entry written before the gate
+        is repaired rather than believed.
+
+        Refused with ``would_hit`` set, because the entry *was* there and a row
+        that said "miss" would claim a lookup that did not happen.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+        stale = self._call(batch)
+        path = suite_cache_mod.entry_path(stale.cache["key"])
+        self._store_husk(path)
+
+        refused = self._call(batch)
+
+        assert refused.cache["state"] == "unmeasured"
+        assert refused.cache["would_hit"] is True
+        assert len(calls) == 4, "an unmeasured entry must not spare the run"
+        assert refused.first.outcomes == self.OUTCOMES
+        # The fresh measurement replaced the husk it could not use.
+        assert self._call(batch).cache["state"] == "hit"
+
+    def test_no_cache_replaces_the_entry_it_could_not_use(self, tmp_path, monkeypatch):
+        """M3 item U2 — the flag refreshes, as its help and ``DISABLE_ENV`` say.
+
+        Leaving the entry alone meant a bad one outlived the single invocation
+        that was asked to check it — the one call whose whole point is to produce
+        a fresh measurement to compare against.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+        stale = self._call(batch)
+        self._store_husk(suite_cache_mod.entry_path(stale.cache["key"]))
+
+        monkeypatch.setenv(suite_cache_mod.DISABLE_ENV, "1")
+        forced = self._call(batch)
+
+        assert forced.cache["state"] == "off:no_cache"
+        assert forced.cache["would_hit"] is True
+        assert len(calls) == 4
+        # The fresh measurement replaced the husk, so the next lookup answers.
+        monkeypatch.delenv(suite_cache_mod.DISABLE_ENV)
+        assert self._call(batch).cache["state"] == "hit"
+        assert suite_mod.parse_report(batch / f"{self.STEM}.run1.json") == self.OUTCOMES
+
+    def test_an_unstamped_layer_is_never_served_and_never_written(
+        self, tmp_path, monkeypatch
+    ):
+        """M3 item U3 — a checkpoint with no recorded identity has no key.
+
+        The name is a label a re-bake reuses, so an entry keyed on it can outlive
+        the layer it measured. Without a stamp there is nothing this run could be
+        a repetition OF, so the cache is off for the call: the row says so, and
+        nothing is written under a key the next bake of this name would inherit.
+        """
+        batch = self._host(tmp_path, monkeypatch, checkpoint_id=None)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+
+        pair = self._call(batch)
+
+        assert pair.cache is not None
+        assert pair.cache["state"] == "off:unknown_checkpoint"
+        assert pair.cache["key"] == "", "no key could be built, so none is claimed"
+        assert pair.cache["would_hit"] is False
+        assert pair.first.outcomes == self.OUTCOMES, "the run itself still happened"
+        assert len(calls) == 2
+        assert not (tmp_path / "cache").exists(), "an unusable layer writes nothing"
+
+        # And the second call is a second run, not a hit: there is nothing to hit.
+        assert self._call(batch).cache["state"] == "off:unknown_checkpoint"
+        assert len(calls) == 4
+
+    def test_a_rebaked_layer_under_the_same_name_is_a_different_experiment(
+        self, tmp_path, monkeypatch
+    ):
+        """M3 item U3 — the name did not change, the layer did.
+
+        This is the defect the item is about: a re-bake reuses ``vanta-bi-<P>``,
+        so a name-keyed entry would serve the OLD layer's suite to a run measuring
+        a rebuilt one. The identity moved with the pins, so the lookup misses.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+        first = self._call(batch)
+        assert first.cache["state"] == "miss"
+
+        rebaked = json.dumps(
+            {
+                "installs": ["decorator==4.4.0"],
+                "checkpoint": "chk",
+                suite_cache_mod.CHECKPOINT_ID_KEY: "layer-2",
+            }
+        )
+        (tmp_path / "deps" / "chk.json").write_text(rebaked, encoding="utf-8")
+
+        second = self._call(batch)
+
+        assert second.cache["state"] == "miss", "a rebuilt layer is not the old one"
+        assert second.cache["key"] != first.cache["key"]
+        assert len(calls) == 4, "the rebuilt layer is measured, not inherited"
+
+    def test_an_entry_from_before_the_schema_bump_is_not_found(
+        self, tmp_path, monkeypatch
+    ):
+        """M3 item U3 — the bump is what makes "not find it" true.
+
+        An entry written before the identity existed was keyed on the name alone,
+        so it describes a layer this build cannot identify. Rewriting its schema
+        is how an old file looks to this build, and the honest answer is not
+        ``None`` from ``read_entry``'s other checks but this one: the format
+        changed, so the file is not consulted.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+        fresh = self._call(batch)
+
+        path = suite_cache_mod.entry_path(fresh.cache["key"])
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["schema"] = suite_cache_mod.SCHEMA_VERSION - 1
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+        assert suite_cache_mod.read_entry(dict(document["material"]), document["key"]) is None
+        assert self._call(batch).cache["state"] == "miss"
+        assert len(calls) == 4
+
+    def test_the_key_covers_the_suite_environment(self, tmp_path, monkeypatch):
+        """fastapi/2's rule: the same bytes measured 775 passed with
+        ``PYTHONPATH=./docs_src`` and 0 collected without it, so the environment is
+        part of the experiment and a key that missed it would serve one
+        environment's result for another's."""
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+
+        plain = self._call(batch)
+        with_env = self._call(batch, extra_env={"PYTHONPATH": "./docs_src"})
+
+        assert plain.cache["key"] != with_env.cache["key"]
+        assert len(calls) == 4
+
+    def test_a_tampered_entry_is_never_served(self, tmp_path, monkeypatch):
+        """A bad entry is recomputed and repaired, never used.
+
+        The payload here still parses as a pair; its digest no longer matches the
+        file, which is the case a "does it look right" reader would miss. The
+        wrapper must treat it as absent, run fresh, and leave a good entry behind.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+        first = self._call(batch)
+
+        path = suite_cache_mod.entry_path(first.cache["key"])
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["payload"]["first"]["outcomes"] = {"tests/a.py::t": "passed"}
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+        again = self._call(batch)
+
+        assert len(calls) == 4, "a tampered entry must not spare the run"
+        assert again.cache["state"] == "miss"
+        assert again.first.outcomes == self.OUTCOMES
+        # ... and the repair left an entry that now answers.
+        assert self._call(batch).cache["state"] == "hit"
+
+    def test_oracle_grading_labels_the_patch_it_grades(self, tmp_path, monkeypatch):
+        """M3 item S2 — a candidate patch's two runs name that patch's label.
+
+        A review row's candidate is the same bytes in every round and every arm,
+        so the origin is what a later hit is traced back to; the key is the bytes.
+        """
+        runs: list = []
+        monkeypatch.setattr(
+            tree_mod, "copy_tree", lambda src, dest: dest.mkdir(parents=True, exist_ok=True)
+        )
+        monkeypatch.setattr(
+            suite_mod,
+            "git_apply_patch",
+            lambda **kwargs: (True, "applied", suite_mod.APPLY_APPLIED),
+        )
+        monkeypatch.setattr(
+            suite_mod,
+            "run_suite_twice",
+            lambda **kwargs: runs.append(kwargs)
+            or suite_pair({"tests/test_demo.py::test_fix": "passed"}),
+        )
+        bug_prep = oracle_prep()
+
+        oracle_mod.grade(
+            prep=bug_prep,
+            batch_dir=tmp_path / "batch",
+            checkpoint="chk",
+            patch_path=write(tmp_path / "final.patch", "diff --git a/x b/x\n"),
+            label="sess1",
+            disk_mb=1024,
+        )
+
+        assert [run["origin"] for run in runs] == [
+            f"{bug_prep.slug}/sess1/hidden",
+            f"{bug_prep.slug}/sess1/patched",
+        ]
+
+    def test_a_grade_records_each_pair_s_cache_note(self, tmp_path, monkeypatch):
+        """M3 item S2 — the two grading pairs leave their provenance on the result.
+
+        Record-only: a note rides *beside* ``patch_good``, never inside it, so a
+        ``true_reject`` served from the cache is still traceable to the row that
+        measured those bytes first. Only ``grade``'s own two calls carry a note
+        here, so the pair order is the grading order.
+        """
+        pairs = []
+        for state, key, source in (("hit", "a" * 64, "Demo_1/sess1"), ("miss", "b" * 64, "")):
+            pair = suite_pair({"tests/test_demo.py::test_fix": "passed"})
+            pair.cache = {"key": key, "state": state, "source": source, "would_hit": False}
+            pairs.append(pair)
+        monkeypatch.setattr(
+            tree_mod, "copy_tree", lambda src, dest: dest.mkdir(parents=True, exist_ok=True)
+        )
+        monkeypatch.setattr(
+            suite_mod,
+            "git_apply_patch",
+            lambda **kwargs: (True, "applied", suite_mod.APPLY_APPLIED),
+        )
+        monkeypatch.setattr(suite_mod, "run_suite_twice", lambda **kwargs: pairs.pop(0))
+
+        result = oracle_mod.grade(
+            prep=oracle_prep(),
+            batch_dir=tmp_path / "batch",
+            checkpoint="chk",
+            patch_path=write(tmp_path / "final.patch", "diff --git a/x b/x\n"),
+            label="sess1",
+            disk_mb=1024,
+        )
+
+        assert result.cache == [
+            {
+                "side": "hidden",
+                "key": "a" * 64,
+                "state": "hit",
+                "source": "Demo_1/sess1",
+                "would_hit": False,
+            },
+            {
+                "side": "patched",
+                "key": "b" * 64,
+                "state": "miss",
+                "source": "",
+                "would_hit": False,
+            },
+        ]
+        # The dict form copies the entries, so a caller cannot mutate the field
+        # through it — and it keeps ``None`` as ``None`` (see the old-row test).
+        assert result.as_dict()["cache"] == result.cache
+        assert result.as_dict()["cache"] is not result.cache
+
+    def test_a_censored_grade_still_records_the_hidden_note(self, tmp_path, monkeypatch):
+        """The E3 guard returns on an unreadable hidden run — but that grading was
+        still a grading, and its note must not vanish exactly where the evidence is
+        weakest. No patched pair runs, so no patched note exists."""
+        pair = suite_mod.compare_runs(
+            suite_mod.SuiteRun(outcomes={}, exit_code=1, report_found=False),
+            suite_mod.SuiteRun(outcomes={}, exit_code=1, report_found=False),
+        )
+        pair.cache = {
+            "key": "c" * 64,
+            "state": "off:no_cache",
+            "source": "Demo_1/sess1",
+            "would_hit": True,
+        }
+        monkeypatch.setattr(
+            tree_mod, "copy_tree", lambda src, dest: dest.mkdir(parents=True, exist_ok=True)
+        )
+        monkeypatch.setattr(
+            suite_mod,
+            "git_apply_patch",
+            lambda **kwargs: (True, "applied", suite_mod.APPLY_APPLIED),
+        )
+        monkeypatch.setattr(suite_mod, "run_suite_twice", lambda **kwargs: pair)
+
+        result = oracle_mod.grade(
+            prep=oracle_prep(),
+            batch_dir=tmp_path / "batch",
+            checkpoint="chk",
+            patch_path=write(tmp_path / "final.patch", "diff --git a/x b/x\n"),
+            label="sess1",
+            disk_mb=1024,
+        )
+
+        assert result.inconclusive is True
+        assert result.cache == [
+            {
+                "side": "hidden",
+                "key": "c" * 64,
+                "state": "off:no_cache",
+                "source": "Demo_1/sess1",
+                "would_hit": True,
+            }
+        ]
+
+    def test_an_old_oracle_row_reads_the_cache_as_unknown(self):
+        """The standing rule for a record-only field: an ``oracle.json`` written
+        before this item reads as unknown, never as ``[]`` — an empty list would
+        claim the cache was consulted and held nothing, which for a row graded
+        before the cache existed is a lookup that never happened."""
+        old = {"apply_ok": True, "patch_good": False}
+        result = runner_mod.oracle_from_dict(old)
+        assert result.cache is None
+        assert result.as_dict()["cache"] is None
+
+        # A recorded list round-trips: only a present list is copied in.
+        recorded = oracle_mod.OracleResult(
+            apply_ok=True,
+            cache=[{"side": "hidden", "key": "d" * 64, "state": "hit"}],
+        )
+        back = runner_mod.oracle_from_dict(recorded.as_dict())
+        assert back.cache == [{"side": "hidden", "key": "d" * 64, "state": "hit"}]
+
+    def test_prepare_labels_the_tree_it_measures(self, tmp_path, monkeypatch):
+        """M3 item S3 — a repeat prepare names the tree, not the caller.
+
+        The tree NAME is in the origin only: the key is the tree's bytes, so a
+        re-prepared tree is a hit exactly when it is the same tree.
+        """
+        runs: list = []
+        monkeypatch.setattr(
+            suite_mod,
+            "run_suite_twice",
+            lambda **kwargs: runs.append(kwargs)
+            or suite_pair({"tests/a.py::t": "passed"}),
+        )
+        bug_prep = prep()
+
+        prepare_mod._suite("chk", tmp_path / "batch", bug_prep, "vanta_tree", "vanta")
+
+        assert runs[0]["origin"] == f"{bug_prep.slug}/vanta_tree"
+        assert runs[0]["report_rel_stem"] == f"reports/{bug_prep.slug}-vanta"
+        assert runs[0]["tree_rel"].endswith("/vanta_tree")
 
 
 class TestCleanTreeNoise:
@@ -6648,7 +9651,15 @@ class TestVersionPin:
                 text=True,
                 timeout=60,
             )
-            return completed.stdout
+            # The whole result, as ``_guest_probe`` returns it: [VANTA-WHY] M3 item P1
+            # — a fake that answered with ``stdout`` alone could not stand in for a
+            # probe whose failure the reason must quote.
+            return shuru_mod.ExecResult(
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                exit_code=completed.returncode,
+                timed_out=False,
+            )
 
         monkeypatch.setattr(version_pin_mod, "_guest_probe", fake)
         return fake
@@ -6778,9 +9789,9 @@ class TestVersionPin:
         record = version_pin_mod.as_record(
             outcome.pin, reason=outcome.reason, probed=outcome.probed
         )
-        # The exact shape recorded for PySnooper/3 in night3, plus the B7 field: a
-        # project with no version machinery pins nothing, reads no sandbox, and its
-        # tree is left exactly as it was.
+        # The exact shape recorded for PySnooper/3 in night3, plus the B7 and T4
+        # fields: a project with no version machinery pins nothing, reads no sandbox,
+        # passes over no candidate, and its tree is left exactly as it was.
         assert record == {
             "pinned": False,
             "kind": None,
@@ -6790,6 +9801,7 @@ class TestVersionPin:
             "sha256": None,
             "reason": None,
             "probe_sandbox": None,
+            "skipped": [],
         }
         # Nothing to freeze means nothing is written.
         assert sorted(str(p.relative_to(tree)) for p in tree.rglob("*")) == before
@@ -6853,7 +9865,7 @@ class TestVersionPin:
         monkeypatch.setattr(
             version_pin_mod,
             "_setuptools_scm_version",
-            lambda _tree, *, vm: "1.2.3",
+            lambda _tree, *, vm: ("1.2.3", ""),
         )
         outcome = version_pin_mod.measure(tree, vm=self._vm())
         assert outcome.kind == "setuptools_scm"
@@ -6900,15 +9912,303 @@ class TestVersionPin:
         """
         tree = tmp_path / "tree"
         write(tree / "pkg" / "_version.py", self._stub())
-        monkeypatch.setattr(version_pin_mod, "_probe", lambda _path, _tree, *, vm: None)
+        monkeypatch.setattr(
+            version_pin_mod,
+            "_probe",
+            lambda _path, _tree, *, vm: (None, "the probe ended with exit code 1: boom"),
+        )
 
         outcome = version_pin_mod.measure(tree, vm=self._vm())
         assert outcome.kind == "versioneer"
         assert outcome.pin is None
         assert "could not be measured" in outcome.reason
         assert "pkg/_version.py" in outcome.reason
+        # [VANTA-WHY] M3 item P1 — the note travels with the reason, so the row says
+        # which failure it was and not merely that there was one.
+        assert "exit code 1: boom" in outcome.reason
         # And it is distinguishable from the honest no-op.
         assert outcome != version_pin_mod.PinOutcome(kind=None, pin=None, reason=None)
+
+    def test_a_failed_measurement_is_marked_for_the_gate(self, tmp_path, monkeypatch):
+        """[VANTA-WHY] M3 item P3 — the bit prepare refuses a bug on.
+
+        Three outcomes mean the machinery was reached and produced nothing usable, and
+        each is the pandas/1 shape if prepare runs on: the tree the sandbox seeds from
+        reports ``0+unknown``, the native suite aborts at collection on both sides, and
+        the row ends ``native_vacuous`` with the cause nowhere in the gate. This is the
+        first — the project's own version file could not be probed at all.
+        """
+        unmeasured = tmp_path / "unmeasured"
+        write(unmeasured / "pkg" / "_version.py", self._stub())
+        monkeypatch.setattr(
+            version_pin_mod,
+            "_probe",
+            lambda _path, _tree, *, vm: (None, "the probe ended with exit code 1: boom"),
+        )
+
+        outcome = version_pin_mod.measure(unmeasured, vm=self._vm())
+
+        assert outcome.pin is None and "could not be measured" in outcome.reason
+        assert outcome.measurement_failed is True
+
+    @staticmethod
+    def _broken_version_file(source: str = "elsewhere/_version.py") -> str:
+        """A versioneer-shaped file that cannot be imported. (item T4)
+
+        It still carries the two names the text pre-filter keys on, so the walk
+        offers it for a probe — and then the probe's ``runpy`` hits the ``raise``
+        before either name is bound, which is exactly the shape T4 is about: the
+        file is probed, the probe answers nothing, and the harness never learns
+        whether it names itself.
+        """
+        return (
+            "raise RuntimeError('this vendored version file blows up on import')\n"
+            "\n"
+            "\n"
+            "def get_config():\n"
+            "    class C:\n"
+            "        pass\n"
+            "    c = C()\n"
+            "    c.VCS = 'git'\n"
+            f"    c.versionfile_source = {source!r}\n"
+            "    return c\n"
+            "\n"
+            "\n"
+            "def get_versions():\n"
+            "    return {'version': '0.0.0'}\n"
+        )
+
+    def test_a_vendored_version_file_that_fails_to_import_is_skipped(
+        self, tmp_path, monkeypatch
+    ):
+        """[VANTA-WHY] M3 item T4 — an undeclared candidate cannot decide the outcome.
+
+        A vendored copy of somebody else's ``_version.py`` that raises on import used
+        to be recorded as "the project's version file could not be measured" and refuse
+        the bug, even when the project's own configuration named a perfectly measurable
+        ``setuptools_scm`` version file. Ownership is established from that
+        configuration, so the undeclared candidate is recorded on the row
+        (:attr:`PinOutcome.skipped`) and the measurement falls through.
+        """
+        tree = tmp_path / "tree"
+        write(
+            tree / "pyproject.toml",
+            "[tool.setuptools_scm]\n" 'write_to = "pkg/_version.py"\n',
+        )
+        write(tree / "docs" / "_version.py", self._broken_version_file())
+        self._fake_probe(monkeypatch)
+        monkeypatch.setattr(
+            version_pin_mod,
+            "_setuptools_scm_version",
+            lambda _tree, *, vm: ("1.2.3", ""),
+        )
+
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
+
+        assert outcome.kind == "setuptools_scm"
+        assert outcome.measurement_failed is False
+        assert outcome.pin is not None
+        assert outcome.pin.file == "pkg/_version.py"
+        assert outcome.pin.version == "1.2.3"
+        # Recorded, not silently dropped: the row says which file was passed over.
+        assert outcome.skipped == ("docs/_version.py",)
+
+        record = version_pin_mod.as_record(
+            outcome.pin, reason=outcome.reason, probed=outcome.probed,
+            skipped=outcome.skipped,
+        )
+        assert record["skipped"] == ["docs/_version.py"]
+
+    def test_a_declared_version_file_that_fails_to_import_still_gates(
+        self, tmp_path, monkeypatch
+    ):
+        """[VANTA-WHY] M3 item T4 — the declaration is what makes the gate.
+
+        The same unimportable file *is* the project's own when ``setup.cfg`` names it,
+        and then nothing may fall through: the tree the sandbox seeds from would report
+        ``0+unknown`` and the row would die ``native_vacuous`` two stages later.
+        """
+        tree = tmp_path / "tree"
+        write(
+            tree / "setup.cfg",
+            "[versioneer]\n" "versionfile_source = pkg/_version.py\n",
+        )
+        write(tree / "pkg" / "_version.py", self._broken_version_file("pkg/_version.py"))
+        self._fake_probe(monkeypatch)
+
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
+
+        assert outcome.pin is None
+        assert outcome.measurement_failed is True
+        assert "could not be measured" in outcome.reason
+        assert "pkg/_version.py" in outcome.reason
+        # It decided the outcome, so it is not a skipped candidate.
+        assert outcome.skipped == ()
+
+    def test_a_measured_placeholder_is_marked_for_the_gate(self, tmp_path, monkeypatch):
+        """The second: the probe answered, and the answer is ``0+unknown`` itself."""
+        placeholder = tmp_path / "placeholder"
+        write(
+            placeholder / "pkg" / "_version.py",
+            self._stub(version="0+unknown", full=None, error="unable to compute version"),
+        )
+        self._fake_probe(monkeypatch)
+
+        outcome = version_pin_mod.measure(placeholder, vm=self._vm())
+
+        assert outcome.pin is None and "placeholder" in outcome.reason
+        assert outcome.measurement_failed is True
+
+    def test_setuptools_scm_that_answers_nothing_is_marked_for_the_gate(
+        self, tmp_path, monkeypatch
+    ):
+        """The third: a probe booted, ``write_to`` was declared, and nothing came back."""
+        scm = tmp_path / "scm"
+        write(
+            scm / "pyproject.toml",
+            "[tool.setuptools_scm]\nwrite_to = \"pkg/_version.py\"\n",
+        )
+        monkeypatch.setattr(
+            version_pin_mod,
+            "_setuptools_scm_version",
+            lambda _tree, *, vm: (None, "the probe ended with exit code 4: boom"),
+        )
+
+        outcome = version_pin_mod.measure(scm, vm=self._vm())
+
+        assert outcome.kind == "setuptools_scm" and outcome.pin is None
+        assert outcome.measurement_failed is True
+
+    def test_a_reason_that_is_not_a_failed_measurement_is_not_marked(self, tmp_path):
+        """[VANTA-WHY] M3 item P3 — the one carve-out, stated rather than inferred.
+
+        A ``reason`` alone cannot be what prepare refuses on. The honest no-op has no
+        reason at all, and the setuptools_scm-without-``write_to`` outcome has one while
+        nothing failed: the project keeps no version file for a sandbox to read, which
+        is a fact about its configuration, and prepare has always gone on to measure
+        that bug. Gating on ``probed`` instead would also gate it on the day a tree
+        carries both a vendored ``_version.py`` and a ``write_to``-less scm table.
+        """
+        nothing = tmp_path / "nothing"
+        write(
+            nothing / "setup.py",
+            "from setuptools import setup\nsetup(version='0.0.6')\n",
+        )
+        outcome = version_pin_mod.measure(nothing, vm=self._vm())
+        assert outcome.reason is None
+        assert outcome.measurement_failed is False
+
+        no_write = tmp_path / "no_write"
+        write(
+            no_write / "pyproject.toml",
+            "[tool.setuptools_scm]\n" 'version_scheme = "guess-next-dev"\n',
+        )
+        outcome = version_pin_mod.measure(no_write, vm=self._vm())
+        assert outcome.kind == "setuptools_scm"
+        assert "write_to" in outcome.reason
+        assert outcome.probed is False
+        assert outcome.measurement_failed is False, (
+            "P3 gates a failed measurement, not a project that keeps no version file"
+        )
+
+    def test_an_unmeasured_pin_quotes_the_guest_stderr_and_exit_code(
+        self, tmp_path, monkeypatch
+    ):
+        """[VANTA-WHY] M3 item P1 — the failing probe's own complaint reaches the row.
+
+        ``_guest_probe`` used to return ``stdout`` alone, so a probe that never wrote
+        its sentinel — a crash on import, a mount that refused a write, a VM that would
+        not boot, a timeout — was recorded as "could not be measured" and nothing more,
+        and the cause had to be found by booting the probe again by hand. The
+        ``ExecResult`` is now carried to :func:`version_pin._probe_note`, which is what
+        this asserts on: the exit code is always named and ``stderr`` is quoted.
+        """
+        tree = tmp_path / "tree"
+        write(tree / "pkg" / "_version.py", self._stub())
+        monkeypatch.setattr(
+            version_pin_mod.shuru,
+            "run",
+            lambda **kwargs: shuru_mod.ExecResult(
+                stdout="shuru: booting VM (2cpus, 1024MB RAM, 16384MB disk)...\n",
+                stderr=(
+                    "Traceback (most recent call last):\n"
+                    "  File \"<string>\", line 4, in <module>\n"
+                    "OSError: [Errno 30] Read-only file system: '.git/index'\n"
+                ),
+                exit_code=1,
+                timed_out=False,
+            ),
+        )
+
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
+
+        assert outcome.probed is True
+        assert outcome.pin is None
+        assert "exit code 1" in outcome.reason
+        assert "Read-only file system" in outcome.reason
+        assert "Traceback" in outcome.reason
+
+    def test_a_probe_that_times_out_says_which_cap_it_hit(self, tmp_path, monkeypatch):
+        """A timeout is a failed measurement too, and its note names the cap."""
+        tree = tmp_path / "tree"
+        write(tree / "pkg" / "_version.py", self._stub())
+        monkeypatch.setattr(
+            version_pin_mod.shuru,
+            "run",
+            lambda **kwargs: shuru_mod.ExecResult(
+                stdout="shuru: booting VM (2cpus, 1024MB RAM, 16384MB disk)...\n",
+                stderr=f"shuru run TIMEOUT after {version_pin_mod.PROBE_TIMEOUT_SECS}s",
+                exit_code=None,
+                timed_out=True,
+            ),
+        )
+
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
+
+        assert outcome.pin is None
+        assert f"timed out after {version_pin_mod.PROBE_TIMEOUT_SECS}s" in outcome.reason
+
+    def test_the_note_is_bounded_so_a_reason_stays_one_line(
+        self, tmp_path, monkeypatch
+    ):
+        """The note is bounded: ``reason`` is prose in ``prepare.json``, not a log."""
+        tree = tmp_path / "tree"
+        write(tree / "pkg" / "_version.py", self._stub())
+        noise = "x" * 4000
+        monkeypatch.setattr(
+            version_pin_mod.shuru,
+            "run",
+            lambda **kwargs: shuru_mod.ExecResult(
+                stdout="", stderr=noise, exit_code=1, timed_out=False
+            ),
+        )
+
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
+
+        assert outcome.pin is None
+        assert noise not in outcome.reason
+        assert outcome.reason.endswith("…")
+        assert len(outcome.reason) < 600
+
+    def test_a_probe_that_writes_nothing_and_exits_zero_still_says_so(
+        self, tmp_path, monkeypatch
+    ):
+        """A silent zero-exit probe is a different failure from a crash, and readable."""
+        tree = tmp_path / "tree"
+        write(tree / "pkg" / "_version.py", self._stub())
+        monkeypatch.setattr(
+            version_pin_mod.shuru,
+            "run",
+            lambda **kwargs: shuru_mod.ExecResult(
+                stdout="", stderr="", exit_code=0, timed_out=False
+            ),
+        )
+
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
+
+        assert outcome.pin is None
+        assert "wrote nothing" in outcome.reason
+        assert "exit code 0" in outcome.reason
 
     def test_the_probe_mounts_the_tree_read_only_in_its_own_vm(
         self, tmp_path, monkeypatch
@@ -7099,6 +10399,179 @@ class TestTheFreezeRefusalIsAGate:
         assert not (root.parent / "escape.py").exists()
 
 
+class TestTheUnmeasuredPinIsAGate:
+    """[VANTA-WHY] M3 item P3 — a pin that could not be measured refuses the bug.
+
+    ``strip_and_baseline`` recorded a ``reason`` outcome in ``version_pin`` and then
+    carried on, so a bug whose version machinery could not produce a version ran its
+    whole native suite against a tree reporting ``0+unknown``: on pandas/1 collection
+    aborted on both sides and the row ended ``native_vacuous`` — an ``infra_failure``
+    naming the tree for what was a fact about the pin. It is refused here, recorded
+    like the escape above it, with the probe's own complaint as the visible cause. The
+    ``write_to``-less setuptools_scm outcome keeps preparing exactly as it did.
+    """
+
+    def _prep_with(self, tmp_path, monkeypatch, pin):
+        root = tmp_path / "batch" / "worktrees" / "Demo_1"
+        write(root / "oracle_tree" / "demo.py", "x = 1\n")
+        monkeypatch.setattr(
+            prepare_mod, "_read_report", lambda batch_dir, stem: {"tests": []}
+        )
+        # No repository here, so the guard's candidate set is empty; nothing is scanned.
+        monkeypatch.setattr(tree_mod, "tracked_paths", lambda checkouts: set())
+        monkeypatch.setattr(version_pin_mod, "measure", lambda tree, *, vm: pin)
+        return prep(root=root)
+
+    def test_a_pin_that_cannot_be_measured_is_a_gate_failure(
+        self, tmp_path, monkeypatch
+    ):
+        unmeasured = version_pin_mod.PinOutcome(
+            kind="versioneer",
+            pin=None,
+            reason=(
+                "a versioneer-shaped version file was found but could not be "
+                "measured: demo/_version.py — the probe ended with exit code 1: boom"
+            ),
+            probed=True,
+            measurement_failed=True,
+        )
+        bug_prep = self._prep_with(tmp_path, monkeypatch, unmeasured)
+
+        recorded = prepare_mod.strip_and_baseline(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch"
+        )
+
+        assert recorded is False
+        assert len(bug_prep.gate_failures) == 1
+        assert prepare_mod.VERSION_PIN_UNMEASURED_REASON in bug_prep.gate_failures[0]
+        assert "could not be measured" in bug_prep.gate_failures[0]
+        # The cause P1 made visible travels all the way into the gate.
+        assert "exit code 1: boom" in bug_prep.gate_failures[0]
+
+    def test_the_setuptools_scm_without_write_to_case_still_prepares(
+        self, tmp_path, monkeypatch
+    ):
+        """The carve-out at the caller: a reason that is not a failure is not a gate.
+
+        The probe never booted and the project keeps no version file, so there is
+        nothing to freeze and nothing failed. Refusing here would drop every bug in
+        such a project from the batch.
+        """
+        carve_out = version_pin_mod.PinOutcome(
+            kind="setuptools_scm",
+            pin=None,
+            reason=(
+                "setuptools_scm is configured without a write_to/version_file, so "
+                "the project keeps no version file for a sandbox to read"
+            ),
+            probed=False,
+            measurement_failed=False,
+        )
+        bug_prep = self._prep_with(tmp_path, monkeypatch, carve_out)
+
+        class ReachedTheSuite(Exception):
+            """Raised where a VM would boot, so the step stops without one."""
+
+        def fake_suite(*_args, **_kwargs):
+            raise ReachedTheSuite
+
+        monkeypatch.setattr(prepare_mod, "_suite", fake_suite)
+
+        with pytest.raises(ReachedTheSuite):
+            prepare_mod.strip_and_baseline(
+                bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch"
+            )
+
+        assert bug_prep.gate_failures == [], (
+            "the pin step must not have refused the bug"
+        )
+        assert bug_prep.version_pin["pinned"] is False
+        assert bug_prep.version_pin["reason"] == carve_out.reason
+
+
+class TestTheFrozenPinReachesVantaClean:
+    """[VANTA-WHY] M3 item P4 — the regression guard for the pandas/1 pin loss.
+
+    P1, P2 and P3 each repaired one link: the probe's failure is quoted in the reason
+    (P1), the read-only mount no longer makes shuru refuse the boot before a VM exists
+    (P2), and a measurement that fails now refuses the bug at prepare (P3). None of the
+    three proves the chain *end to end*, and the loss this round started from was
+    exactly a link no test watched: the probe answered nothing, the row read ``pinned
+    false``, and prepare went on — nobody noticed because nothing asserted the positive
+    case at prepare at all.
+
+    So this test walks the chain at the level prepare owns: a versioneer project, a
+    working probe, and ``strip_and_baseline`` run to its last line. It asserts the two
+    facts the session then depends on — the row records ``pinned true``, and the frozen
+    version file is in ``vanta_clean``, the tree the runner seeds from. The frozen bytes
+    are read back with versioneer's own reader regex, and their digest is compared with
+    the row's ``sha256``, so the file on disk and the number in the record cannot drift.
+
+    Only the probe VM is faked (a unit test cannot boot one); the detection, the freeze,
+    the record and the copy are all the real code.
+    """
+
+    @staticmethod
+    def _measured_suite(*_args, **_kwargs) -> suite_mod.SuitePair:
+        """A measured pair: a report was written, one test collected and passed twice."""
+        run = suite_mod.SuiteRun(
+            outcomes={"tests/test_demo.py::test_a": "passed"},
+            exit_code=0,
+            report_found=True,
+        )
+        return suite_mod.SuitePair(first=run, second=run)
+
+    def test_prepare_pins_a_versioneer_tree_and_freezes_vanta_clean(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "batch" / "worktrees" / "Demo_1"
+        write(root / "oracle_tree" / "pkg" / "_version.py", TestVersionPin._stub())
+        write(
+            root / "oracle_tree" / "pkg" / "__init__.py",
+            "from ._version import get_versions\n"
+            "__version__ = get_versions()['version']\n",
+        )
+        monkeypatch.setattr(
+            prepare_mod, "_read_report", lambda batch_dir, stem: {"tests": []}
+        )
+        # No repository here, so the guard's candidate set is empty; nothing is scanned.
+        monkeypatch.setattr(tree_mod, "tracked_paths", lambda checkouts: set())
+        # The one piece a unit test cannot boot, so it is the only stand-in here.
+        TestVersionPin._fake_probe(monkeypatch)
+        monkeypatch.setattr(prepare_mod, "_suite", self._measured_suite)
+        bug_prep = prep(root=root)
+
+        recorded = prepare_mod.strip_and_baseline(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch"
+        )
+
+        assert recorded is True
+        assert bug_prep.gate_failures == []
+        assert bug_prep.version_pin["pinned"] is True
+        assert bug_prep.version_pin["kind"] == "versioneer"
+        assert bug_prep.version_pin["file"] == "pkg/_version.py"
+        assert bug_prep.version_pin["version"] == "1.2.3"
+        assert bug_prep.version_pin["probe_sandbox"] == "shuru"
+
+        # The tree the runner seeds from carries the file, and it is the sdist SHORT
+        # form versioneer itself reads back — not the long form it replaced.
+        frozen = (root / "vanta_clean" / "pkg" / "_version.py").read_text()
+        found = re.search(
+            r"version_json = '''\n(.*)'''  # END VERSION_JSON", frozen, re.DOTALL
+        )
+        assert found is not None, frozen
+        assert json.loads(found.group(1)) == {
+            "version": "1.2.3",
+            "full-revisionid": "a" * 40,
+            "dirty": False,
+            "error": None,
+        }
+        # The record's digest is over the bytes that landed in ``vanta_clean``.
+        assert bug_prep.version_pin["sha256"] == hashlib.sha256(
+            frozen.encode("utf-8")
+        ).hexdigest()
+
+
 class TestPrepareRunRecordContract:
     """``prepare.json`` has one writer and one reader, and they cannot drift.
 
@@ -7155,6 +10628,12 @@ class TestPrepareRunRecordContract:
             preps=list(preps),
             n_ctx=n_ctx,
             n_ctx_source=n_ctx_source,
+            config_block={
+                "config_hash": "0" * 64,
+                "config_path": "configs/v1-m3.toml",
+                "config_override": False,
+                "config_overrides": [],
+            },
         )
         (batch_dir / "prepare.json").write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
@@ -7217,6 +10696,12 @@ class TestPrepareRunRecordContract:
                 )
             },
             collect_flip_nodeids=["tests/test_skip_defaults.py::test_skip_defaults"],
+            collect_excluded={
+                "tests/test_side.py": (
+                    "outside the import closure of the declared tests "
+                    "(tests/test_declared.py): ModuleNotFoundError: No module named 'mysql'"
+                )
+            },
             gate_failures=[],
             context=verdict,
             issue=issue,
@@ -7299,6 +10784,9 @@ class TestPrepareRunRecordContract:
         assert loaded.precompile == ["lib/matplotlib/widgets.py"]
         assert loaded.hidden_by_collect_flip == original.hidden_by_collect_flip
         assert loaded.collect_flip_nodeids == sorted(original.collect_flip_nodeids)
+        # §3.4 round 10: the files the collect gate set aside, which the row records so
+        # a re-prepare can prove it set aside the same suite edges.
+        assert loaded.collect_excluded == original.collect_excluded
         assert loaded.hidden_nodeids == sorted(
             [*original.fail_to_pass, *original.collect_flip_nodeids]
         )
@@ -7465,6 +10953,32 @@ class TestContextWindowWarning:
         warning = runner_mod.context_window_warning(self._batch(tmp_path, n_ctx=None))
         assert warning is not None
         assert "records no n_ctx" in warning
+
+    def test_the_effective_environment_is_what_is_compared(self, tmp_path, monkeypatch):
+        """[VANTA-WHY] M3 item T5 — the window is read from the invocation's env.
+
+        A setting frozen in ``configs/v1-m3.toml`` but left out of the caller's shell
+        is applied to every child the run starts, so those children resolve the frozen
+        window — not the one ``os.environ`` would give here. The comparison must read
+        the same effective environment the children inherit, or a variable merely
+        exported in this shell reads as a divergence the run does not have.
+        """
+        batch = self._batch(tmp_path, n_ctx=131_072)
+        # The process environment says 65536; every child will actually see 131072.
+        monkeypatch.setenv("VANTA_LLM_CONTEXT_TOKENS", "65536")
+        assert (
+            runner_mod.context_window_warning(
+                batch, environ={"VANTA_LLM_CONTEXT_TOKENS": "131072"}
+            )
+            is None
+        )
+        # And the passed environment governs: a window that disagrees with the batch
+        # warns even when the process environment happens to agree.
+        monkeypatch.setenv("VANTA_LLM_CONTEXT_TOKENS", "131072")
+        warning = runner_mod.context_window_warning(
+            batch, environ={"VANTA_LLM_CONTEXT_TOKENS": "65536"}
+        )
+        assert warning is not None and "65536" in warning
 
 
 # ============================================================================
@@ -9060,19 +12574,31 @@ class TestRunBakeActions:
             "vanta-bi-Demo-2"
         )
 
-    def test_the_summary_names_what_was_rebuilt_skipped_and_failed(self):
+    def test_the_summary_says_the_outcome_not_the_plan_it_was_written_from(self):
+        """The words after the state are what happened, never the plan's reason.
+
+        ``[done] … — not baked yet`` was the measured complaint: the state word and
+        the plan's reason said opposite things on one line. The plan's wording
+        (``not baked yet``, ``--force: replaced``, ``delete+rebuild``) belongs in the
+        ``bake plan`` block; the summary is the record of the run.
+        """
         recorder = self.Recorder(present={PY38, "vanta-bi-Demo-1", "vanta-bi-Demo-2"})
         summary = self._run(_layers(PY38, "vanta-bi-Demo-1"), recorder, force=True)
-        assert "[done] vanta-bi-Demo-1: delete+rebuild" in summary
+        assert "[done] vanta-bi-Demo-1: rebuilt" in summary
         # A stale child is *deleted*, which is not the same statement as "skipped".
-        assert "[deleted] vanta-bi-Demo-2: delete" in summary
-        assert "[done] vanta-bugsinpy-py3.8" in summary
+        assert "[deleted] vanta-bi-Demo-2: deleted" in summary
+        assert "[done] vanta-bugsinpy-py3.8: rebuilt" in summary
+        # Nothing the plan said about what it *would* do survives into the record.
+        assert "not baked yet" not in summary
+        assert "--force" not in summary
+        assert "delete+rebuild" not in summary
 
     def test_without_force_a_baked_layer_is_not_touched(self):
         recorder = self.Recorder(present={PY38, "vanta-bi-Demo-1"})
         summary = self._run(_layers(PY38, "vanta-bi-Demo-1"), recorder, force=False)
         assert recorder.calls == []
         assert summary.count("[skipped]") == 2
+        assert "[skipped] vanta-bi-Demo-1: already baked" in summary
 
     def test_the_run_logs_each_built_layers_own_build_environment(self):
         logged: list[str] = []
@@ -9112,7 +12638,9 @@ class TestRunBakeActions:
 
         Whole, not a tail, and written for a layer whether it succeeded or failed —
         the layers that failed are the ones whose logs are worth reading, and the last
-        bake's three failures left no log at all between them.
+        bake's three failures left no log at all between them. An unrelated log in the
+        folder is left where it is: §8.6 gives each run its own folder
+        (:func:`bake_logs_dir`), so nothing is deleted to keep this run's logs clear.
         """
         logs = tmp_path / "bake-logs"
         logs.mkdir()
@@ -9142,7 +12670,7 @@ class TestRunBakeActions:
             log=logged.append,
             logs_dir=logs,
         )
-        assert not stale.exists(), "this bake's logs, and only this bake's"
+        assert stale.exists(), "an earlier bake's log is never wiped"
         for name in (PY38, "vanta-bi-Demo-1"):
             path = bake_mod.bake_log_path(logs, name)
             assert path.exists(), name
@@ -9307,12 +12835,15 @@ class TestBakeLogProvenance:
         # Shuru's line by itself is not an error line at all.
         assert bake_mod.last_error_line("shuru: checkpoint 'x' saved\n") == "(no output)"
 
-    def test_a_layers_log_is_written_whole_and_an_old_one_is_cleared(self, tmp_path):
+    def test_a_layers_log_is_written_whole_and_an_old_one_is_kept(self, tmp_path):
         """The one-line error in the summary is a pointer, so the file has to be there.
 
         Whole and not a tail: the reason a layer failed is usually not near the end of
         its log — pip's error is followed by shuru's ``checkpoint … saved``, and a
-        compiler's ``fatal error`` by the rest of the recipe.
+        compiler's ``fatal error`` by the rest of the recipe. And an earlier bake's log
+        is *kept*: §8.6 gives each run its own folder (:func:`bake_logs_dir`), so
+        nothing has to be — or is — deleted for this run's logs to be unambiguous, and
+        the failed run's log stays readable.
         """
         logs = tmp_path / "bake-logs"
         logs.mkdir()
@@ -9320,10 +12851,6 @@ class TestBakeLogProvenance:
         stale.write_text("a previous bake's layer", encoding="utf-8")
         kept = logs / "notes.txt"
         kept.write_text("not a log this harness writes", encoding="utf-8")
-        assert bake_mod.clear_bake_logs(logs) == 1
-        assert not stale.exists(), "this bake's logs, and only this bake's"
-        assert kept.exists()
-        assert bake_mod.clear_bake_logs(tmp_path / "absent") == 0
 
         result = bake_mod.ExecResult(
             stdout="first line\n", stderr="ERROR: it did not install\n", exit_code=1,
@@ -9332,6 +12859,22 @@ class TestBakeLogProvenance:
         path = bake_mod.write_bake_log(logs, "vanta-bi-Demo-1", result)
         assert path == bake_mod.bake_log_path(logs, "vanta-bi-Demo-1")
         assert path.read_text(encoding="utf-8") == "first line\nERROR: it did not install\n"
+        assert stale.read_text(encoding="utf-8") == "a previous bake's layer"
+        assert kept.read_text(encoding="utf-8") == "not a log this harness writes"
+
+    def test_each_bake_gets_its_own_timestamped_log_folder(self, tmp_path):
+        """§8.6: a folder per run, so a later bake cannot wipe the failed one's logs."""
+        first = bake_mod.bake_logs_dir(
+            tmp_path, when=datetime(2026, 11, 6, 4, 15, 30, tzinfo=timezone.utc)
+        )
+        second = bake_mod.bake_logs_dir(
+            tmp_path, when=datetime(2026, 11, 6, 4, 16, 0, tzinfo=timezone.utc)
+        )
+        assert first == tmp_path / "bake-logs" / "20261106T041530Z"
+        assert second == tmp_path / "bake-logs" / "20261106T041600Z"
+        assert first != second, "two runs never share a folder"
+        # Sortable, and filesystem-safe: no ``:`` that a portability-minded reader trips on.
+        assert ":" not in first.name
 
     def test_a_layer_not_reached_is_not_called_done(self):
         actions = bake_mod.plan_layers(
@@ -10434,6 +13977,129 @@ class TestBuildRequirementPins:
             "declared_by": "ujson==2.0.3",
         }
 
+    def test_the_declarer_cutoff_reads_the_declaring_releases_own_date(self):
+        """The date the fallback widens to, and the three answers it can give.
+
+        [VANTA-WHY] Named in its own right because the widening turns on *which* answer
+        comes back: a date widens the window (§3.2's :func:`pin_cutoff` reasoning, read
+        on the build half), while ``None`` leaves it at the bug's own date. The name is
+        canonicalized first, so the declaring pin's spelling in a ``setup_requires`` need
+        not match PyPI's.
+        """
+        releases = {"ujson": {"3.0.0": "2020-06-03"}}
+        assert bake_mod._declarer_pin_cutoff("ujson==3.0.0", releases) == "2020-06-03"
+        assert bake_mod._declarer_pin_cutoff("UJSON==3.0.0", releases) == "2020-06-03"
+        assert bake_mod._declarer_pin_cutoff("ujson==3.0.0", {}) is None
+        assert bake_mod._declarer_pin_cutoff("ujson>=3", releases) is None
+        assert bake_mod._declarer_pin_cutoff("ujson==9.9.9", releases) is None
+
+    def test_the_declarers_own_release_date_widens_a_window_that_found_nothing(self):
+        """``fastapi/11``: the declaring pin landed after the bug, and its own date admits
+        the release its ``setup_requires`` asks for.
+
+        [VANTA-WHY] ``ujson==3.0.0`` is a BugsInPy reference pin installed *as written*
+        (:func:`reference_pin`), so it is admitted on a layer whose commit date precedes
+        it — and its ``setup_requires`` names ``setuptools_scm>=3.4``, a release that did
+        not exist at the bug's own date. Read only against the bug's date this is a
+        refusal for a pin the reference environment itself carried; the declaring
+        release's own date is the window the date rule already uses for such a pin
+        (:func:`pin_cutoff`).
+        """
+        releases = {
+            "setuptools-scm": {
+                "3.3.3": "2019-03-01",
+                "3.4.1": "2019-09-05",
+                "3.5.0": "2020-01-01",
+            },
+            "ujson": {"3.0.0": "2020-06-03"},
+        }
+        pins = self._pins(
+            [self._requirement("ujson==3.0.0", "setuptools_scm>=3.4")],
+            releases=releases,
+        )
+        assert [pin.pin for pin in pins] == ["setuptools-scm==3.5.0"]
+        assert pins[0].released_at == "2020-01-01"
+        assert pins[0].build_requirement_of == "ujson==3.0.0"
+
+    def test_a_window_widened_to_the_declaring_releases_own_date_is_recorded(self):
+        """``fastapi/11`` in the JSON: the fallback was used, and what anchored it.
+
+        [VANTA-WHY] ``declared_by`` alone cannot say *which* rule placed the pin — a pin
+        the bug's own date reaches and one only the declaring pin's own date reaches carry
+        the same key. So the widened window records itself: a distinct ``pin_rule`` and a
+        ``widened_by`` naming the declaring release whose own date became the cutoff, down
+        to the day it landed. Here ``ujson==3.0.0`` (2020-06-03) declares
+        ``setuptools_scm>=3.4``, nothing at the bug's 2019-08-06 date satisfies it, and the
+        widened window admits ``setuptools-scm==4.1.2`` (2020-05-31).
+        """
+        releases = {
+            "setuptools-scm": {
+                "3.3.3": "2019-03-01",
+                "3.4.1": "2019-09-05",
+                "3.5.0": "2020-01-01",
+                "4.1.2": "2020-05-31",
+            },
+            "ujson": {"3.0.0": "2020-06-03"},
+        }
+        pins = self._pins(
+            [self._requirement("ujson==3.0.0", "setuptools_scm>=3.4")],
+            commit_date="2019-08-06",
+            releases=releases,
+        )
+        assert [pin.pin for pin in pins] == ["setuptools-scm==4.1.2"]
+        assert pins[0].pin_rule == bake_mod.BUILD_REQUIREMENT_FALLBACK_PIN_RULE
+        assert pins[0].widened_by == (("ujson==3.0.0", "2020-06-03"),)
+        assert pins[0].as_dict() == {
+            "name": "setuptools-scm",
+            "pin": "setuptools-scm==4.1.2",
+            "source": "ujson==3.0.0 setup_requires (setup.py) line 24",
+            "pin_rule": bake_mod.BUILD_REQUIREMENT_FALLBACK_PIN_RULE,
+            "released_at": "2020-05-31",
+            "declared_by": "ujson==3.0.0",
+            "widened_by": [{"pin": "ujson==3.0.0", "released_at": "2020-06-03"}],
+        }
+
+    def test_a_widened_window_that_still_finds_nothing_still_flags_the_bug(self):
+        """The fallback fails closed: a widened window with no candidate raises as before.
+
+        [VANTA-WHY] The widened cutoff is what the refusal now names, so the record still
+        says which window was searched — no candidate is invented and the bug is flagged.
+        """
+        releases = {
+            "setuptools-scm": {"3.3.3": "2019-03-01"},
+            "ujson": {"3.0.0": "2020-06-03"},
+        }
+        with pytest.raises(
+            bake_mod.BakeError,
+            match=r"'setuptools-scm' has no release on or before 2020-06-03",
+        ):
+            self._pins(
+                [self._requirement("ujson==3.0.0", "setuptools_scm>=3.4")],
+                releases=releases,
+            )
+
+    def test_a_window_the_bug_date_already_resolves_is_left_alone(self):
+        """The fallback is reached **only** when the bug's date finds nothing.
+
+        [VANTA-WHY] This is what keeps the rule byte-identical for every already-baked
+        layer: an empty window raised :class:`BakeError`, so a layer that baked by
+        construction never had one, and the declarer's later date cannot move a pin the
+        bug's own date already placed. The record proves it: a pin the bug's date reached
+        carries no ``widened_by`` and the base ``pin_rule``.
+        """
+        releases = {
+            "setuptools-scm": {"3.3.3": "2019-03-01", "3.5.0": "2020-01-01"},
+            "ujson": {"3.0.0": "2020-06-03"},
+        }
+        pins = self._pins(
+            [self._requirement("ujson==3.0.0", "setuptools_scm")],
+            releases=releases,
+        )
+        assert [pin.pin for pin in pins] == ["setuptools-scm==3.3.3"]
+        assert pins[0].widened_by == ()
+        assert pins[0].pin_rule == bake_mod.BUILD_REQUIREMENT_PIN_RULE
+        assert "widened_by" not in pins[0].as_dict()
+
 
 class TestABuildRequirementNoPinCoversReachesTheLayer:
     """The wiring, end to end: the reading and the date rule into a real layer (§3.2).
@@ -10565,6 +14231,70 @@ class TestABuildRequirementNoPinCoversReachesTheLayer:
         assert record["source"] == "ujson==2.0.3 setup_requires (setup.py) line 86"
         assert record["pin_rule"] == bake_mod.BUILD_REQUIREMENT_PIN_RULE
         assert layers[0].early_pins == ("setuptools-scm==3.3.3",), (
+            "the build finds it only if it is installed first"
+        )
+
+    def test_a_build_requirement_only_the_declarers_own_date_can_place(
+        self, monkeypatch
+    ):
+        """The ``fastapi/11`` shape end to end: the bug's date finds nothing and the
+        declaring pin's own release date admits the release its build asked for.
+
+        [VANTA-WHY] ``ujson==3.0.0`` is a reference pin — admitted though it landed after
+        the bug (:func:`reference_pin`) — and its ``setup_requires`` names
+        ``setuptools_scm>=3.4``, which nothing at the bug's 2019-04-22 date satisfies.
+        Read against the bug's date alone this layer *flags*; read also against the
+        declaring release's own date (2020-06-03) the pin resolves to the newest release
+        inside that window and the layer bakes. The reference pin's own admission is
+        asserted too, because the fallback is meaningless if the declarer never lands.
+        """
+        releases = dict(_fixture_releases())
+        releases["ujson"] = {"3.0.0": "2020-06-03"}
+        releases["setuptools-scm"] = {
+            "3.3.3": "2019-05-12",
+            "3.4.0": "2020-01-17",
+            "3.5.0": "2020-02-13",
+        }
+
+        def classify(name, version, minor):
+            kind = (
+                bake_mod.SDIST_ONLY if name == "ujson" else bake_mod.INSTALLABLE_WHEEL
+            )
+            return bake_mod.PreflightPin(name, version, kind, "this test's own stub")
+
+        def build_requires_of(name, version):
+            if (name, version) == ("ujson", "3.0.0"):
+                return (
+                    bake_mod.DepRef(
+                        "setuptools_scm",
+                        "setuptools_scm>=3.4",
+                        "setup_requires (setup.py) line 85",
+                    ),
+                )
+            return ()
+
+        fetched, layers, flagged = _resolve_with_drops(
+            monkeypatch,
+            refs=(bake_mod.dep_ref("ujson==3.0.0", "requirements.txt line 1"),),
+            classify=classify,
+            build_requires_of=build_requires_of,
+            releases=releases,
+        )
+        assert flagged == []
+        assert layers[0].installs == ("ujson==3.0.0",), (
+            "a reference pin is installed as written, after the bug though it landed"
+        )
+        assert "setuptools-scm" in fetched, "fetched because it has to be dated"
+        record = next(
+            dep
+            for dep in layers[0].provenance["build_pins"]
+            if dep["name"] == "setuptools-scm"
+        )
+        assert record["pin"] == "setuptools-scm==3.5.0"
+        assert record["released_at"] == "2020-02-13"
+        assert record["declared_by"] == "ujson==3.0.0"
+        assert record["source"] == "ujson==3.0.0 setup_requires (setup.py) line 85"
+        assert layers[0].early_pins == ("setuptools-scm==3.5.0",), (
             "the build finds it only if it is installed first"
         )
 
@@ -12533,16 +16263,38 @@ class TestTheAbsentNamePass:
         ("fastparquet", "0.4.0"): ("pandas>=0.19",),
         ("numpy", "1.18.4"): ("six",),
         ("both", "1.0"): ("cryptography>=2.8", "pandas>=0.25"),
+        # §8.6 R2(ii)'s measured cascade: dropping ``h5py`` leaves ``clifford`` (which
+        # declares it) to be moved, and ``mpl-toolkits-clifford`` (which declares
+        # ``clifford``) has to move with it, or pip resolves the whole chain itself.
+        ("clifford", "1.3.1"): ("h5py",),
+        ("mpl-toolkits-clifford", "0.0.3"): ("clifford",),
+        ("h5py", "2.10.0"): (),
     }
     """What each release declares, sparse: a name not here is a release nothing was read
     for, which is the case :func:`bake_mod.no_deps_dependents` skips rather than guesses
     at."""
 
+    CASCADE_INSTALLS = (
+        "h5py==2.10.0",
+        "clifford==1.3.1",
+        "mpl-toolkits-clifford==0.0.3",
+        "numpy==1.18.4",
+    )
+    """``pandas/7``'s shape at the retry: the unbuildable ``h5py`` is dropped and the two
+    pins that declare it, directly and through each other, move with it."""
+
     def _metadata_of(self, name: str, version: str):
         declared = self.DECLARES.get((name, version))
         if declared is None:
-            raise bake_mod.BakeError(f"no metadata for {name}=={version}")
+            # A *known* unknown: the release PyPI carries no readable declarations for
+            # (§3.2's ``CASE_UNKNOWN``). The closure leaves it in place rather than
+            # guessing, and the strict freeze gate is the backstop.
+            raise bake_mod.UnknownDeclarations(f"no metadata for {name}=={version}")
         return (declared, None)
+
+    def _error_reader(self, name: str, version: str):
+        """A reader that *errors* — a network fault, not a release that has no metadata."""
+        raise bake_mod.BakeError(f"could not read {name}=={version}: connection reset")
 
     # ---- which pins are moved out of the main pass -------------------------
     def test_the_pins_that_declare_an_absent_name_are_the_only_ones_moved(self):
@@ -12597,7 +16349,12 @@ class TestTheAbsentNamePass:
         ), "a dropped name nothing declares moves no pin"
 
     def test_a_release_nothing_could_be_read_for_is_not_guessed_at(self):
-        """The reader's contract, not a silent pass: an unreadable release moves nothing."""
+        """A **known** unknown (``UnknownDeclarations``) moves nothing, and is not failed.
+
+        PyPI carries no readable declarations for this release — it is a fact about the
+        release, not a failed read — so the closure leaves it in place and the strict
+        freeze gate is the backstop (D4).
+        """
         assert (
             bake_mod.no_deps_dependents(
                 ("unknown-pin==1.0", "pyopenssl==19.1.0"),
@@ -12606,6 +16363,36 @@ class TestTheAbsentNamePass:
             )
             == ("pyopenssl==19.1.0",)
         )
+
+    def test_a_read_that_errored_names_the_pin_and_fails_the_layer(self):
+        """A read that *errored* is not a known unknown: it raises, naming the pin (D4).
+
+        A network fault leaves the closure drawn against a picture it only half holds, so
+        the pin it could not read is named here — the first pass flags the bug on it and
+        the retry refuses to render a second attempt — rather than silently skipped.
+        """
+        with pytest.raises(bake_mod.UnmovableDependent) as caught:
+            bake_mod.no_deps_dependents(
+                ("unknown-pin==1.0", "pyopenssl==19.1.0"),
+                ("cryptography",),
+                metadata_of=self._error_reader,
+            )
+        assert caught.value.spec == "unknown-pin==1.0"
+        assert "could not be read" in caught.value.why
+
+    def test_the_closure_is_transitive_over_the_pins_it_moves(self):
+        """``pandas/7``: dropping ``h5py`` moves ``clifford`` moves ``mpl-toolkits-clifford``.
+
+        Moving a dependent out of the main pass makes *its* name a name the main pass
+        installs nothing for, so the walk runs to a fixpoint (D3): nothing left in the
+        main pass declares a name pip would otherwise choose a version for.
+        """
+        assert bake_mod.no_deps_dependents(
+            self.CASCADE_INSTALLS, ("h5py",), metadata_of=self._metadata_of
+        ) == (
+            "clifford==1.3.1",
+            "mpl-toolkits-clifford==0.0.3",
+        ), "numpy is read and declares no such name, so it stays in the main pass"
 
     # ---- the recipe --------------------------------------------------------
     def test_the_moved_pins_are_installed_no_deps_and_leave_the_main_pass(self):
@@ -13499,6 +17286,162 @@ class TestUnresolvablePins:
         )
         assert [dep.pin for dep in resolved] == ["requests-async==0.2.4"]
 
+    # ---- §8.6's round-11 stdlib-shadow drop --------------------------------
+    def test_a_stdlib_backport_the_interpreter_ships_is_dropped(self):
+        """``enum34`` on 3.8: the date rule is right to pick it (hypothesis declares it
+        bare), the interpreter makes it redundant, and its ``enum`` shadows the stdlib's.
+
+        ``luigi/7`` and ``luigi/5`` die at pytest start-up with ``TypeError: an integer
+        is required (got type bytes)``. ``luigi/9`` and ``luigi/12`` carry no ``enum34``
+        but fail an earlier gate (``empty FAIL_TO_PASS``) and never run, so they are not
+        evidence that the suite runs without it.
+        """
+        enum = bake_mod.ResolvedDep(
+            name="enum34",
+            spec="",
+            sources=(),
+            pin="enum34==1.1.6",
+            harness=False,
+            required_by=("hypothesis==3.17.0",),
+        )
+        dropped: list[bake_mod.DroppedPin] = []
+        kept = bake_mod.drop_stdlib_backports(
+            (enum,), python_minor="3.8", dropped=dropped, audit=self._audit()
+        )
+        assert kept == []
+        assert [record.name for record in dropped] == ["enum34"]
+        assert dropped[0].outcome == bake_mod.STDLIB_BACKPORT
+        assert dropped[0].sources == ("hypothesis==3.17.0",), "the record names what asked"
+        # …and it stays on an interpreter older than the module it backports, where the
+        # backport *is* the module.
+        assert bake_mod.drop_stdlib_backports((enum,), python_minor="3.3", dropped=[]) == [
+            enum
+        ]
+
+    def test_a_pin_that_merely_looks_like_a_shadow_is_kept(self):
+        """``argparse==1.3.0`` is a stdlib name 15 layers carry and no layer needs dropped.
+
+        The list is closed and named (:data:`STDLIB_BACKPORTS`), so a dependency that is
+        only *shaped* like a stdlib shadow is installed exactly as written.
+        """
+        argparse = bake_mod.ResolvedDep(
+            name="argparse",
+            spec="argparse==1.3.0",
+            sources=("requirements.txt line 4",),
+            pin="argparse==1.3.0",
+            harness=False,
+        )
+        dropped: list[bake_mod.DroppedPin] = []
+        kept = bake_mod.drop_stdlib_backports(
+            (argparse,), python_minor="3.8", dropped=dropped, audit=self._audit()
+        )
+        assert kept == [argparse]
+        assert dropped == []
+
+    # ---- §8.6's round-11 self-pin drop -------------------------------------
+    def _self_pin(self, name: str, pin: str) -> bake_mod.ResolvedDep:
+        return bake_mod.ResolvedDep(
+            name=name,
+            spec=pin,
+            sources=("requirements.txt line 3",),
+            pin=pin,
+            harness=False,
+        )
+
+    def _gap_classifier(self, *, gaps=()):
+        """A classifier that calls the named pins unreviewed sdists and everything else a
+        wheel (:attr:`bake_mod.PreflightPin.gap`)."""
+
+        def classify(name, version, python_minor):
+            if (name, version) in gaps:
+                return bake_mod.PreflightPin(
+                    name,
+                    version,
+                    bake_mod.SDIST_ONLY,
+                    "no wheel; pip builds it from its sdist",
+                    compiled=("src/x.c",),
+                    gap="unreviewed: compiles from its sdist and the table has no entry",
+                )
+            return bake_mod.PreflightPin(
+                name,
+                version,
+                bake_mod.INSTALLABLE_WHEEL,
+                "w",
+                matched_tag="py3-none-any",
+            )
+
+        return classify
+
+    def test_a_self_pin_built_from_an_unreviewed_sdist_is_dropped(self):
+        """``pandas/154``'s ``pandas==1.0.4``: the tree's own name, built from its sdist."""
+        self_pin = self._self_pin("pandas", "pandas==1.0.4")
+        kept = bake_mod.drop_self_pin(
+            (self_pin,),
+            tree_names={"pandas"},
+            classify=self._gap_classifier(gaps={("pandas", "1.0.4")}),
+            python_minor="3.8",
+        )
+        assert kept == []
+
+    def test_a_self_pin_that_installs_from_a_wheel_is_kept(self):
+        """``fastapi/3``'s ``fastapi==0.55.1`` and ``scrapy/1``'s ``scrapy==2.1.0``.
+
+        A wheel self-pin is harmless — it installs the project over itself from a wheel —
+        so the narrow rule leaves it alone, which is what keeps this drop a no-op for every
+        layer measured but ``pandas/154`` and ``pandas/160``.
+        """
+        self_pin = self._self_pin("fastapi", "fastapi==0.55.1")
+        kept = bake_mod.drop_self_pin(
+            (self_pin,),
+            tree_names={"fastapi"},
+            classify=self._gap_classifier(),
+            python_minor="3.8",
+        )
+        assert kept == [self_pin]
+
+    def test_a_self_pin_with_a_reviewed_sdist_is_kept(self):
+        """The gap is the qualifier: a reviewed sdist has a table entry saying what it needs."""
+        self_pin = self._self_pin("pandas", "pandas==1.0.4")
+
+        def classify(name, version, python_minor):
+            return bake_mod.PreflightPin(
+                name,
+                version,
+                bake_mod.SDIST_ONLY,
+                "reviewed: needs gfortran, libopenblas-dev",
+                compiled=("src/x.c",),
+            )
+
+        assert bake_mod.drop_self_pin(
+            (self_pin,), tree_names={"pandas"}, classify=classify, python_minor="3.8"
+        ) == [self_pin]
+
+    def test_a_pin_that_is_not_the_projects_own_name_is_kept(self):
+        """The rule is about the project under test, not about sdists: any other name stays."""
+        scipy = self._self_pin("scipy", "scipy==1.4.1")
+        assert bake_mod.drop_self_pin(
+            (scipy,),
+            tree_names={"pandas"},
+            classify=self._gap_classifier(gaps={("scipy", "1.4.1")}),
+            python_minor="3.8",
+        ) == [scipy]
+
+    def test_a_harness_self_pin_is_kept(self):
+        """A harness pin is the interpreter layer's, never this layer's to leave to the tree."""
+        harness = bake_mod.ResolvedDep(
+            name="pandas",
+            spec="pandas==1.0.4",
+            sources=(),
+            pin="pandas==1.0.4",
+            harness=True,
+        )
+        assert bake_mod.drop_self_pin(
+            (harness,),
+            tree_names={"pandas"},
+            classify=self._gap_classifier(gaps={("pandas", "1.0.4")}),
+            python_minor="3.8",
+        ) == [harness]
+
     def test_resolve_deps_flags_by_raising_when_the_graded_tests_import_the_pin(self):
         refs = (bake_mod.dep_ref("pyarrow==0.17.1", "requirements.txt line 12"),)
         with pytest.raises(bake_mod.BakeError, match="imports it"):
@@ -13646,6 +17589,60 @@ class TestUnresolvablePins:
         ]
         assert found.sites[1].optional == "type-checking only"
         assert "no unconditional import of it is in" in found.reason
+
+    def test_a_commit_without_the_failing_test_file_does_not_stand_in_with_its_tree(self):
+        """``pandas/66``: the buggy commit lacks the test file the fix carries.
+
+        The only unconditional ``import pyarrow`` is in the buggy commit's
+        ``demo/extra.py``, which the fix's test never reaches. Standing the buggy tree
+        in for the roots it cannot give read that site as reachable, so the pin looked
+        required and the bug was refused. Only the commit that carries the failing test
+        file has roots to answer the closure question with.
+        """
+        walk = {
+            "b" * 40: ["demo/extra.py", "demo/api.py"],
+            "f" * 40: ["demo/api.py", "tests/test_demo.py"],
+        }
+        text = {
+            ("b" * 40, "demo/extra.py"): "import pyarrow\n",
+            ("b" * 40, "demo/api.py"): "",
+            ("f" * 40, "demo/api.py"): "",
+            ("f" * 40, "tests/test_demo.py"): "import api\n",
+        }
+        audit = bake_mod.import_auditor(
+            Path("/nonexistent"),
+            ("b" * 40, "f" * 40),
+            distributions={},
+            test_files=["tests/test_demo.py"],
+            read_file=lambda commit, path: text.get((commit, path)),
+            list_files=lambda commit: walk[commit],
+        )
+        found = audit("pyarrow")
+        assert found.required_by is None, "the fix's test never reaches demo/extra.py"
+        assert [site.path for site in found.sites] == ["demo/extra.py"]
+        assert "no unconditional import of it is in" in found.reason
+
+    def test_neither_commit_carrying_the_failing_test_file_keeps_the_whole_tree(self):
+        """No roots at all, so the whole tree counts as reachable: the conservative half.
+
+        A bug whose recorded ``test_file`` exists in *neither* commit still has to bake
+        or flag on what it can read. With no roots to answer from, an empty closure
+        would drop every pin nothing can install, so every file counts as reachable and
+        an unconditional site is required rather than dropped.
+        """
+        audit = bake_mod.import_auditor(
+            Path("/nonexistent"),
+            ("b" * 40, "f" * 40),
+            distributions={},
+            test_files=["tests/test_demo.py"],
+            read_file=lambda commit, path: (
+                "import pyarrow\n" if path == "demo/core.py" else None
+            ),
+            list_files=lambda commit: ["demo/core.py"],
+        )
+        found = audit("pyarrow")
+        assert found.required_by == f"demo/core.py:1 at {'b' * 12}"
+        assert "inside the failing tests' import closure" in found.reason
 
     def test_the_audit_reads_each_commit_once_however_many_pins_ask(self):
         walks: list[str] = []
@@ -13986,6 +17983,236 @@ class TestUnresolvablePins:
         )
 
 
+class TestTheNarrowDateRuleDrop:
+    """§8.6's R2(i), the refused half: a date-rule refusal nothing the tests reach.
+
+    ``luigi/7`` is the measured case. ``test/_mysqldb_test.py`` imports ``mysql`` at
+    module scope at the fixed commit, no release of ``mysql-connector-python`` predates
+    the buggy commit, and nothing the failing tests reach imports the module — so the
+    ref is dropped with a :data:`DATE_RULE_REFUSAL` record instead of flagging the bug.
+
+    The scope is the **module**, not the file that declared it (batch-3's symmetry
+    answer, matching R2(ii)): a project's own file and the test side's import closure
+    are the same finding once the question is "do the graded tests reach it". What
+    makes a refusal droppable is the audit's answer and the safeguard's, and this class
+    tests them apart because either alone is not enough: nothing the graded tests reach
+    imports the module (:func:`decide_unresolvable`), and §8.6's R2 safeguard does not
+    protect it (:func:`pin_safeguard`). A refusal the failing tests *do* reach still
+    flags the bug, a refused pin the safeguard protects still flags it, and both are
+    tested here so the narrowness is the claim, not just the drop.
+    """
+
+    def _sources(self, *refs, commit_date: str = "2019-04-22") -> bake_mod.DepSources:
+        return bake_mod.DepSources(
+            project="Demo",
+            bug_id=7,
+            checkpoint="vanta-bi-Demo-7",
+            buggy_commit="b" * 40,
+            commit_date=commit_date,
+            fixed_commit="f" * 40,
+            fixed_commit_date="2019-07-30",
+            import_name="demo",
+            refs=tuple(refs),
+        )
+
+    def _audit(self, *, required_by=None) -> "callable":
+        """An ``audit`` for a distribution nothing the graded tests reach imports."""
+        def audit(distribution):
+            if required_by is None:
+                return bake_mod.ImportAudit(
+                    (), None, "nothing in either tree imports it"
+                )
+            site = bake_mod.ImportSite(required_by, 20, distribution, None, "f" * 40)
+            return bake_mod.ImportAudit(
+                (site,),
+                site.spelling,
+                f"{site.spelling} imports it unconditionally, inside the failing tests' "
+                "import closure",
+            )
+
+        return audit
+
+    def _ordinary(self, name, version):
+        """``reason_of`` that finds nothing wrong: the drop here comes from the dates."""
+        return None
+
+    # ---- the source prefix is still what the walk writes -----------------
+    def test_the_walk_writes_the_one_source_prefix_the_rule_reads(self):
+        """``test_import_closure``'s refs carry the closure's own prefix, and nothing else."""
+        files = {"tests/test_demo.py": "import mysql\n"}
+        refs, _, _ = bake_mod.test_import_closure(
+            files=["tests/test_demo.py"],
+            read_file=lambda path: files.get(path),
+            import_name="demo",
+        )
+        assert [ref.source for ref in refs] == [
+            f"{bake_mod.CLOSURE_SOURCE_PREFIX}tests/test_demo.py line 1"
+        ]
+
+    def test_an_undatable_ref_is_a_bake_error_that_carries_its_ref(self):
+        """The type the drop pass catches is still a ``BakeError``: every ``except`` holds."""
+        ref = bake_mod.dep_ref("mysql", "import closure: test/_mysqldb_test.py line 20")
+        exc = bake_mod.UndatableRef(
+            "no release on or before 2019-04-22", ref=ref
+        )
+        assert isinstance(exc, bake_mod.BakeError)
+        assert exc.ref is ref
+
+    # ---- resolve_deps: the drop, the loop, and every re-raise -------------
+    def test_resolve_deps_drops_a_closure_sourced_ref_the_date_rule_refuses(self):
+        """The measured case, at the layer it is dropped in."""
+        refs = (
+            bake_mod.dep_ref("decorator>=4.3.0", "install_requires (setup.py) line 1"),
+            bake_mod.dep_ref("mysql", "import closure: test/_mysqldb_test.py line 20"),
+        )
+        dropped: list[bake_mod.DroppedPin] = []
+        resolved = bake_mod.resolve_deps(
+            self._sources(*refs),
+            releases={
+                "decorator": {"4.4.0": "2019-01-15"},
+                "mysql": {"8.0.20": "2020-04-01"},
+            },
+            harness_pins={},
+            reason_of=self._ordinary,
+            audit=self._audit(),
+            dropped=dropped,
+        )
+        assert [dep.pin for dep in resolved] == ["decorator==4.4.0"]
+        assert [record.pin for record in dropped] == ["mysql"]
+        record = dropped[0]
+        assert record.outcome == bake_mod.DATE_RULE_REFUSAL
+        assert record.version is None, "the rule named a version, the drop has none"
+        assert record.sources == (
+            "import closure: test/_mysqldb_test.py line 20",
+        )
+        assert "no release on or before 2019-04-22" in record.reason
+
+    def test_every_undatable_ref_is_dropped_in_turn(self):
+        """A loop, not one retry: ``resolve_pins`` refuses the whole layer at the first."""
+        refs = (
+            bake_mod.dep_ref("mysql", "import closure: test/_mysqldb_test.py line 20"),
+            bake_mod.dep_ref("mysqlclient", "import closure: test/_mysql_test.py line 3"),
+            bake_mod.dep_ref("decorator>=4.3.0", "install_requires (setup.py) line 1"),
+        )
+        dropped: list[bake_mod.DroppedPin] = []
+        resolved = bake_mod.resolve_deps(
+            self._sources(*refs),
+            releases={
+                "decorator": {"4.4.0": "2019-01-15"},
+                "mysql": {"8.0.20": "2020-04-01"},
+                "mysqlclient": {"2.0.1": "2020-04-01"},
+            },
+            harness_pins={},
+            reason_of=self._ordinary,
+            audit=self._audit(),
+            dropped=dropped,
+        )
+        assert [dep.pin for dep in resolved] == ["decorator==4.4.0"]
+        assert [record.pin for record in dropped] == ["mysql", "mysqlclient"]
+        assert {record.outcome for record in dropped} == {bake_mod.DATE_RULE_REFUSAL}
+
+    def test_a_project_sourced_undatable_ref_outside_the_closure_is_dropped(self):
+        """The scope is the module: a file the project wrote declares a droppable ref too.
+
+        Batch-3's symmetry answer. ``luigi/30``'s ``mysql-connector-python==8.0.20`` is
+        declared in ``requirements.txt``, and that its module is one nothing the graded
+        tests reach is the whole finding — not which file named it.
+        """
+        refs = (bake_mod.dep_ref("mysql", "requirements.txt line 90"),)
+        dropped: list[bake_mod.DroppedPin] = []
+        resolved = bake_mod.resolve_deps(
+            self._sources(*refs),
+            releases={"mysql": {"8.0.20": "2020-04-01"}},
+            harness_pins={},
+            reason_of=self._ordinary,
+            audit=self._audit(),
+            dropped=dropped,
+        )
+        assert resolved == []
+        assert [record.pin for record in dropped] == ["mysql"]
+        assert dropped[0].sources == ("requirements.txt line 90",)
+
+    def test_a_refusal_the_graded_tests_reach_still_flags_the_bug(self):
+        """The other half, whatever file declared it: the closure's reach decides."""
+        refs = (bake_mod.dep_ref("mysql", "import closure: test/_mysqldb_test.py line 20"),)
+        with pytest.raises(bake_mod.BakeError, match="imports it"):
+            bake_mod.resolve_deps(
+                self._sources(*refs),
+                releases={"mysql": {"8.0.20": "2020-04-01"}},
+                harness_pins={},
+                reason_of=self._ordinary,
+                audit=self._audit(required_by="test/_mysqldb_test.py"),
+                dropped=[],
+            )
+
+    def test_a_refusal_the_safeguard_protects_still_flags_the_bug(self):
+        """A protected pin is a flag even when nothing the graded tests import names it."""
+        refs = (bake_mod.dep_ref("pytest-xdist", "requirements.txt line 4"),)
+        safeguard = bake_mod.pin_safeguard(
+            protected_names={bake_mod.canonicalize_name("pytest-xdist"): "a pytest plugin"}
+        )
+        with pytest.raises(bake_mod.BakeError, match="will not drop it"):
+            bake_mod.resolve_deps(
+                self._sources(*refs),
+                releases={"pytest-xdist": {"2.0.0": "2020-04-01"}},
+                harness_pins={},
+                reason_of=self._ordinary,
+                audit=self._audit(),
+                dropped=[],
+                safeguard=safeguard,
+            )
+
+    def test_without_the_rule_the_refusal_is_left_alone(self):
+        """A caller that wants no drop — every test about the date rule — passes no triple."""
+        refs = (bake_mod.dep_ref("mysql", "import closure: test/_mysqldb_test.py line 20"),)
+        releases = {"mysql": {"8.0.20": "2020-04-01"}}
+        with pytest.raises(bake_mod.UndatableRef):
+            bake_mod.resolve_deps(
+                self._sources(*refs), releases=releases, harness_pins={}
+            )
+        with pytest.raises(bake_mod.UndatableRef):
+            bake_mod.resolve_deps(
+                self._sources(*refs),
+                releases=releases,
+                harness_pins={},
+                reason_of=self._ordinary,
+                dropped=[],
+            )
+
+    # ---- and the record reaches the layer's provenance -------------------
+    def test_the_date_rule_drop_reaches_the_layer_provenance(self, monkeypatch):
+        """Wired end to end: the drop is in the deps JSON, not only in a returned list."""
+        monkeypatch.setattr(
+            bake_mod,
+            "import_auditor",
+            lambda repo, commits, **kwargs: lambda name: bake_mod.ImportAudit(
+                (), None, "nothing in either tree imports it"
+            ),
+        )
+        releases = dict(_fixture_releases())
+        releases["mysql"] = {"8.0.20": "2020-04-01"}
+        _, layers, flagged = _resolve_with_drops(
+            monkeypatch,
+            refs=(
+                bake_mod.dep_ref("decorator>=4.3.0", "install_requires (setup.py) line 1"),
+                bake_mod.dep_ref("mysql", "import closure: test/_mysqldb_test.py line 20"),
+            ),
+            releases=releases,
+            # The drop is what this test measures, and its presence sends the first-pass
+            # ``--no-deps`` walk over ``installs`` — every pin's own declarations, not only
+            # the dropped name's. ``decorator==4.4.0`` declares nothing; the shared fixture
+            # reader knows only ``moto``/``plugin``, so it would answer with a read error,
+            # which the walk now fails the layer closed on rather than silently skipping.
+            metadata_of=lambda name, version: ((), None),
+        )
+        assert flagged == []
+        record = layers[0].provenance["dropped"][0]
+        assert record["pin"] == "mysql"
+        assert record["outcome"] == bake_mod.DATE_RULE_REFUSAL
+        assert record["sources"] == ["import closure: test/_mysqldb_test.py line 20"]
+        assert "no release on or before 2019-04-22" in record["reason"]
+
+
 def _fixture_releases() -> dict:
     """The release tables the resolution tests share: the date-rule fixture plus the
     plugin pair.
@@ -14000,6 +18227,19 @@ def _fixture_releases() -> dict:
     return releases
 
 
+def _no_release_is_a_pytest_plugin(name: str, version: str) -> bool:
+    """The stand-in for §8.6's R2 entry-point question in the resolution tests.
+
+    ``False`` — "this release registers no ``pytest11`` entry point" — is the answer that
+    leaves the drop rule alone, which is what these tests are about; a test that wants
+    the safeguard to fire passes its own ``plugin_of``. The default is a stub rather than
+    :func:`bake.declares_pytest_plugin` for the reason the whole helper exists: the real
+    one reads PyPI, and a drop rule that can only be tested by reaching the network is a
+    drop rule nobody tests. The arm itself is covered directly, over a stubbed release.
+    """
+    return False
+
+
 def _resolve_with_drops(
     monkeypatch,
     *,
@@ -14009,6 +18249,7 @@ def _resolve_with_drops(
     releases=None,
     tree_modules=(),
     build_requires_of=None,
+    plugin_of=_no_release_is_a_pytest_plugin,
 ):
     """``resolve_bug_deps`` over one fake source set, with the network taken out.
 
@@ -14027,6 +18268,7 @@ def _resolve_with_drops(
     build-requirement passes read (:func:`bake.early_install_pins`,
     :func:`bake.uncovered_build_requirements`): with the wheel stub nothing is a source
     build and neither pass asks anything, so the default is "nothing declared".
+    ``plugin_of`` is §8.6's R2's last question, and its default is the stub above.
     """
     fetched: list[str] = []
     table = _fixture_releases() if releases is None else releases
@@ -14065,8 +18307,1220 @@ def _resolve_with_drops(
         metadata_of=reader,
         classify=classify or _wheel_classifier(),
         build_requires_of=build_requires_of or (lambda name, version: ()),
+        plugin_of=plugin_of,
     )
     return fetched, layers, flagged
+
+
+_PANDAS_7_BUILD_LOG = (
+    "Collecting h5py==2.10.0\n"
+    "  Building wheel for h5py (setup.py) ... error\n"
+    "  ERROR: Failed building wheel for h5py\n"
+    "Collecting scikit-learn==0.22.1\n"
+    "  ERROR: Failed building wheel for scikit-learn\n"
+    "Failed to build h5py scikit-learn\n"
+    "ERROR: Could not build wheels for h5py, scikit-learn, which is required to\n"
+    "install pyproject.toml-based projects\n"
+)
+"""The measured shape of ``pandas/7``'s first-pass build failure.
+
+Both pins the layer holds fail inside the image (``h5py`` wants ``libhdf5.so``,
+``scikit-learn`` wants a ``scipy`` pip never got), so pip's own summary line names
+both and its per-name lines name each. Reproduced from the run's log, not invented.
+"""
+
+_LUIGI_30_BUILD_LOG = (
+    "Collecting pytest-runner==2.5.1\n"
+    "  Downloading pytest-runner-2.5.1.zip (11 kB)\n"
+    "  Preparing metadata (setup.py): started\n"
+    "  Preparing metadata (setup.py): finished with status 'error'\n"
+    "    File \"/tmp/pip-install-jwj5ruzh/pytest-runner/setup.py\", line 53, in <module>\n"
+    "      setuptools.setup(**setup_params)\n"
+    "    File \"/tmp/pip-install-jwj5ruzh/pytest-runner/.eggs/"
+    "setuptools_scm-10.3.4-py3.8.egg/setuptools_scm/_integration/version_inference.py\", "
+    "line 18, in <module>\n"
+    "      from setuptools import sic as setuptools_sic\n"
+    "  ImportError: cannot import name 'sic' from 'setuptools'\n"
+    "ERROR: Command errored out with exit status 1: python setup.py egg_info "
+    "Check the logs for full command output.\n"
+)
+"""``luigi/30``'s failure: a build *requirement*'s ``egg_info``, and pip names no pin.
+
+The load-bearing negative for §8.6's R2(ii): :func:`bake.failed_builds` finds no
+``Failed to build …`` line, so the retry answers ``None`` there and the ordinary failure
+path is left alone — this is R1's case and not this rule's.
+
+It is also R1's one *positive* piece of evidence, and the reason the rule cannot be read
+from :data:`bake.EASY_INSTALL_MARKERS` alone: the fetch's only trace in the real log is
+the traceback frame that ran out of the fetched release, under the build's own
+``.eggs/`` directory. Reproduced from the run's log (``pytest-runner``'s own ``setup.py``
+frame, the ``.eggs/setuptools_scm-10.3.4-py3.8.egg`` frame, the ``ImportError`` and pip's
+``egg_info`` summary line), not invented.
+"""
+
+_PANDAS_66_BUILD_LOG = (
+    "+ python -m pip install --no-cache-dir -c /tmp/constraints.txt "
+    "--no-build-isolation --use-deprecated=legacy-resolver -r /tmp/req.txt\n"
+    "WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, "
+    "status=None)) after connection broken by 'ProtocolError('Connection aborted.', "
+    "RemoteDisconnected('Remote end closed connection without response'))': "
+    "/simple/cycler/\n"
+    "ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE. "
+    "If you have updated the package versions, please update the hashes. Otherwise, "
+    "examine the package contents carefully; someone may have tampered with them.\n"
+    "    matplotlib==3.1.3 from https://files.pythonhosted.org/packages/be/74/"
+    "24d058c17b155d131359f1cd01e120b3954686bf8b7853172b279237e1dc/"
+    "matplotlib-3.1.3.tar.gz#sha256="
+    "db3121f12fb9b99f105d1413aebaeb3d943f269f3d262b45586d12765866f0c6 "
+    "(from -c /tmp/constraints.txt (line 41)):\n"
+    "        Expected sha256 "
+    "db3121f12fb9b99f105d1413aebaeb3d943f269f3d262b45586d12765866f0c6\n"
+    "             Got        "
+    "a126ab08efbd1508221af0aa54bdac70f782587567710a5d54e4a6c9c2795bb9\n"
+)
+"""``pandas/66``'s failure: a *download* whose bytes were not the ones the index names.
+
+The index's own link advertises ``db3121…`` (PyPI's recorded sdist hash) and the body
+that arrived hashed to ``a126ab08…``, one line under a ``RemoteDisconnected`` on a
+different index page — a transfer cut short, not a package whose bytes changed. The
+harness writes no hashes (:data:`bake.CONSTRAINTS_FILE` holds ``name==version`` lines
+only), so the ``#sha256=`` fragment is the index's. Reproduced from the run's log, and it
+is why the mismatch is not a pin to drop and not an ordering to fix.
+
+``retry_plan`` reaches it through §8.6 **R4**: :func:`bake.failed_builds` is empty here
+(nothing reached the wheel stage) and the log is not an ``egg_info`` crash, so neither
+R2(ii) nor R1 answers it.
+"""
+
+
+def _carrier_wheel(*, entry_points: str | None = None) -> bytes:
+    """One wheel in memory: a ``METADATA``, and an ``entry_points.txt`` when asked for.
+
+    A real zip rather than a mock, because what is being tested is precisely the
+    difference between "the archive opened and lists no such member" and "the archive
+    did not open" — a mock would answer whichever of the two the test asserted.
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("carrier-1.0.dist-info/METADATA", "Name: carrier\nVersion: 1.0\n")
+        if entry_points is not None:
+            archive.writestr("carrier-1.0.dist-info/entry_points.txt", entry_points)
+    return buffer.getvalue()
+
+
+class TestTheSafeguardsEntryPointQuestion:
+    """§8.6's R2's last arm: is this release a pytest plugin, and can we tell at all?
+
+    Three answers and not two, and the third is what the arm turns on. ``True`` protects
+    the pin (pytest loads a ``pytest11`` plugin itself, so no site in the tree names it);
+    ``None`` protects it too (an unreadable release is not evidence for a drop); and
+    ``False`` — **read, and it registers nothing** — lets the drop proceed. Reading the
+    last two as one answer is the failure this class exists against: measured on
+    ``h5py==2.10.0``, whose 28 wheels carry no ``entry_points.txt`` at all, it protected
+    the very pin ``pandas/7``'s retry was to drop and turned the retry into a flag.
+    """
+
+    def test_a_release_pypi_does_not_list_registers_nothing(self):
+        """A 404 is an answer, not a failed fetch: the release cannot be a plugin."""
+        assert (
+            bake_mod.declares_pytest_plugin("six", "9.9.9", files_of=lambda n, v: None)
+            is False
+        )
+
+    def test_a_wheel_that_opens_without_entry_points_registers_nothing(self):
+        assert (
+            bake_mod.declares_pytest_plugin(
+                "h5py",
+                "2.10.0",
+                files_of=lambda n, v: (_wheel("h5py-2.10.0-cp38-cp38-manylinux1_x86_64.whl"),),
+                entry_points_of=lambda file: "",
+            )
+            is False
+        )
+
+    def test_a_wheel_it_cannot_read_is_unknown(self):
+        assert (
+            bake_mod.declares_pytest_plugin(
+                "h5py",
+                "2.10.0",
+                files_of=lambda n, v: (_wheel("h5py-2.10.0-cp38-cp38-manylinux1_x86_64.whl"),),
+                entry_points_of=lambda file: None,
+            )
+            is None
+        )
+
+    def test_a_fetch_that_fails_is_unknown(self):
+        def files_of(name, version):
+            raise bake_mod.BakeError("cannot read the files from PyPI")
+
+        assert bake_mod.declares_pytest_plugin("six", "1.13.0", files_of=files_of) is None
+
+    def test_a_release_with_no_wheel_is_unknown(self):
+        """Nothing to read: the sdist's own metadata is not among these readers."""
+        assert (
+            bake_mod.declares_pytest_plugin(
+                "demo",
+                "1.0",
+                files_of=lambda n, v: (_sdist("demo-1.0.tar.gz"),),
+            )
+            is None
+        )
+
+    def test_a_wheel_that_registers_the_group_is_a_plugin(self):
+        assert (
+            bake_mod.declares_pytest_plugin(
+                "pytest-xdist",
+                "1.31.0",
+                files_of=lambda n, v: (_wheel("pytest_xdist-1.31.0-py2.py3-none-any.whl"),),
+                entry_points_of=lambda file: "[pytest11]\nxdist = xdist.plugin\n",
+            )
+            is True
+        )
+
+    def test_a_wheel_that_registers_somewhere_else_is_not_a_plugin(self):
+        assert (
+            bake_mod.declares_pytest_plugin(
+                "demo",
+                "1.0",
+                files_of=lambda n, v: (_wheel("demo-1.0-py3-none-any.whl"),),
+                entry_points_of=lambda file: "[console_scripts]\ndemo = demo.cli:main\n",
+            )
+            is False
+        )
+
+    # ---- the reader, which is where the third answer is produced -----------
+    def test_the_reader_says_empty_for_a_wheel_without_entry_points(self):
+        assert (
+            bake_mod._wheel_member(
+                _carrier_wheel(), bake_mod.WHEEL_ENTRY_POINTS_MEMBER, missing=""
+            )
+            == ""
+        )
+
+    def test_the_reader_returns_the_member_when_the_wheel_holds_one(self):
+        text = bake_mod._wheel_member(
+            _carrier_wheel(entry_points="[pytest11]\ncarrier = carrier.plugin\n"),
+            bake_mod.WHEEL_ENTRY_POINTS_MEMBER,
+            missing="",
+        )
+        assert bake_mod.entry_point_group(text, bake_mod.PYTEST_ENTRY_POINT_GROUP) == (
+            "carrier",
+        )
+
+    def test_the_reader_still_says_none_for_a_wheel_it_cannot_open(self):
+        """``missing`` is for the archive that opened; an unreadable one is unknown."""
+        assert (
+            bake_mod._wheel_member(
+                b"not a zip at all", bake_mod.WHEEL_ENTRY_POINTS_MEMBER, missing=""
+            )
+            is None
+        )
+
+    def test_the_default_reader_is_unchanged_for_the_metadata_member(self):
+        assert (
+            bake_mod._wheel_member(_carrier_wheel(), bake_mod.WHEEL_METADATA_MEMBER)
+            is not None
+        )
+        assert (
+            bake_mod._wheel_member(
+                _carrier_wheel(), bake_mod.WHEEL_ENTRY_POINTS_MEMBER
+            )
+            is None
+        )
+
+    # ---- and what the safeguard does with the three answers ----------------
+    def _audit(self):
+        return bake_mod.ImportAudit((), None, "nothing in either tree imports it")
+
+    def test_the_safeguard_protects_a_release_that_registers_the_group(self):
+        safeguard = bake_mod.pin_safeguard(
+            protected_names={}, plugin_of=lambda name, version: True
+        )
+        reason = safeguard("pytest-xdist", "1.31.0", self._audit())
+        assert reason is not None and "pytest11" in reason
+
+    def test_the_safeguard_protects_a_release_it_cannot_read(self):
+        safeguard = bake_mod.pin_safeguard(
+            protected_names={}, plugin_of=lambda name, version: None
+        )
+        reason = safeguard("h5py", "2.10.0", self._audit())
+        assert reason is not None and "could not be read" in reason
+
+    def test_the_safeguard_lets_a_release_that_registers_nothing_be_dropped(self):
+        safeguard = bake_mod.pin_safeguard(
+            protected_names={}, plugin_of=lambda name, version: False
+        )
+        assert safeguard("h5py", "2.10.0", self._audit()) is None
+
+    def test_the_safeguard_does_not_ask_without_a_version(self):
+        """A ref the *date rule* refused has no release to read, and needs none."""
+        asked: list[tuple[str, str]] = []
+
+        def plugin_of(name, version):
+            asked.append((name, version))
+            return True
+
+        safeguard = bake_mod.pin_safeguard(protected_names={}, plugin_of=plugin_of)
+        assert safeguard("mysql-connector-python", None, self._audit()) is None
+        assert asked == []
+
+    # ---- and wired into the bake's own resolution --------------------------
+    def test_a_plugin_pin_flags_the_bug_rather_than_being_dropped(self, monkeypatch):
+        monkeypatch.setattr(
+            bake_mod,
+            "import_auditor",
+            lambda repo, commits, **kwargs: lambda name: bake_mod.ImportAudit(
+                (), None, "nothing in either tree imports it"
+            ),
+        )
+        _, layers, flagged = _resolve_with_drops(
+            monkeypatch,
+            refs=(bake_mod.dep_ref("six==9.9.9", "requirements.txt line 4"),),
+            plugin_of=lambda name, version: True,
+        )
+        assert layers == []
+        assert [flag.key for flag in flagged] == ["Demo/1"]
+        assert "pytest11" in flagged[0].reason
+
+    def test_a_release_that_registers_nothing_is_still_dropped(self, monkeypatch):
+        """The negative the arm must not over-reach on: ``False`` leaves the rule alone."""
+        monkeypatch.setattr(
+            bake_mod,
+            "import_auditor",
+            lambda repo, commits, **kwargs: lambda name: bake_mod.ImportAudit(
+                (), None, "nothing in either tree imports it"
+            ),
+        )
+        _, layers, flagged = _resolve_with_drops(
+            monkeypatch,
+            refs=(bake_mod.dep_ref("six==9.9.9", "requirements.txt line 4"),),
+            plugin_of=lambda name, version: False,
+        )
+        assert flagged == []
+        assert layers[0].provenance["dropped"][0]["pin"] == "six==9.9.9"
+
+
+class TestTheRetryOnAnUnbuildablePin:
+    """§8.6's retries: a per-bug layer rebuilt once after its build already failed.
+
+    The trigger is an **observed** build failure, never a static prediction, which is
+    what leaves every already-baked layer untouched by construction: a retry runs only
+    after a build has already failed, and the first-pass recipe is byte-identical. The
+    **R2(ii)** half (measured on ``pandas/7``) answers ``None`` for every failure it does
+    not cover, drops only pins **outside the failing tests' closure** that the safeguard
+    does not protect, records each drop in the layer metadata, and fails **closed** if
+    the retry also fails. The **R1** half (rows 11–12, luigi's ``egg_info`` crash, the
+    very case R2(ii) answers ``None`` for) drops nothing and only moves the early-pin
+    install before the build requirements.
+    """
+
+    INSTALLS = (
+        "numpy==1.18.1",
+        "h5py==2.10.0",
+        "scikit-learn==0.22.1",
+        "python-dateutil==2.8.1",
+    )
+    DECLARED = {
+        "h5py": ("requirements.txt line 12",),
+        "scikit-learn": ("import closure: pandas/tests/test_downstream.py line 77",),
+    }
+
+    def _audit(self, *, required_by=None):
+        def audit(distribution):
+            if required_by is None:
+                return bake_mod.ImportAudit(
+                    (), None, "nothing in either tree imports it"
+                )
+            site = bake_mod.ImportSite(required_by, 77, distribution, None, "f" * 40)
+            return bake_mod.ImportAudit(
+                (site,), site.spelling, f"{site.spelling} imports it unconditionally"
+            )
+
+        return audit
+
+    def _drop_plan(self, script: str = "retry recipe") -> bake_mod.RetryPlan:
+        drop = bake_mod.DroppedPin(
+            name="h5py",
+            spec="h5py==2.10.0",
+            sources=("requirements.txt line 12",),
+            version="2.10.0",
+            outcome=bake_mod.UNBUILDABLE_AT_BAKE,
+            reason="its sdist failed to build in this image during the first pass",
+        )
+        return bake_mod.RetryPlan(script=script, drops=(drop,))
+
+    def _transient_plan(self, script: str = "retry recipe") -> bake_mod.RetryPlan:
+        return bake_mod.RetryPlan(
+            script=script,
+            drops=(),
+            rule=bake_mod.RETRY_RULE_TRANSIENT,
+            why="re-fetched",
+            transient=bake_mod.transient_download_failure(_PANDAS_66_BUILD_LOG),
+        )
+
+    def _declares_nothing(self, name: str, version: str):
+        """The ordinary reader: these releases declare nothing that moves the closure."""
+        return ((), None)
+
+    def _cascade_metadata(self, name: str, version: str):
+        """``pandas/7``'s retry: ``clifford`` declares the dropped ``h5py``, and
+        ``mpl-toolkits-clifford`` declares ``clifford``."""
+        declared = {
+            ("clifford", "1.3.1"): ("h5py",),
+            ("mpl-toolkits-clifford", "0.0.3"): ("clifford",),
+        }.get((name, version), ())
+        return (declared, None)
+
+    def _deps(
+        self,
+        *,
+        retry=True,
+        provenance=None,
+        installs=None,
+        metadata_of=None,
+        safeguard=None,
+        **kwargs,
+    ) -> bake_mod.BugDeps:
+        material = (
+            bake_mod.RetryMaterial(
+                audit=self._audit(),
+                safeguard=safeguard
+                if safeguard is not None
+                else bake_mod.pin_safeguard(protected_names={}),
+                metadata_of=metadata_of
+                if metadata_of is not None
+                else self._declares_nothing,
+                minor="3.8",
+            )
+            if retry
+            else None
+        )
+        pins = self.INSTALLS if installs is None else installs
+        return bake_mod.BugDeps(
+            entry={"project": "pandas", "bug_id": 7},
+            checkpoint="vanta-bi-pandas-7",
+            installs=pins,
+            provenance=(
+                provenance
+                if provenance is not None
+                else {
+                    "installs": list(pins),
+                    "dependencies": [
+                        {"name": name, "sources": list(sources)}
+                        for name, sources in self.DECLARED.items()
+                    ],
+                }
+            ),
+            retry=material,
+            **kwargs,
+        )
+
+    # ---- reading the failing layer's own log -----------------------------
+    def test_the_summary_line_names_the_pins_pip_failed_to_build(self):
+        assert bake_mod.failed_builds(_PANDAS_7_BUILD_LOG) == (
+            "h5py",
+            "scikit-learn",
+        )
+
+    def test_the_names_are_canonicalised(self):
+        assert bake_mod.failed_builds("Failed to build Scikit_Learn\n") == (
+            "scikit-learn",
+        )
+
+    def test_a_log_that_names_no_distribution_is_not_this_rule(self):
+        """luigi/30's shape: a build *requirement*'s ``egg_info`` crash, no summary line."""
+        assert bake_mod.failed_builds(_LUIGI_30_BUILD_LOG) == ()
+
+    def test_the_evidence_is_the_line_that_names_the_pin(self):
+        line = bake_mod.failed_build_line(_PANDAS_7_BUILD_LOG, "h5py")
+        assert line.startswith("build log line ")
+        assert line.endswith("ERROR: Failed building wheel for h5py")
+
+    def test_without_a_per_name_line_the_summary_is_the_evidence(self):
+        line = bake_mod.failed_build_line("Failed to build h5py\n", "h5py")
+        assert line.endswith("Failed to build h5py")
+
+    # ---- retry_drops: the drop, and every ``None`` ------------------------
+    def test_an_unbuildable_pin_outside_the_closure_is_dropped(self):
+        drops = bake_mod.retry_drops(
+            _PANDAS_7_BUILD_LOG,
+            installs=self.INSTALLS,
+            declared=self.DECLARED,
+            audit=self._audit(),
+        )
+        assert drops is not None
+        assert [drop.pin for drop in drops] == ["h5py==2.10.0", "scikit-learn==0.22.1"]
+        first = drops[0]
+        assert first.outcome == bake_mod.UNBUILDABLE_AT_BAKE
+        assert first.version == "2.10.0"
+        # The declaration's source *and* the failing layer's own log line, both.
+        assert first.sources[0] == "requirements.txt line 12"
+        assert first.sources[-1].endswith(
+            "ERROR: Failed building wheel for h5py"
+        )
+        assert "its sdist failed to build in this image" in first.reason
+        assert first.audit is not None
+
+    def test_a_log_that_names_no_distribution_asks_for_no_retry(self):
+        assert (
+            bake_mod.retry_drops(
+                _LUIGI_30_BUILD_LOG,
+                installs=self.INSTALLS,
+                declared=self.DECLARED,
+                audit=self._audit(),
+            )
+            is None
+        )
+
+    def test_a_failed_name_that_is_not_a_pin_of_this_layer_asks_for_no_retry(self):
+        output = "Failed to build something-else\n"
+        assert (
+            bake_mod.retry_drops(
+                output, installs=self.INSTALLS, declared={}, audit=self._audit()
+            )
+            is None
+        )
+
+    def test_a_safeguarded_pin_asks_for_no_retry(self):
+        """A pytest plugin pip failed to build is a flag, not a drop, even here."""
+        safeguard = bake_mod.pin_safeguard(
+            protected_names={
+                bake_mod.canonicalize_name("pytest-xdist"): "a pytest plugin"
+            }
+        )
+        assert (
+            bake_mod.retry_drops(
+                "Failed to build pytest-xdist\n",
+                installs=("pytest-xdist==2.0.0",),
+                declared={},
+                audit=self._audit(),
+                safeguard=safeguard,
+            )
+            is None
+        )
+
+    def test_a_pin_the_graded_tests_reach_asks_for_no_retry(self):
+        """A layer missing a module the graded tests import cannot be graded: a flag."""
+        assert (
+            bake_mod.retry_drops(
+                "Failed to build h5py\n",
+                installs=self.INSTALLS,
+                declared=self.DECLARED,
+                audit=self._audit(
+                    required_by="pandas/tests/frame/indexing/test_indexing.py"
+                ),
+            )
+            is None
+        )
+
+    # ---- retry_plan: the recipe the second attempt runs ------------------
+    def test_a_layer_without_retry_material_is_never_retried(self):
+        assert bake_mod.retry_plan(self._deps(retry=False), _PANDAS_7_BUILD_LOG) is None
+
+    def test_the_retry_recipe_is_the_first_pass_minus_exactly_the_dropped_pins(self):
+        deps = self._deps(
+            build_pins=("numpy==1.18.1",), early_pins=("numpy==1.18.1",)
+        )
+        plan = bake_mod.retry_plan(deps, _PANDAS_7_BUILD_LOG)
+        assert plan is not None
+        assert [drop.pin for drop in plan.drops] == ["h5py==2.10.0", "scikit-learn==0.22.1"]
+        assert plan.script == bake_mod.requirements_recipe(
+            ("numpy==1.18.1", "python-dateutil==2.8.1"),
+            build_pins=("numpy==1.18.1",),
+            early_pins=("numpy==1.18.1",),
+            minor="3.8",
+        )
+        # The first pass, under the same inputs, still installs the dropped pair: the
+        # retry is what removes them, not a change to how the first pass is built.
+        first_pass = bake_mod.requirements_recipe(
+            self.INSTALLS, build_pins=("numpy==1.18.1",), minor="3.8"
+        )
+        assert "h5py==2.10.0" in first_pass
+        assert "h5py==2.10.0" not in plan.script
+
+    # ---- D3: a moved dependent takes its own dependents with it ----------
+    CASCADE_INSTALLS = (
+        "numpy==1.18.1",
+        "h5py==2.10.0",
+        "clifford==1.3.1",
+        "mpl-toolkits-clifford==0.0.3",
+        "python-dateutil==2.8.1",
+    )
+
+    def test_a_moved_dependent_takes_its_own_dependents_with_it(self):
+        """``pandas/7``: the retry **moves**, it does not merely drop (D3).
+
+        Dropping ``h5py`` leaves ``clifford`` (which declares it) in the main pass, so
+        ``clifford`` moves too — and ``mpl-toolkits-clifford`` (which declares
+        ``clifford``) moves with it, or pip resolves the whole chain itself at the newest
+        release of the day. Nothing left in the main pass declares a name pip would choose
+        a version for.
+        """
+        deps = self._deps(
+            installs=self.CASCADE_INSTALLS, metadata_of=self._cascade_metadata
+        )
+        plan = bake_mod.retry_plan(deps, "Failed to build h5py\n")
+        assert plan is not None
+        assert plan.refused is None
+        assert [drop.pin for drop in plan.drops] == ["h5py==2.10.0"]
+        main = (
+            plan.script.split("<<'VANTA_REQUIREMENTS'\n", 1)[1]
+            .split("\nVANTA_REQUIREMENTS", 1)[0]
+        )
+        assert main.splitlines() == ["numpy==1.18.1", "python-dateutil==2.8.1"]
+        no_deps = plan.script.split("<<'VANTA_NO_DEPS'\n", 1)[1]
+        assert no_deps.startswith("clifford==1.3.1\nmpl-toolkits-clifford==0.0.3\n")
+        assert plan.script == bake_mod.requirements_recipe(
+            (
+                "numpy==1.18.1",
+                "clifford==1.3.1",
+                "mpl-toolkits-clifford==0.0.3",
+                "python-dateutil==2.8.1",
+            ),
+            no_deps_pins=("clifford==1.3.1", "mpl-toolkits-clifford==0.0.3"),
+            minor="3.8",
+        )
+
+    def test_a_pin_that_merely_declares_a_no_deps_name_does_not_move(self):
+        """The narrowed seed: only the pins this retry **dropped** seed the walk.
+
+        A ``--no-deps`` pin's name is in ``/tmp/constraints.txt``, so a main-pass pin
+        that only declares one gives pip no version to choose and leaks nothing. Measured
+        on ``pandas/7``: ``pytest==5.4.3`` declares ``hypothesis`` behind an ``extra``,
+        ``hypothesis`` is one of the layer's eight ``--no-deps`` pins, and the old seed —
+        the dropped names **and** the ``--no-deps`` names — moved pytest out of the
+        resolving pass, where the safeguard then refused the whole retry.
+        """
+        def reader(name, version):
+            declared = {
+                ("pytest", "5.4.3"): ("hypothesis (>=3.56) ; extra == 'testing'",),
+                ("clifford", "1.3.1"): ("h5py",),
+                ("mpl-toolkits-clifford", "0.0.3"): ("clifford",),
+            }.get((name, version), ())
+            return (declared, None)
+
+        deps = self._deps(
+            installs=(
+                "pytest==5.4.3",
+                "hypothesis==5.16.0",
+                "h5py==2.10.0",
+                "clifford==1.3.1",
+                "mpl-toolkits-clifford==0.0.3",
+            ),
+            metadata_of=reader,
+            no_deps_pins=("hypothesis==5.16.0",),
+        )
+        plan = bake_mod.retry_plan(deps, "Failed to build h5py\n")
+        assert plan is not None
+        assert plan.refused is None
+        assert [drop.pin for drop in plan.drops] == ["h5py==2.10.0"]
+        main = (
+            plan.script.split("<<'VANTA_REQUIREMENTS'\n", 1)[1]
+            .split("\nVANTA_REQUIREMENTS", 1)[0]
+        )
+        assert main.splitlines() == ["pytest==5.4.3"], "pytest is never moved"
+        no_deps = plan.script.split("<<'VANTA_NO_DEPS'\n", 1)[1]
+        # The dropped ``h5py``'s dependers re-close onto the pass; the kept pin stays put.
+        assert no_deps.startswith(
+            "hypothesis==5.16.0\nclifford==1.3.1\nmpl-toolkits-clifford==0.0.3\n"
+        )
+
+    def test_pandas_7_s_real_pins_move_nothing_new_under_the_narrowed_seed(self):
+        """``pandas/7``'s own retry: the eight ``--no-deps`` pins stay exactly as they
+        are, ``clifford`` and ``mpl-toolkits-clifford`` re-close on the ``h5py`` they
+        already declared, nothing joins the pass, and the retry is rendered — not
+        refused. ``pytest`` stays in the resolving pass throughout."""
+        KEPT = (
+            "clifford==1.3.1",
+            "hypothesis==5.16.0",
+            "mpl-toolkits-clifford==0.0.3",
+            "sparse==0.10.0",
+            "xarray==0.15.0",
+            "fastparquet==0.3.2",
+            "dask==2.10.1",
+            "statsmodels==0.11.0",
+        )
+        declared = {
+            ("clifford", "1.3.1"): ("numpy", "scipy", "numba (>0.46)", "h5py", "sparse"),
+            ("mpl-toolkits-clifford", "0.0.3"): ("clifford", "matplotlib", "trimesh"),
+            ("sparse", "0.10.0"): ("numpy", "scipy (>=0.19)", "numba (>=0.49)"),
+            ("xarray", "0.15.0"): ("pandas (>=0.25)",),
+            ("fastparquet", "0.3.2"): ("pandas (>=0.19)",),
+            ("statsmodels", "0.11.0"): ("pandas (>=0.25)",),
+            ("pytest", "5.4.3"): ("hypothesis (>=3.56) ; extra == 'testing'",),
+        }
+
+        def reader(name, version):
+            return (declared.get((name, version), ()), None)
+
+        installs = ("pytest==5.4.3", "h5py==2.10.0", *KEPT)
+        deps = self._deps(installs=installs, metadata_of=reader, no_deps_pins=KEPT)
+        plan = bake_mod.retry_plan(deps, "Failed to build h5py\n")
+        assert plan is not None
+        assert plan.refused is None
+        assert [drop.pin for drop in plan.drops] == ["h5py==2.10.0"]
+        main = (
+            plan.script.split("<<'VANTA_REQUIREMENTS'\n", 1)[1]
+            .split("\nVANTA_REQUIREMENTS", 1)[0]
+        )
+        assert main.splitlines() == ["pytest==5.4.3"], "pytest is never moved"
+        no_deps = plan.script.split("<<'VANTA_NO_DEPS'\n", 1)[1]
+        assert no_deps.startswith("".join(f"{pin}\n" for pin in KEPT))
+        assert plan.script == bake_mod.requirements_recipe(
+            ("pytest==5.4.3", *KEPT), no_deps_pins=KEPT, minor="3.8"
+        )
+
+    def test_a_protected_dependent_makes_the_retry_refuse(self):
+        """A dependent the safeguard protects may not leave the resolving pass (D2/D5b)."""
+        safeguard = bake_mod.pin_safeguard(
+            protected_names={
+                bake_mod.canonicalize_name("clifford"): "a pytest plugin"
+            }
+        )
+        deps = self._deps(
+            installs=("h5py==2.10.0", "clifford==1.3.1"),
+            metadata_of=self._cascade_metadata,
+            safeguard=safeguard,
+        )
+        plan = bake_mod.retry_plan(deps, "Failed to build h5py\n")
+        assert plan is not None
+        assert plan.script == "", "nothing may be built when the closure cannot be closed"
+        assert plan.refused == (("clifford==1.3.1", "a pytest plugin"),)
+        assert any("refusing to retry" in line for line in plan.describe())
+
+    def test_a_known_unknown_pin_leaves_the_retry_intact(self):
+        """A release PyPI cannot be read for is left in place and does not fail the layer
+        (D4): the closure skips it, and the strict freeze gate is the backstop."""
+        def reader(name, version):
+            if (name, version) == ("httpcore", "0.3.0"):
+                raise bake_mod.UnknownDeclarations(f"no metadata for {name}=={version}")
+            return ((), None)
+
+        deps = self._deps(
+            installs=("h5py==2.10.0", "httpcore==0.3.0"), metadata_of=reader
+        )
+        plan = bake_mod.retry_plan(deps, "Failed to build h5py\n")
+        assert plan is not None
+        assert plan.refused is None
+        assert "httpcore==0.3.0" in plan.script
+
+    def test_an_errored_read_makes_the_retry_refuse(self):
+        """A read that *errored* fails the layer closed, naming the pin it could not read
+        (D2/D4), rather than being skipped like a known unknown."""
+        def reader(name, version):
+            raise bake_mod.BakeError(f"could not read {name}=={version}: connection reset")
+
+        deps = self._deps(
+            installs=("h5py==2.10.0", "clifford==1.3.1"), metadata_of=reader
+        )
+        plan = bake_mod.retry_plan(deps, "Failed to build h5py\n")
+        assert plan is not None
+        assert plan.script == ""
+        assert plan.refused is not None
+        assert [spec for spec, _why in plan.refused] == ["clifford==1.3.1"]
+        assert "could not be read" in plan.refused[0][1]
+
+    # ---- record_retry: the drop reaches the layer's provenance -----------
+    def test_record_retry_writes_the_drops_and_the_retry_into_the_layer(self, tmp_path):
+        deps = self._deps()
+        bake_mod.write_deps(tmp_path, deps)
+        before = bake_mod.load_deps(tmp_path, deps.checkpoint)
+        plan = bake_mod.retry_plan(deps, _PANDAS_7_BUILD_LOG)
+        bake_mod.record_retry(tmp_path, deps.checkpoint, plan)
+        after = bake_mod.load_deps(tmp_path, deps.checkpoint)
+        assert [record["pin"] for record in after["dropped"]] == [
+            "h5py==2.10.0",
+            "scikit-learn==0.22.1",
+        ]
+        assert after["dropped"][0]["outcome"] == bake_mod.UNBUILDABLE_AT_BAKE
+        assert after["retry"]["used"] is True
+        assert "h5py==2.10.0" in after["retry"]["reason"]
+        assert len(after["retry"]["dropped"]) == 2
+        # The identity moves with the drops: this file now describes a different layer.
+        assert after["checkpoint_id"] != before["checkpoint_id"]
+
+    # ---- R1: the early pins move before the build requirements -----------
+    def test_the_egg_info_detector_reads_luigi_30_and_not_pandas_7(self):
+        """R1's trigger, and the positive ``failed_builds`` documents as its negative."""
+        assert bake_mod.failed_build_requirement_metadata(_LUIGI_30_BUILD_LOG) is True
+        assert bake_mod.failed_build_requirement_metadata(_PANDAS_7_BUILD_LOG) is False
+        assert bake_mod.failed_build_requirement_metadata("") is False
+
+    # ``pytest-runner`` is luigi/30's real build requirement and is *not* a build tool,
+    # so ``_split_build_pins`` keeps it in ``/tmp/build-req.txt`` — which is what the
+    # reorder is about. A build tool (``cython``) would land in the always-first
+    # ``/tmp/build-tools.txt`` group and leave no build-req block to move.
+    _R1_BUILD = ("pytest-runner==2.5.1",)
+    _R1_EARLY = ("setuptools-scm==3.4.1",)
+
+    def _recipe(self, *, early_pins_first: bool, hoist_pins=()) -> str:
+        return bake_mod.requirements_recipe(
+            self.INSTALLS,
+            build_pins=self._R1_BUILD,
+            early_pins=self._R1_EARLY,
+            minor="3.8",
+            early_pins_first=early_pins_first,
+            hoist_pins=hoist_pins,
+        )
+
+    def test_the_default_recipe_installs_the_early_pins_after_the_build_requirements(self):
+        script = self._recipe(early_pins_first=False)
+        assert script.index("/tmp/build-req.txt") < script.index("/tmp/early-req.txt")
+
+    def test_the_retry_recipe_only_reorders_the_two_installs(self):
+        """``early_pins_first`` moves the block and changes nothing else, line for line."""
+        first = self._recipe(early_pins_first=False)
+        retry = self._recipe(early_pins_first=True)
+        assert retry.index("/tmp/early-req.txt") < retry.index("/tmp/build-req.txt")
+        assert sorted(retry.splitlines()) == sorted(first.splitlines())
+
+    def test_the_hoist_is_a_finished_install_step_of_its_own_before_the_early_block(self):
+        """The fetched pin is installed by a step that has already ended, ahead of the
+        block it came from — and it is *additive*: everything else is line-for-line the
+        retry it was before the hoist existed."""
+        first = self._recipe(early_pins_first=True)
+        hoisted = self._recipe(
+            early_pins_first=True, hoist_pins=("setuptools-scm==3.4.1",)
+        )
+        before = first.splitlines()
+        after = hoisted.splitlines()
+        start = after.index("cat > /tmp/hoist-req.txt <<'VANTA_HOIST_REQUIRES'")
+        block = after[start : start + 5]
+        assert block[0] == "cat > /tmp/hoist-req.txt <<'VANTA_HOIST_REQUIRES'"
+        assert block[1] == "setuptools-scm==3.4.1", "the pin, at the version it already had"
+        assert block[2] == "VANTA_HOIST_REQUIRES"
+        assert "hoist-req.txt" in block[3] and "--no-build-isolation" in block[3]
+        assert block[4].startswith("for d in /tmp/pip-build-env-*")
+        assert hoisted.index("/tmp/hoist-req.txt") < hoisted.index("/tmp/early-req.txt")
+        # Nothing was removed and nothing else moved: delete the hoist block and the
+        # retry reads exactly as it did before the rule existed.
+        assert after[:start] + after[start + 5 :] == before
+
+    # ---- R1's fetch evidence: the two readings of one fetch -----------------
+    def test_the_egg_directory_names_the_distribution_easy_install_fetched(self):
+        """``luigi/30``'s shape: no marker line at all, only the ``.eggs`` traceback."""
+        assert bake_mod.easy_install_fetches(_LUIGI_30_BUILD_LOG) == ()
+        evidence = bake_mod.easy_install_fetch_evidence(_LUIGI_30_BUILD_LOG)
+        assert [spelling for spelling, _ in evidence] == ["setuptools_scm-10.3.4-py3.8"]
+        assert evidence[0][1].startswith("build log line ")
+        assert ".eggs/setuptools_scm-10.3.4-py3.8.egg/" in evidence[0][1]
+
+    def test_a_marker_line_names_the_distribution_too(self):
+        """``fastapi/1``'s shape, so one rule reads both logs."""
+        evidence = bake_mod.easy_install_fetch_evidence(
+            "Searching for cffi\nBest match: cffi 2.1.1\n"
+        )
+        assert [spelling for spelling, _ in evidence] == ["cffi", "cffi"]
+
+    def test_a_log_that_names_no_fetch_has_no_evidence(self):
+        assert bake_mod.easy_install_fetch_evidence(_PANDAS_7_BUILD_LOG) == ()
+        assert bake_mod.easy_install_fetch_evidence("") == ()
+
+    def test_the_hoist_is_the_early_pin_the_fetched_name_satisfies(self):
+        hoist = bake_mod.hoisted_pins(
+            _LUIGI_30_BUILD_LOG, early_pins=self._R1_EARLY
+        )
+        assert [item.pin for item in hoist] == ["setuptools-scm==3.4.1"]
+        assert hoist[0].name == "setuptools-scm"
+        assert hoist[0].fetched == "setuptools_scm-10.3.4-py3.8"
+        assert hoist[0].evidence.startswith("build log line ")
+
+    def test_a_fetch_no_early_pin_satisfies_hoists_nothing(self):
+        """Nothing to reorder is nothing to retry: the layer fails closed."""
+        assert (
+            bake_mod.hoisted_pins(_LUIGI_30_BUILD_LOG, early_pins=("six==1.13.0",)) == ()
+        )
+
+    def test_the_hoist_keeps_the_early_lists_own_order(self):
+        """The log's order does not decide: the hoist keeps the early list's order, so a
+        second attempt's script is deterministic and a reader can compare it by hand."""
+        output = (
+            "  File \"/tmp/b/x/.eggs/alpha-1.0-py3.8.egg/alpha/a.py\", line 1\n"
+            "  File \"/tmp/b/x/.eggs/beta-2.0-py3.8.egg/beta/b.py\", line 1\n"
+        )
+        hoist = bake_mod.hoisted_pins(
+            output, early_pins=("beta==2.0", "alpha==1.0")
+        )
+        assert [item.pin for item in hoist] == ["beta==2.0", "alpha==1.0"]
+
+    def test_a_build_requirement_egg_info_failure_retries_with_the_early_pins_first(self):
+        deps = self._deps(build_pins=self._R1_BUILD, early_pins=self._R1_EARLY)
+        plan = bake_mod.retry_plan(deps, _LUIGI_30_BUILD_LOG)
+        assert plan is not None
+        assert plan.drops == ()
+        assert [item.pin for item in plan.hoist] == ["setuptools-scm==3.4.1"]
+        assert plan.rule == bake_mod.RETRY_RULE_EARLY
+        assert plan.describe()
+        assert plan.script == self._recipe(
+            early_pins_first=True, hoist_pins=("setuptools-scm==3.4.1",)
+        )
+
+    def test_a_layer_with_no_early_pins_never_gets_the_r1_retry(self):
+        deps = self._deps(build_pins=self._R1_BUILD)
+        assert bake_mod.retry_plan(deps, _LUIGI_30_BUILD_LOG) is None
+
+    def test_a_log_that_is_not_an_egg_info_crash_never_gets_the_r1_retry(self):
+        deps = self._deps(early_pins=self._R1_EARLY)
+        assert bake_mod.retry_plan(deps, "some other failure\n") is None
+
+    def test_an_egg_info_crash_that_names_no_fetch_gets_no_retry(self):
+        """Fail closed: with no fetch in the log there is nothing a retry could do."""
+        deps = self._deps(early_pins=self._R1_EARLY)
+        assert (
+            bake_mod.retry_plan(
+                deps,
+                "ERROR: Command errored out with exit status 1: python setup.py "
+                "egg_info\n",
+            )
+            is None
+        )
+
+    def test_record_retry_records_the_reordering_without_a_drop(self, tmp_path):
+        deps = self._deps(early_pins=self._R1_EARLY)
+        bake_mod.write_deps(tmp_path, deps)
+        before = bake_mod.load_deps(tmp_path, deps.checkpoint)
+        plan = bake_mod.retry_plan(deps, _LUIGI_30_BUILD_LOG)
+        bake_mod.record_retry(tmp_path, deps.checkpoint, plan)
+        after = bake_mod.load_deps(tmp_path, deps.checkpoint)
+        assert after["retry"]["used"] is True
+        assert after["retry"]["rule"] == bake_mod.RETRY_RULE_EARLY
+        assert after["retry"]["dropped"] == []
+        assert after["retry"]["hoisted"] == [
+            {
+                "name": "setuptools-scm",
+                "pin": "setuptools-scm==3.4.1",
+                "fetched": "setuptools_scm-10.3.4-py3.8",
+                "evidence": plan.hoist[0].evidence,
+            }
+        ]
+        assert "easy_install reached for setuptools_scm-10.3.4-py3.8" in (
+            after["retry"]["reason"]
+        )
+        # R1 drops nothing, so ``dropped`` is exactly what the first pass left there.
+        assert after["dropped"] == before.get("dropped", [])
+        # The retry record is decisive material too, so the identity moves.
+        assert after["checkpoint_id"] != before["checkpoint_id"]
+
+    # ---- R4: a download that did not match the hash the index named -------
+    def test_the_mismatch_block_names_the_package_and_both_hashes(self):
+        """``pandas/66``'s shape: the index's own ``#sha256=`` link, the body arriving."""
+        transient = bake_mod.transient_download_failure(_PANDAS_66_BUILD_LOG)
+        assert transient is not None
+        assert transient.spec == "matplotlib==3.1.3"
+        assert transient.expected.startswith("db3121f1")
+        assert transient.got.startswith("a126ab08")
+        assert transient.aborted is True, "the RemoteDisconnected corroborates a cut transfer"
+        assert transient.evidence.startswith("build log line ")
+        assert "THESE PACKAGES DO NOT MATCH THE HASHES" in transient.evidence
+        assert "re-fetch" in transient.describe()
+        assert transient.as_dict()["connection_broken"] is True
+
+    def test_a_log_with_no_mismatch_is_not_this_rule(self):
+        """The three other logs reach their own rules: R2(ii) and R1 named nothing here."""
+        assert bake_mod.transient_download_failure("") is None
+        assert bake_mod.transient_download_failure(_PANDAS_7_BUILD_LOG) is None
+        assert bake_mod.transient_download_failure(_LUIGI_30_BUILD_LOG) is None
+
+    def test_a_mismatch_block_that_names_no_package_is_not_this_rule(self):
+        """Fail closed: a mismatch that names nothing gives no package to re-fetch."""
+        output = (
+            "ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE.\n"
+        )
+        assert bake_mod.transient_download_failure(output) is None
+
+    def test_the_retry_for_a_transient_download_is_the_first_pass_unchanged(self):
+        """§8.6 R4 drops nothing, reorders nothing, and re-runs the identical recipe: the
+        bytes were wrong, not the layer. ``--no-cache-dir`` is what makes it a re-fetch."""
+        deps = self._deps()
+        plan = bake_mod.retry_plan(deps, _PANDAS_66_BUILD_LOG)
+        assert plan is not None
+        assert plan.rule == bake_mod.RETRY_RULE_TRANSIENT
+        assert plan.drops == ()
+        assert plan.hoist == ()
+        assert plan.transient is not None
+        assert plan.script == bake_mod.requirements_recipe(self.INSTALLS, minor="3.8")
+        assert plan.describe()
+
+    def test_each_rule_reads_its_own_log_and_not_the_others(self):
+        """The order is R2(ii) then R1 then R4, and each log reaches exactly its own."""
+        pandas_66 = self._deps()
+        assert (
+            bake_mod.retry_plan(pandas_66, _PANDAS_7_BUILD_LOG).rule
+            == bake_mod.RETRY_RULE_DROP
+        )
+        r1 = self._deps(build_pins=self._R1_BUILD, early_pins=self._R1_EARLY)
+        assert (
+            bake_mod.retry_plan(r1, _LUIGI_30_BUILD_LOG).rule
+            == bake_mod.RETRY_RULE_EARLY
+        )
+        assert (
+            bake_mod.retry_plan(pandas_66, _PANDAS_66_BUILD_LOG).rule
+            == bake_mod.RETRY_RULE_TRANSIENT
+        )
+
+    def test_record_retry_writes_the_transient_download(self, tmp_path):
+        deps = self._deps()
+        bake_mod.write_deps(tmp_path, deps)
+        before = bake_mod.load_deps(tmp_path, deps.checkpoint)
+        plan = bake_mod.retry_plan(deps, _PANDAS_66_BUILD_LOG)
+        bake_mod.record_retry(tmp_path, deps.checkpoint, plan)
+        after = bake_mod.load_deps(tmp_path, deps.checkpoint)
+        assert after["retry"]["rule"] == bake_mod.RETRY_RULE_TRANSIENT
+        assert after["retry"]["transient"]["spec"] == "matplotlib==3.1.3"
+        assert after["retry"]["transient"]["connection_broken"] is True
+        assert after["dropped"] == before.get("dropped", [])
+        # The retry record is decisive material too, so the identity moves.
+        assert after["checkpoint_id"] != before["checkpoint_id"]
+
+    def test_record_retry_writes_a_refusal_without_claiming_a_drop(self, tmp_path):
+        """D2/D5: a refused plan is recorded as a refusal — ``used`` is ``False``, nothing
+        is dropped, and the dependent and the reason are named."""
+        deps = self._deps()
+        bake_mod.write_deps(tmp_path, deps)
+        before = bake_mod.load_deps(tmp_path, deps.checkpoint)
+        plan = bake_mod.RetryPlan(
+            script="",
+            drops=(),
+            refused=(("clifford==1.3.1", "a pytest plugin"),),
+        )
+        bake_mod.record_retry(tmp_path, deps.checkpoint, plan)
+        after = bake_mod.load_deps(tmp_path, deps.checkpoint)
+        assert after["retry"]["used"] is False
+        assert after["retry"]["refused"] == [
+            {"spec": "clifford==1.3.1", "why": "a pytest plugin"}
+        ]
+        assert after["retry"]["dropped"] == []
+        assert after.get("dropped", []) == before.get("dropped", [])
+
+    # ---- run_bake_actions: the retry, and failing closed -----------------
+    CHILDREN = {"vanta-bi-Demo-1": PY38}
+
+    def _retry_run(
+        self,
+        *,
+        retry,
+        record_drops=None,
+        first_error,
+        second_ok,
+        second_error=None,
+        projects=None,
+        **kwargs,
+    ):
+        existing = {PY38}
+        projects = [] if projects is None else projects
+        logged: list[str] = []
+
+        def exists(name):
+            return name in existing
+
+        def remove(name):
+            existing.discard(name)
+
+        def build(name, script, base):
+            projects.append((name, script))
+            existing.add(name)
+            if name == "vanta-bi-Demo-1" and script == "recipe for vanta-bi-Demo-1":
+                return bake_mod.ExecResult(
+                    stdout=first_error, stderr="", exit_code=1, timed_out=False
+                )
+            if name == "vanta-bi-Demo-1" and not second_ok:
+                return bake_mod.ExecResult(
+                    stdout=(
+                        second_error
+                        if second_error is not None
+                        else "ERROR: retry blew up\n"
+                    ),
+                    stderr="",
+                    exit_code=1,
+                    timed_out=False,
+                )
+            return bake_mod.ExecResult(
+                stdout="ok", stderr="", exit_code=0, timed_out=False
+            )
+
+        return (
+            bake_mod.run_bake_actions(
+                bake_mod.plan_layers(
+                    _layers(PY38, "vanta-bi-Demo-1"),
+                    force=True,
+                    children=self.CHILDREN,
+                    exists=exists,
+                ),
+                children=self.CHILDREN,
+                exists=exists,
+                remove=remove,
+                build=build,
+                log=logged.append,
+                retry=retry,
+                record_drops=record_drops,
+                **kwargs,
+            ),
+            projects,
+            logged,
+        )
+
+    def test_a_failed_layer_is_rebuilt_once_with_the_dropped_pins_removed(self):
+        recorded: list[tuple[str, object]] = []
+        plan = self._drop_plan()
+
+        def retry(name, built):
+            return plan if name == "vanta-bi-Demo-1" else None
+
+        summary, projects, logged = self._retry_run(
+            retry=retry,
+            record_drops=lambda name, value: recorded.append((name, value)),
+            first_error=_PANDAS_7_BUILD_LOG,
+            second_ok=True,
+        )
+        attempts = [script for name, script in projects if name == "vanta-bi-Demo-1"]
+        assert attempts == ["recipe for vanta-bi-Demo-1", "retry recipe"]
+        assert recorded == [("vanta-bi-Demo-1", plan)]
+        assert any("retry: dropping h5py==2.10.0" in line for line in logged)
+        assert "[done] vanta-bi-Demo-1" in summary
+
+    def test_a_failed_retry_fails_closed_and_reports_the_retry_s_own_error(self):
+        """Fail closed: the **retry's** error is the report, and nothing is recorded."""
+        recorded: list[tuple[str, object]] = []
+
+        def retry(name, built):
+            return self._drop_plan() if name == "vanta-bi-Demo-1" else None
+
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._retry_run(
+                retry=retry,
+                record_drops=lambda name, value: recorded.append((name, value)),
+                first_error=_PANDAS_7_BUILD_LOG,
+                second_ok=False,
+            )
+        assert recorded == [], "a layer whose retry failed has no drop to record"
+        message = str(excinfo.value)
+        assert "ERROR: retry blew up" in message, "the retry's own error is the diagnosis"
+        assert "ERROR: Failed building wheel for h5py" not in message, (
+            "the first pass's error is what the retry was answering, not why it failed"
+        )
+        assert "[FAILED] vanta-bi-Demo-1" in message
+
+    def test_a_refused_retry_builds_no_second_attempt_and_names_the_refusal(self):
+        """D2: a refusal renders no script, so **no** second build runs; the layer keeps
+        its first-pass classification and the report names the refusal."""
+        refusal = bake_mod.RetryPlan(
+            script="",
+            drops=(),
+            refused=(("clifford==1.3.1", "a pytest plugin"),),
+        )
+        recorded: list[tuple[str, object]] = []
+        attempts: list[tuple[str, str]] = []
+
+        def retry(name, built):
+            return refusal if name == "vanta-bi-Demo-1" else None
+
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._retry_run(
+                retry=retry,
+                record_drops=lambda name, value: recorded.append((name, value)),
+                first_error=_PANDAS_7_BUILD_LOG,
+                second_ok=False,
+                projects=attempts,
+            )
+        built = [script for name, script in attempts if name == "vanta-bi-Demo-1"]
+        assert built == ["recipe for vanta-bi-Demo-1"], "no second attempt is rendered"
+        assert recorded == [("vanta-bi-Demo-1", refusal)], "the refusal is recorded"
+        message = str(excinfo.value)
+        assert "refused a retry" in message
+        assert "clifford==1.3.1" in message and "a pytest plugin" in message
+        assert "[FAILED] vanta-bi-Demo-1" in message
+
+    def test_a_failed_retry_writes_its_own_log_beside_the_first_pass(self, tmp_path):
+        """Both attempts' logs are kept, and both are named in the failure report."""
+        def retry(name, built):
+            return self._drop_plan() if name == "vanta-bi-Demo-1" else None
+
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._retry_run(
+                retry=retry,
+                first_error=_PANDAS_7_BUILD_LOG,
+                second_ok=False,
+                logs_dir=tmp_path,
+            )
+        first = bake_mod.bake_log_path(tmp_path, "vanta-bi-Demo-1")
+        second = bake_mod.retry_log_path(tmp_path, "vanta-bi-Demo-1")
+        assert first.is_file(), "the first pass's log is not overwritten"
+        assert second.is_file(), "the retry's own output is written"
+        assert _PANDAS_7_BUILD_LOG in first.read_text(encoding="utf-8")
+        assert "ERROR: retry blew up" in second.read_text(encoding="utf-8")
+        message = str(excinfo.value)
+        assert f"first-pass build log: {first}" in message
+        assert f"retry build log: {second}" in message
+
+    def test_a_transient_download_is_retried_once_and_can_build(self):
+        """The R4 retry runs the identical recipe again; a clean second fetch bakes."""
+        plan = self._transient_plan()
+        summary, projects, logged = self._retry_run(
+            retry=lambda name, built: plan if name == "vanta-bi-Demo-1" else None,
+            first_error=_PANDAS_66_BUILD_LOG,
+            second_ok=True,
+        )
+        attempts = [script for name, script in projects if name == "vanta-bi-Demo-1"]
+        assert attempts == ["recipe for vanta-bi-Demo-1", "retry recipe"]
+        assert any("retry: re-fetching" in line for line in logged)
+        assert "[done] vanta-bi-Demo-1" in summary
+
+    def test_a_second_mismatch_is_a_possible_integrity_problem(self):
+        """Hash checking is never weakened: a second mismatch fails closed and the report
+        asks a person to look at the index rather than calling it another cut transfer."""
+        plan = self._transient_plan()
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._retry_run(
+                retry=lambda name, built: plan if name == "vanta-bi-Demo-1" else None,
+                first_error=_PANDAS_66_BUILD_LOG,
+                second_ok=False,
+                second_error=_PANDAS_66_BUILD_LOG,
+            )
+        message = str(excinfo.value)
+        assert "[FAILED] vanta-bi-Demo-1" in message
+        assert "possible integrity problem" in message
+        assert "matplotlib==3.1.3" in message
+        assert "not a transient download" in message
+
+    def test_without_a_retry_callable_a_failed_layer_is_not_retried(self):
+        """A caller that attaches no retry — every run before this rule — builds once."""
+        projects: list[tuple[str, str]] = []
+        with pytest.raises(bake_mod.BakeError):
+            self._retry_run(
+                retry=None,
+                first_error=_PANDAS_7_BUILD_LOG,
+                second_ok=True,
+                projects=projects,
+            )
+        attempts = [script for name, script in projects if name == "vanta-bi-Demo-1"]
+        assert attempts == ["recipe for vanta-bi-Demo-1"]
+
+    def test_the_interpreter_layer_is_never_retried(self):
+        asked: list[str] = []
+        existing = {PY38}
+
+        def build(name, script, base):
+            existing.add(name)
+            return bake_mod.ExecResult(
+                stdout="Failed to build h5py\n", stderr="", exit_code=1, timed_out=False
+            )
+
+        with pytest.raises(bake_mod.BakeError):
+            bake_mod.run_bake_actions(
+                bake_mod.plan_layers(
+                    _layers(PY38, "vanta-bi-Demo-1"),
+                    force=True,
+                    children=self.CHILDREN,
+                    exists=lambda name: name in existing,
+                ),
+                children=self.CHILDREN,
+                exists=lambda name: name in existing,
+                remove=lambda name: existing.discard(name),
+                build=build,
+                log=lambda line: None,
+                retry=lambda name, built: asked.append(name) or None,
+            )
+        assert asked == [], "the base layer is built from DEFAULT_BASE and never retried"
 
 
 def _transitive_unbuildable_fixture():
@@ -14313,6 +19767,172 @@ class TestSetupPyStaticReader:
     def test_setup_py_that_is_not_python_is_an_error(self):
         with pytest.raises(bake_mod.BakeError, match="does not parse as Python"):
             bake_mod.setup_py_refs("setup(name=\n", {}, [])
+
+
+class TestSetupPyFStrings:
+    """The pandas template: an f-string over a module-level string constant (§8.6).
+
+    Six held-out pandas bugs (78, 121, 85, 138, 144, 104) declare ``install_requires``
+    as ``[..., f"numpy >= {min_numpy_ver}"]`` with ``min_numpy_ver = "1.13.3"`` at
+    module level. ``ast`` sees the ``JoinedStr``, and its only literal part is
+    ``"numpy >= "`` — a requirement nobody wrote, which is what the reader used to
+    hand to ``Requirement``. The declaration is resolved statically; one that cannot
+    be resolved is flagged rather than truncated.
+    """
+
+    def test_an_fstring_over_a_module_level_string_constant_is_resolved(self):
+        setup = (
+            "min_numpy_ver = '1.13.3'\n"
+            "setuptools_kwargs = {\n"
+            "    'install_requires': [\n"
+            "        'python-dateutil >= 2.6.1',\n"
+            "        'pytz >= 2017.2',\n"
+            "        f'numpy >= {min_numpy_ver}',\n"
+            "    ],\n"
+            "}\n"
+            "setup(name='pandas', **setuptools_kwargs)\n"
+        )
+        refs, _ = setup_py_refs(setup, {}, [])
+        assert [ref.spec for ref in refs] == [
+            "python-dateutil >= 2.6.1",
+            "pytz >= 2017.2",
+            "numpy >= 1.13.3",
+        ]
+        assert refs[-1].name == "numpy"
+        assert refs[-1].source == "install_requires (setup.py) line 6"
+
+    def test_an_fstring_interpolating_two_constants_is_resolved(self):
+        setup = (
+            "lo = '1.13'\n"
+            "hi = '2'\n"
+            "setup(name='X', install_requires=[f'numpy >={lo}.3,<{hi}'])\n"
+        )
+        refs, _ = setup_py_refs(setup, {}, [])
+        assert [ref.spec for ref in refs] == ["numpy >=1.13.3,<2"]
+
+    def test_an_fstring_over_a_name_bound_at_module_level_to_a_call_is_flagged(self):
+        """§8.6: a declaration that does not resolve to a literal fails closed."""
+        setup = (
+            "def vers():\n"
+            "    return '1.13.3'\n"
+            "min_numpy_ver = vers()\n"
+            "setup(name='X', install_requires=[f'numpy >= {min_numpy_ver}'])\n"
+        )
+        with pytest.raises(bake_mod.BakeError, match="cannot resolve"):
+            setup_py_refs(setup, {}, [])
+
+    def test_an_fstring_with_a_conversion_or_a_format_spec_is_flagged(self):
+        for template in ("f'numpy >= {min_numpy_ver!r}'", "f'numpy >= {min_numpy_ver:>8}'"):
+            setup = f"min_numpy_ver = '1.13.3'\nsetup(name='X', install_requires=[{template}])\n"
+            with pytest.raises(bake_mod.BakeError, match="cannot resolve"):
+                setup_py_refs(setup, {}, [])
+
+    def test_a_dict_bound_inside_a_function_is_left_unresolved_as_before(self):
+        """pandas 1, 51, 7 and 66 bind ``setuptools_kwargs`` inside ``setup_package()``.
+
+        [VANTA-WHY] Those layers are already baked, and the module-level f-string fix
+        must not reach into a function body to change them: the reader sees no
+        ``install_requires`` here, exactly as it did when they were baked.
+        """
+        setup = (
+            "min_numpy_ver = '1.13.3'\n"
+            "def setup_package():\n"
+            "    setuptools_kwargs = {'install_requires': [f'numpy >= {min_numpy_ver}']}\n"
+            "    setup(name='pandas', **setuptools_kwargs)\n"
+        )
+        notes: list[str] = []
+        refs, _ = setup_py_refs(setup, {}, notes)
+        assert refs == []
+        assert "install_requires: not declared in setup.py" in notes
+
+
+class TestSetupPyFormatCalls:
+    """The third spelling: ``"numpy >= {v}".format(v=…)`` over a module constant (§8.6).
+
+    pandas/121, 138 and 144 stayed flagged on ``'numpy >= {numpy_ver}'`` after the
+    f-string spelling was resolved: their ``setup.py`` at ``ad4c4d5`` writes
+    ``min_numpy_ver = "1.13.3"`` and spells the requirement
+    ``"numpy >= {numpy_ver}".format(numpy_ver=min_numpy_ver)``, which ``ast`` sees as a
+    ``Call`` on a string constant and the literal readers therefore never saw as a
+    requirement. Resolved the same way — statically, from the AST — and flagged when it
+    cannot be, never truncated to the template.
+    """
+
+    def test_a_format_call_over_a_module_level_string_constant_is_resolved(self):
+        """pandas/121's declaration, verbatim: the argument name is not the constant's."""
+        setup = (
+            "min_numpy_ver = '1.13.3'\n"
+            "setuptools_kwargs = {\n"
+            "    'install_requires': [\n"
+            "        'python-dateutil >= 2.6.1',\n"
+            "        'pytz >= 2017.2',\n"
+            "        'numpy >= {numpy_ver}'.format(numpy_ver=min_numpy_ver),\n"
+            "    ],\n"
+            "}\n"
+            "setup(name='pandas', **setuptools_kwargs)\n"
+        )
+        refs, _ = setup_py_refs(setup, {}, [])
+        assert [ref.spec for ref in refs] == [
+            "python-dateutil >= 2.6.1",
+            "pytz >= 2017.2",
+            "numpy >= 1.13.3",
+        ]
+        assert refs[-1].name == "numpy"
+        assert refs[-1].source == "install_requires (setup.py) line 6"
+
+    def test_a_string_literal_keyword_is_resolved_too(self):
+        setup = "setup(name='X', install_requires=['numpy >= {v}'.format(v='1.13.3')])\n"
+        refs, _ = setup_py_refs(setup, {}, [])
+        assert [ref.spec for ref in refs] == ["numpy >= 1.13.3"]
+
+    def test_a_module_level_template_constant_is_resolved_too(self):
+        setup = (
+            "TEMPLATE = 'numpy >= {v}'\n"
+            "VER = '1.13.3'\n"
+            "setup(name='X', install_requires=[TEMPLATE.format(v=VER)])\n"
+        )
+        refs, _ = setup_py_refs(setup, {}, [])
+        assert [ref.spec for ref in refs] == ["numpy >= 1.13.3"]
+
+    def test_an_argument_that_is_not_a_module_level_constant_is_flagged(self):
+        """§8.6: a declaration that does not resolve to a literal fails closed."""
+        setup = (
+            "def vers():\n"
+            "    return '1.13.3'\n"
+            "setup(name='X', install_requires=['numpy >= {v}'.format(v=vers())])\n"
+        )
+        with pytest.raises(bake_mod.BakeError, match="str.format call"):
+            setup_py_refs(setup, {}, [])
+
+    def test_a_positional_or_auto_numbered_field_is_flagged(self):
+        for call in ("'numpy >= {}'.format('1.13.3')", "'numpy >= {0}'.format('1.13.3')"):
+            setup = f"setup(name='X', install_requires=[{call}])\n"
+            with pytest.raises(bake_mod.BakeError, match="str.format call"):
+                setup_py_refs(setup, {}, [])
+
+    def test_a_conversion_or_a_format_spec_is_flagged(self):
+        for call in (
+            "'numpy >= {v!r}'.format(v='1.13.3')",
+            "'numpy >= {v:>8}'.format(v='1.13.3')",
+        ):
+            setup = f"setup(name='X', install_requires=[{call}])\n"
+            with pytest.raises(bake_mod.BakeError, match="str.format call"):
+                setup_py_refs(setup, {}, [])
+
+    def test_a_field_with_no_matching_keyword_is_flagged(self):
+        setup = "setup(name='X', install_requires=['numpy >= {v}'.format(w='1.13.3')])\n"
+        with pytest.raises(bake_mod.BakeError, match="str.format call"):
+            setup_py_refs(setup, {}, [])
+
+    def test_a_template_that_is_not_a_literal_is_flagged(self):
+        """The receiver is not a string this reader can see, so the call is refused."""
+        setup = (
+            "def template():\n"
+            "    return 'numpy >= {v}'\n"
+            "setup(name='X', install_requires=[template().format(v='1.13.3')])\n"
+        )
+        with pytest.raises(bake_mod.BakeError, match="str.format call"):
+            setup_py_refs(setup, {}, [])
 
 
 def setup_py_refs(setup_py: str, files: dict, notes: list) -> tuple:
@@ -17795,6 +23415,138 @@ class TestDependencyProvenance:
         assert bake_mod.load_deps(deps_dir, "vanta-bi-Demo-3")["import_name"] == "demo"
         assert bake_mod.missing_deps(deps_dir, ["vanta-bi-Demo-3"]) == []
 
+    # ---- the layer's identity (M3 item U3) --------------------------------
+    @staticmethod
+    def _layer(checkpoint, provenance):
+        return bake_mod.BugDeps(
+            entry={"project": "Demo", "bug_id": 3},
+            checkpoint=checkpoint,
+            installs=(),
+            provenance=provenance,
+        )
+
+    def test_the_written_provenance_carries_the_layers_identity(
+        self, tmp_path, monkeypatch
+    ):
+        """M3 item U3 — bake stamps a digest and the moment it was baked.
+
+        ``suite_cache`` reads exactly this field, so a layer that is written
+        without one is a layer no run may be served from.
+        """
+        deps_dir = tmp_path / "deps"
+        path = bake_mod.write_deps(
+            deps_dir, self._layer("chk", {"installs": [], "import_name": "demo"})
+        )
+        data = json.loads(path.read_text(encoding="utf-8"))
+        baked_at = data[bake_mod.BAKED_AT_KEY]
+        assert baked_at.endswith("+00:00"), "ISO-8601, UTC"
+        assert data[bake_mod.CHECKPOINT_ID_KEY] == hashlib.sha256(
+            f"{baked_at}\x00{bake_mod.provenance_digest(data)}".encode("utf-8")
+        ).hexdigest()
+
+        monkeypatch.setattr(suite_cache_mod, "deps_dir", lambda: deps_dir)
+        assert (
+            suite_cache_mod.checkpoint_identity("chk")
+            == data[bake_mod.CHECKPOINT_ID_KEY]
+        )
+
+    def test_an_unchanged_layer_keeps_its_identity_across_a_rebake(self, tmp_path):
+        """The stamp is preserved when a re-bake resolves the same layer.
+
+        A fresh timestamp on every ``bake`` invocation would change the identity
+        of a layer nothing changed — and take the suite cache down with it every
+        time the bake was re-run.
+        """
+        deps_dir = tmp_path / "deps"
+        first = bake_mod.write_deps(
+            deps_dir, self._layer("chk", {"installs": [], "import_name": "demo"})
+        )
+        before = json.loads(first.read_text(encoding="utf-8"))
+
+        second = bake_mod.write_deps(
+            deps_dir, self._layer("chk", {"installs": [], "import_name": "demo"})
+        )
+        after = json.loads(second.read_text(encoding="utf-8"))
+
+        assert after[bake_mod.CHECKPOINT_ID_KEY] == before[bake_mod.CHECKPOINT_ID_KEY]
+        assert after[bake_mod.BAKED_AT_KEY] == before[bake_mod.BAKED_AT_KEY]
+
+    def test_a_layer_rebaked_from_other_pins_is_a_new_identity(self, tmp_path):
+        """The name is reused; the identity must not be."""
+        deps_dir = tmp_path / "deps"
+        first = bake_mod.write_deps(
+            deps_dir, self._layer("chk", {"installs": [], "import_name": "demo"})
+        )
+        before = json.loads(first.read_text(encoding="utf-8"))
+
+        second = bake_mod.write_deps(
+            deps_dir,
+            self._layer("chk", {"installs": ["decorator==4.4.0"], "import_name": "demo"}),
+        )
+        after = json.loads(second.read_text(encoding="utf-8"))
+
+        assert after[bake_mod.CHECKPOINT_ID_KEY] != before[bake_mod.CHECKPOINT_ID_KEY]
+
+    def test_the_layers_own_pip_check_reading_is_not_part_of_its_identity(self, tmp_path):
+        """``record_pip_check`` runs AFTER the stamp and must not move it.
+
+        ``pip_check`` is the layer's verdict on itself, not an input to the bake.
+        A digest that covered it would make every re-bake of an already recorded
+        layer look like a different layer.
+        """
+        deps_dir = tmp_path / "deps"
+        provenance = {"installs": [], "import_name": "demo"}
+        path = bake_mod.write_deps(deps_dir, self._layer("chk", provenance))
+        before = json.loads(path.read_text(encoding="utf-8"))
+
+        bake_mod.record_pip_check(
+            deps_dir,
+            "chk",
+            (
+                bake_mod.PinConflict(
+                    case=bake_mod.CASE_BOTH_OWN_PINS,
+                    requires="httpcore==0.3.0 declares h11==0.8.*",
+                    held="h11==0.9.0",
+                    source="pip check",
+                    pins=("httpcore==0.3.0", "h11==0.9.0"),
+                ),
+            ),
+        )
+        after = json.loads(path.read_text(encoding="utf-8"))
+
+        assert after[bake_mod.PIP_CHECK_KEY], "the reading was written back"
+        assert after[bake_mod.CHECKPOINT_ID_KEY] == before[bake_mod.CHECKPOINT_ID_KEY]
+
+        rebaked = json.loads(
+            bake_mod.write_deps(deps_dir, self._layer("chk", provenance)).read_text(
+                encoding="utf-8"
+            )
+        )
+        assert rebaked[bake_mod.CHECKPOINT_ID_KEY] == before[bake_mod.CHECKPOINT_ID_KEY]
+
+    def test_a_layer_with_no_recorded_identity_is_read_as_unknown(self, tmp_path, monkeypatch):
+        """``None`` means UNKNOWN, and a missing file means the same thing.
+
+        Answering "unknown" rather than raising keeps one stale layer a per-bug
+        cache miss instead of a harness crash.
+        """
+        deps_dir = tmp_path / "deps"
+        deps_dir.mkdir()
+        monkeypatch.setattr(suite_cache_mod, "deps_dir", lambda: deps_dir)
+
+        assert suite_cache_mod.checkpoint_identity("chk") is None
+        bake_mod.write_deps(deps_dir, self._layer("chk", {"installs": []}))
+        assert suite_cache_mod.checkpoint_identity("chk") == json.loads(
+            (deps_dir / "chk.json").read_text(encoding="utf-8")
+        )[bake_mod.CHECKPOINT_ID_KEY]
+
+        (deps_dir / "legacy.json").write_text(
+            json.dumps({"installs": [], "harness_pins": {}}), encoding="utf-8"
+        )
+        assert suite_cache_mod.checkpoint_identity("legacy") is None
+        (deps_dir / "broken.json").write_text("{oops\n", encoding="utf-8")
+        assert suite_cache_mod.checkpoint_identity("broken") is None
+
     def test_a_layer_with_no_recorded_provenance_must_be_rebaked(self, tmp_path):
         deps_dir = tmp_path / "deps"
         with pytest.raises(bake_mod.BakeError, match="re-run bake"):
@@ -17813,11 +23565,395 @@ class TestDependencyProvenance:
         with pytest.raises(bake_mod.BakeError, match="not dependency provenance"):
             bake_mod.load_deps(deps_dir, "vanta-bi-Demo-3")
 
+    # ---- giving the layers baked before U3 an identity (`stamp-existing`) ---
+    @staticmethod
+    def _verified(stdout: str):
+        """A boot-verify result, so these tests never boot a VM."""
+        return bake_mod.ExecResult(
+            stdout=stdout, stderr="", exit_code=0, timed_out=False
+        )
+
+    @staticmethod
+    def _probe(
+        listing,
+        *,
+        interpreter="/usr/local/bin/python",
+        version="Python 3.8.20",
+        listing_failed=False,
+    ):
+        """The stdout :func:`bake_mod.boot_layer_probe` prints for one boot.
+
+        Built from the probe's own sentinels — the marker, the interpreter it queried and
+        the version that interpreter reported, then its listing between the envelope — so
+        these tests exercise the real parse rather than a stand-in, and a change to the
+        probe's shape fails them. ``listing_failed`` emits ``VERIFY_LISTING_FAILED`` in
+        place of the listing, which is what a listing that exits non-zero looks like.
+        """
+        lines = [
+            bake_mod.VERIFY_MARKER_OK,
+            f"{bake_mod.VERIFY_INTERPRETER} {interpreter}",
+            f"{bake_mod.VERIFY_VERSION} {version}",
+            bake_mod.VERIFY_LISTING_BEGIN,
+        ]
+        if listing_failed:
+            lines.append(bake_mod.VERIFY_LISTING_FAILED)
+        else:
+            lines += [*listing, bake_mod.VERIFY_LISTING_END]
+        return "\n".join(lines) + "\n"
+
+    def test_stamp_existing_gives_a_legacy_layer_an_identity_without_rebaking(
+        self, tmp_path, monkeypatch
+    ):
+        """M3 item U3 — a layer baked before the stamp gains one where it stands.
+
+        The checkpoints that exist were baked before U3, so the whole suite cache read
+        ``off:unknown_checkpoint`` and nothing was ever reused. The stamp is the identity
+        a bake would have written, in the file a bake writes it to, so the layer keeps its
+        place; the boot-verify is faked because this is about the identity, not a sandbox.
+        """
+        deps_dir = tmp_path / "deps"
+        deps_dir.mkdir()
+        legacy = {
+            "project": "Demo",
+            "installs": ["decorator==4.4.0"],
+            "import_name": "demo",
+        }
+        write(deps_dir / "chk.json", json.dumps(legacy))
+        write(deps_dir / "chk.preflight.json", json.dumps({"checkpoint": "chk"}))
+        write(deps_dir / "nothing.json", json.dumps({"import_name": "demo"}))
+
+        monkeypatch.setattr(bake_mod, "layer_exists", lambda name: True)
+        monkeypatch.setattr(
+            bake_mod,
+            "boot_layer_probe",
+            lambda checkpoint, *, disk_mb: self._verified(
+                self._probe(["decorator==4.4.0", "pytest==6.2.5"])
+            ),
+        )
+
+        outcomes = {o.checkpoint: o for o in bake_mod.stamp_existing(deps_dir)}
+
+        assert outcomes["chk"].action == "stamped"
+        assert outcomes["chk"].origin == "stamped"
+        assert "chk.preflight" not in outcomes, "a preflight record is not a layer"
+        assert outcomes["nothing"].action == "not a layer's provenance"
+
+        data = json.loads((deps_dir / "chk.json").read_text(encoding="utf-8"))
+        assert data[bake_mod.STAMPED_EXISTING_KEY] is True
+        assert data[bake_mod.CHECKPOINT_ID_KEY] == hashlib.sha256(
+            f"{data[bake_mod.BAKED_AT_KEY]}\x00{bake_mod.provenance_digest(data)}".encode(
+                "utf-8"
+            )
+        ).hexdigest(), "the identity is the stamped material's digest, as a bake's is"
+        assert outcomes["chk"].digest == bake_mod.provenance_digest(data)
+
+        monkeypatch.setattr(suite_cache_mod, "deps_dir", lambda: deps_dir)
+        assert suite_cache_mod.checkpoint_identity("chk") == data[bake_mod.CHECKPOINT_ID_KEY]
+        assert not bake_mod.unstamped_deps(deps_dir, ["chk"]), "the layer is stamped now"
+
+        # Idempotent: a second run is a no-op and does not move the identity.
+        again = {o.checkpoint: o for o in bake_mod.stamp_existing(deps_dir)}
+        assert again["chk"].action == "already"
+        assert again["chk"].origin == "stamped"
+        assert json.loads((deps_dir / "chk.json").read_text(encoding="utf-8")) == data
+
+        # A later bake of the SAME pins is a new identity: the marker is digested, so the
+        # bake's material differs, ``baked_at`` cannot be preserved, and the stamp is not
+        # the identity of the layer the bake just built.
+        rebaked = json.loads(
+            bake_mod.write_deps(deps_dir, self._layer("chk", legacy)).read_text(
+                encoding="utf-8"
+            )
+        )
+        assert bake_mod.STAMPED_EXISTING_KEY not in rebaked
+        assert rebaked[bake_mod.CHECKPOINT_ID_KEY] != data[bake_mod.CHECKPOINT_ID_KEY]
+
+    def test_stamp_existing_refuses_a_layer_that_no_longer_matches(
+        self, tmp_path, monkeypatch
+    ):
+        """The refusal is per layer, and a refused layer is left byte-for-byte alone.
+
+        A stamp is an identity, so handing one to a layer whose boot-verify disagrees
+        with its recorded pins is the one thing this step must not do — and one such
+        layer must not stop the others from being stamped.
+        """
+        deps_dir = tmp_path / "deps"
+        deps_dir.mkdir()
+        prov = {"project": "Demo", "installs": ["decorator==4.4.0"]}
+        write(deps_dir / "changed.json", json.dumps(prov))
+        write(deps_dir / "fine.json", json.dumps(prov))
+        before = (deps_dir / "changed.json").read_text(encoding="utf-8")
+
+        monkeypatch.setattr(bake_mod, "layer_exists", lambda name: True)
+        monkeypatch.setattr(
+            bake_mod,
+            "boot_layer_probe",
+            lambda checkpoint, *, disk_mb: self._verified(
+                self._probe(
+                    ["pytest==6.2.5"] if checkpoint == "changed" else ["decorator==4.4.0"]
+                )
+            ),
+        )
+
+        outcomes = {o.checkpoint: o for o in bake_mod.stamp_existing(deps_dir)}
+
+        assert outcomes["changed"].action == "refused"
+        assert "decorator==4.4.0 is not installed" in outcomes["changed"].verify
+        assert (deps_dir / "changed.json").read_text(encoding="utf-8") == before
+        assert bake_mod.unstamped_deps(deps_dir, ["changed"]) == ["changed"]
+        assert outcomes["fine"].action == "stamped"
+
+    def test_stamp_existing_refuses_a_layer_whose_marker_is_gone(self, tmp_path, monkeypatch):
+        """A missing marker is a refusal with its own sentence, not a generic failure."""
+        deps_dir = tmp_path / "deps"
+        deps_dir.mkdir()
+        write(deps_dir / "chk.json", json.dumps({"installs": []}))
+        monkeypatch.setattr(bake_mod, "layer_exists", lambda name: True)
+        monkeypatch.setattr(
+            bake_mod,
+            "boot_layer_probe",
+            lambda checkpoint, *, disk_mb: self._verified(bake_mod.VERIFY_MARKER_MISSING),
+        )
+        [outcome] = bake_mod.stamp_existing(deps_dir)
+        assert outcome.action == "refused"
+        assert outcome.verify == f"the layer has no marker {bake_mod.MARKER}"
+
+    def test_stamp_existing_stamps_a_layer_whose_own_interpreter_lists_its_pins(
+        self, tmp_path, monkeypatch
+    ):
+        """A layer stamps when its own interpreter's listing carries every recorded pin.
+
+        The fake VM returns exactly what :func:`bake_mod.boot_layer_probe` prints, so this
+        exercises the real parse — and the listing is the one a working layer produces,
+        which is why it names ``argparse==1.3.0`` (hidden from ``pip freeze`` because it is
+        a standard-library module's name, so a pip-based listing would call a healthy layer
+        drifted) and ``pysnooper`` in PEP 503 form against a ``PySnooper`` pin (so the
+        comparison has to canonicalise names). A second deps file whose checkpoint is gone
+        is reported ``missing`` — not refused — and the first still stamps.
+        """
+        deps_dir = tmp_path / "deps"
+        deps_dir.mkdir()
+        write(
+            deps_dir / "live.json",
+            json.dumps(
+                {
+                    "project": "PySnooper",
+                    "installs": [
+                        "decorator==4.4.0",
+                        "argparse==1.3.0",
+                        "PySnooper==0.2.8",
+                    ],
+                    "import_name": "pysnooper",
+                }
+            ),
+        )
+        write(deps_dir / "gone.json", json.dumps({"project": "Demo", "installs": []}))
+
+        monkeypatch.setattr(bake_mod, "layer_exists", lambda name: name == "live")
+        monkeypatch.setattr(
+            bake_mod,
+            "boot_layer_probe",
+            lambda checkpoint, *, disk_mb: self._verified(
+                self._probe(
+                    [
+                        "decorator==4.4.0",
+                        "argparse==1.3.0",
+                        "pysnooper==0.2.8",
+                        "pytest==6.2.5",
+                    ],
+                    interpreter="/usr/local/bin/python",
+                    version="Python 3.8.20",
+                )
+            ),
+        )
+
+        outcomes = {o.checkpoint: o for o in bake_mod.stamp_existing(deps_dir)}
+
+        assert outcomes["live"].action == "stamped"
+        assert outcomes["live"].interpreter == "/usr/local/bin/python"
+        assert outcomes["live"].python_version == "Python 3.8.20"
+        assert outcomes["gone"].action == "missing"
+        assert "no checkpoint named gone" in outcomes["gone"].verify
+
+    def test_stamp_existing_refuses_when_the_listing_cannot_be_read(
+        self, tmp_path, monkeypatch
+    ):
+        """A listing that failed is a verify error, never a mismatch.
+
+        A listing that exits non-zero is the probe not managing to look, so the layer is
+        refused with :data:`bake_mod.ENV_UNREADABLE` and the reason — not with the "no
+        longer matches its recorded provenance" sentence, which would claim the layer
+        drifted and send a reader to re-bake a layer that is fine.
+        """
+        deps_dir = tmp_path / "deps"
+        deps_dir.mkdir()
+        write(
+            deps_dir / "chk.json",
+            json.dumps({"project": "Demo", "installs": ["decorator==4.4.0"]}),
+        )
+        monkeypatch.setattr(bake_mod, "layer_exists", lambda name: True)
+        monkeypatch.setattr(
+            bake_mod,
+            "boot_layer_probe",
+            lambda checkpoint, *, disk_mb: self._verified(
+                self._probe([], listing_failed=True)
+            ),
+        )
+
+        [outcome] = bake_mod.stamp_existing(deps_dir)
+
+        assert outcome.action == "refused"
+        assert bake_mod.ENV_UNREADABLE in outcome.verify
+        assert "no longer matches its recorded provenance" not in outcome.verify
+
 
 needs_bare_repos = pytest.mark.skipif(
     not (REPO_ROOT / "runs" / "bugsinpy" / "repos" / "PySnooper.git").is_dir(),
     reason="the bare project clones are not present (runs/ is not committed)",
 )
+
+
+class TestSuitePythonpath:
+    """§8.6 round 10 — the suite's ``PYTHONPATH`` is the project's own, read per commit.
+
+    The split records the *rule* (this project's suite needs a ``PYTHONPATH``); the
+    *value* is read from the buggy commit's own ``scripts/test.sh``, because fastapi
+    moved its example tree from ``docs_src`` to ``docs/src`` and one recorded value
+    served only one side of the move. ``_sandbox_env`` is exactly what ``prepare_one``
+    builds the row with, so a test of it is a test of the row.
+    """
+
+    FASTAPI_REPO = REPO_ROOT / "runs" / "bugsinpy" / "repos" / "fastapi.git"
+    # The buggy commits the held-out split records (§8.6 round 10). Kept as literals
+    # because the point of the test is that *these* commits, read from the mirror,
+    # say what the canary needs — not that the split happens to agree with itself.
+    FASTAPI_11 = "bf229ad5d830eb5320f966d51a55e590e8d57008"
+    FASTAPI_3 = "869c7389e22dc9ad659940fa271da76c4f3ba3b1"
+
+    def test_the_project_s_own_export_is_read(self, monkeypatch):
+        monkeypatch.setattr(
+            tree_mod,
+            "read_file_at",
+            lambda repo, commit, path: "set -e\nexport PYTHONPATH=./docs/src\npytest tests\n",
+        )
+        assert (
+            prepare_mod.suite_pythonpath(Path("/clones/fastapi.git"), "c" * 40)
+            == "./docs/src"
+        )
+
+    def test_quotes_around_the_value_are_trimmed(self, monkeypatch):
+        monkeypatch.setattr(
+            tree_mod,
+            "read_file_at",
+            lambda repo, commit, path: 'export PYTHONPATH="./docs/src"\n',
+        )
+        assert (
+            prepare_mod.suite_pythonpath(Path("/clones/fastapi.git"), "c" * 40)
+            == "./docs/src"
+        )
+
+    def test_a_project_with_no_runner_states_nothing(self, monkeypatch):
+        monkeypatch.setattr(tree_mod, "read_file_at", lambda repo, commit, path: None)
+        assert prepare_mod.suite_pythonpath(Path("/clones/matplotlib.git"), "c" * 40) is None
+
+    def test_a_runner_that_exports_no_pythonpath_states_nothing(self, monkeypatch):
+        monkeypatch.setattr(
+            tree_mod,
+            "read_file_at",
+            lambda repo, commit, path: "#!/usr/bin/env bash\npytest tests\n",
+        )
+        assert prepare_mod.suite_pythonpath(Path("/clones/luigi.git"), "c" * 40) is None
+
+    def test_the_row_takes_the_commits_value_over_the_splits(self, monkeypatch):
+        """The stale recorded value does not win: fastapi/11's tree has no ``docs_src``."""
+        monkeypatch.setattr(
+            tree_mod,
+            "read_file_at",
+            lambda repo, commit, path: "export PYTHONPATH=./docs/src\n",
+        )
+        env = prepare_mod._sandbox_env(
+            {"sandbox_env": {"PYTHONPATH": "./docs_src"}},
+            repo=Path("/clones/fastapi.git"),
+            commit=self.FASTAPI_11,
+        )
+        assert env == {"PYTHONPATH": "./docs/src"}
+
+    def test_the_row_keeps_the_split_value_when_the_project_states_nothing(self, monkeypatch):
+        """matplotlib ships no ``scripts/test.sh``: its recorded ``lib`` stands."""
+        monkeypatch.setattr(tree_mod, "read_file_at", lambda repo, commit, path: None)
+        env = prepare_mod._sandbox_env(
+            {"sandbox_env": {"MPLBACKEND": "Agg", "PYTHONPATH": "lib"}},
+            repo=Path("/clones/matplotlib.git"),
+            commit="c" * 40,
+        )
+        assert env == {"MPLBACKEND": "Agg", "PYTHONPATH": "lib"}
+
+    def test_a_project_that_states_a_path_with_no_recorded_rule_gets_it(self, monkeypatch):
+        monkeypatch.setattr(
+            tree_mod,
+            "read_file_at",
+            lambda repo, commit, path: "export PYTHONPATH=./docs/src\n",
+        )
+        assert prepare_mod._sandbox_env(
+            {}, repo=Path("/clones/fastapi.git"), commit=self.FASTAPI_11
+        ) == {"PYTHONPATH": "./docs/src"}
+
+    def test_fastapi_11s_suite_run_sees_docs_src_on_the_path(self, monkeypatch, tmp_path):
+        """The env that reaches the deps gate's collect is the commit's own ``./docs/src``.
+
+        [VANTA-WHY] The deps gate's collect is the run that failed on fastapi/11 — its
+        tutorial tests import the example apps out of the tree's docs directory — so
+        that is the run this asserts. The row's ``sandbox_env`` is what every run of the
+        row gets (``TestSandboxEnvReachesEveryRun``), and here it is built from the same
+        commit the held-out split records.
+        """
+        monkeypatch.setattr(
+            tree_mod,
+            "read_file_at",
+            lambda repo, commit, path: "export PYTHONPATH=./docs/src\n",
+        )
+        env = prepare_mod._sandbox_env(
+            {"sandbox_env": {"PYTHONPATH": "./docs_src"}},
+            repo=self.FASTAPI_REPO,
+            commit=self.FASTAPI_11,
+        )
+        seen: dict = {}
+        monkeypatch.setattr(
+            suite_mod,
+            "collect_only",
+            lambda **kwargs: seen.update(collect=kwargs) or {"tests/x.py::t"},
+        )
+        monkeypatch.setattr(
+            suite_mod,
+            "import_probe",
+            lambda **kwargs: seen.update(probe=kwargs)
+            or "/workspace/worktrees/fastapi_11/oracle_tree/fastapi/__init__.py",
+        )
+        prepare_mod.check_deps(
+            prep(
+                root=tmp_path / "batch" / "worktrees" / "fastapi_11",
+                sandbox_env=env,
+            ),
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            deps={"import_name": "fastapi"},
+        )
+        assert seen["collect"]["extra_env"] == {"PYTHONPATH": "./docs/src"}
+        assert seen["probe"]["extra_env"] == {"PYTHONPATH": "./docs/src"}
+
+    @needs_bare_repos
+    def test_fastapi_11s_own_commit_declares_docs_src(self):
+        """The canary's fact, read from the real mirror rather than a stub."""
+        assert (
+            prepare_mod.suite_pythonpath(self.FASTAPI_REPO, self.FASTAPI_11) == "./docs/src"
+        )
+
+    @needs_bare_repos
+    def test_fastapi_3s_own_commit_declares_docs_src(self):
+        """The other side of the move: /3's tree carries ``docs_src`` and it passes."""
+        assert (
+            prepare_mod.suite_pythonpath(self.FASTAPI_REPO, self.FASTAPI_3) == "./docs_src"
+        )
 
 
 @needs_bare_repos
@@ -18730,6 +24866,38 @@ class TestDepGate:
                 deps=self._deps(),
             )
 
+    def test_the_budget_reaches_the_gate_vms(self, tmp_path, monkeypatch):
+        """M3 item Y1 — the collect gate and the import probe are priced too.
+
+        Both boot a VM, so both are handed the invocation's budget; a gate that ran
+        outside it would make ``--prepare-jobs`` a claim about fewer VMs than the
+        machine was actually running.
+        """
+        seen: dict = {}
+        monkeypatch.setattr(
+            suite_mod,
+            "collect_only",
+            lambda **kwargs: seen.update(collect=kwargs) or {"tests/test_x.py::test_a"},
+        )
+        monkeypatch.setattr(
+            suite_mod,
+            "import_probe",
+            lambda **kwargs: seen.update(probe=kwargs)
+            or "/workspace/worktrees/Demo_1/oracle_tree/pysnooper/__init__.py",
+        )
+        budget = budget_mod.Budget(4, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20)
+
+        prepare_mod.check_deps(
+            self._prep(tmp_path),
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            deps=self._deps(),
+            budget=budget,
+        )
+
+        assert seen["collect"]["budget"] is budget
+        assert seen["probe"]["budget"] is budget
+
     def test_the_derivation_reuses_the_gate_s_collection(self, tmp_path, monkeypatch):
         """Two collections of one tree are two chances to disagree."""
         calls: list = []
@@ -18767,7 +24935,21 @@ class TestBuildTreeInPlace:
         base.update(over)
         return shuru_mod.ExecResult(**base)
 
-    def test_it_runs_setup_py_in_the_tree_with_the_layers_env(self, monkeypatch):
+    @staticmethod
+    def _batch(tmp_path: Path, tree_rel: str = "worktrees/matplotlib_1/oracle_tree") -> Path:
+        """A real batch dir holding a real tree.
+
+        [VANTA-WHY] M3 item V8. The build now runs in a fresh clone of the tree
+        (:class:`suite_mod.VmRoot`), so both the batch and the tree have to exist on
+        disk before the call — this used to be ``Path("/nonexistent")`` because the
+        batch was mounted directly.
+        """
+        batch_dir = tmp_path / "batch"
+        (batch_dir / tree_rel).mkdir(parents=True)
+        (batch_dir / tree_rel / "setup.py").write_text("", encoding="utf-8")
+        return batch_dir
+
+    def test_it_runs_setup_py_in_the_tree_with_the_layers_env(self, monkeypatch, tmp_path):
         seen: dict = {}
         monkeypatch.setattr(
             suite_mod.shuru, "run", lambda **kwargs: seen.update(kwargs) or self._result()
@@ -18775,7 +24957,7 @@ class TestBuildTreeInPlace:
 
         suite_mod.build_tree_in_place(
             checkpoint="vanta-bi-matplotlib-1",
-            batch_dir=Path("/nonexistent"),
+            batch_dir=self._batch(tmp_path),
             tree_rel="worktrees/matplotlib_1/oracle_tree",
             python="python",
             setup_args=("build_ext", "--inplace"),
@@ -18794,7 +24976,9 @@ class TestBuildTreeInPlace:
         )
         assert seen["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
 
-    def test_a_failed_build_names_the_tree_and_carries_the_error_lines(self, monkeypatch):
+    def test_a_failed_build_names_the_tree_and_carries_the_error_lines(
+        self, monkeypatch, tmp_path
+    ):
         monkeypatch.setattr(
             suite_mod.shuru,
             "run",
@@ -18811,7 +24995,7 @@ class TestBuildTreeInPlace:
         with pytest.raises(suite_mod.SuiteError) as excinfo:
             suite_mod.build_tree_in_place(
                 checkpoint="chk",
-                batch_dir=Path("/nonexistent"),
+                batch_dir=self._batch(tmp_path),
                 tree_rel="worktrees/matplotlib_1/oracle_tree",
                 python="python",
                 setup_args=("build_ext", "--inplace"),
@@ -18828,7 +25012,9 @@ class TestBuildTreeInPlace:
             "progress output"
         )
 
-    def test_a_build_that_hangs_is_a_build_failure_not_a_suite_timeout(self, monkeypatch):
+    def test_a_build_that_hangs_is_a_build_failure_not_a_suite_timeout(
+        self, monkeypatch, tmp_path
+    ):
         monkeypatch.setattr(
             suite_mod.shuru,
             "run",
@@ -18838,7 +25024,7 @@ class TestBuildTreeInPlace:
         with pytest.raises(suite_mod.SuiteError, match="^build timed out after 7s in "):
             suite_mod.build_tree_in_place(
                 checkpoint="chk",
-                batch_dir=Path("/nonexistent"),
+                batch_dir=self._batch(tmp_path, "worktrees/Demo_1/oracle_tree"),
                 tree_rel="worktrees/Demo_1/oracle_tree",
                 python="python",
                 setup_args=("build_ext", "--inplace"),
@@ -18901,6 +25087,33 @@ class TestBuildTreesInPlace:
             "src_fixed": "built: python setup.py build_ext --inplace",
         }
 
+    def test_the_budget_reaches_every_build_vm(self, tmp_path, monkeypatch):
+        """M3 item Y1 — each tree's build VM holds a slot of the one scheduler.
+
+        A build boots a VM exactly as a suite run does; without the budget a
+        concurrent ``prepare`` would boot its builds beside the runs the cap was
+        counting, so every ``build_tree_in_place`` call is handed the budget.
+        """
+        calls: list = []
+        monkeypatch.setattr(
+            suite_mod,
+            "build_tree_in_place",
+            lambda **kwargs: calls.append(kwargs),
+        )
+        self._rule(monkeypatch, needed=True)
+        budget = budget_mod.Budget(4, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20)
+
+        prepare_mod.build_trees_in_place(
+            self._prep(tmp_path),
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            repo=tmp_path / "clone",
+            budget=budget,
+        )
+
+        assert len(calls) == 3, "the three independent trees are each built"
+        assert all(call["budget"] is budget for call in calls)
+
     def test_the_layers_own_compiler_environment_reaches_the_build(self, tmp_path, monkeypatch):
         seen: dict = {}
         monkeypatch.setattr(
@@ -18917,10 +25130,37 @@ class TestBuildTreesInPlace:
             repo=tmp_path / "clone",
         )
 
-        assert seen["env"] == dict(bake_mod.build_env_for("3.8")), (
-            "the compiler the interpreter recorded is the builder's, not the layer's"
-        )
+        layer = bake_mod.build_env_for("3.8")
+        assert seen["env"] == dict(
+            layer, CFLAGS=f"{layer['CFLAGS']} -Wno-error=array-bounds"
+        ), "the compiler the interpreter recorded is the builder's, not the layer's"
         assert seen["env"]["CC"] == bake_mod.VANTA_CC_PATH
+
+    def test_the_array_bounds_demotion_reaches_the_build(self, tmp_path, monkeypatch):
+        """M3 §8.6 round 12 (item 5) — ``pandas/6``'s C parser needs ``-Warray-bounds`` demoted.
+
+        GCC 14 flags the out-of-range subscript in ``tokenizer.c`` and the tree's own
+        ``-Werror`` fails the build on it. The demotion is appended at *prepare* time to
+        the layer's ``CFLAGS`` — so no layer is rebaked — and only that one diagnosis is
+        affected, leaving a build that never trips it compiling exactly as before.
+        """
+        seen: dict = {}
+        monkeypatch.setattr(
+            suite_mod,
+            "build_tree_in_place",
+            lambda **kwargs: seen.update(kwargs),
+        )
+        self._rule(monkeypatch, needed=True)
+
+        prepare_mod.build_trees_in_place(
+            self._prep(tmp_path),
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            repo=tmp_path / "clone",
+        )
+
+        assert seen["env"]["CFLAGS"].endswith("-Wno-error=array-bounds")
+        assert seen["env"]["CFLAGS"].count("-Wno-error=array-bounds") == 1
 
     def test_the_projects_own_build_rule_reaches_the_build(self, tmp_path, monkeypatch):
         """``build_env`` is added to the layer's environment, not put in its place.
@@ -18942,7 +25182,7 @@ class TestBuildTreesInPlace:
             self._prep(
                 tmp_path,
                 build_env={
-                    "CFLAGS": "-Wno-error=array-bounds",
+                    "CFLAGS": "-fno-strict-aliasing",
                     "MPLSETUPCFG": "/workspace/vanta-build.cfg",
                 },
             ),
@@ -18952,7 +25192,10 @@ class TestBuildTreesInPlace:
         )
 
         layer = bake_mod.build_env_for("3.8")
-        assert seen["env"]["CFLAGS"] == f"{layer['CFLAGS']} -Wno-error=array-bounds"
+        assert (
+            seen["env"]["CFLAGS"]
+            == f"{layer['CFLAGS']} -Wno-error=array-bounds -fno-strict-aliasing"
+        )
         assert seen["env"]["MPLSETUPCFG"] == "/workspace/vanta-build.cfg"
         assert seen["env"]["CC"] == layer["CC"], "the layer's own variables survive"
 
@@ -18986,6 +25229,54 @@ class TestBuildTreesInPlace:
         assert sorted(entry.name for entry in batch.iterdir()) == ["vanta-build.cfg"], (
             "directly in the batch directory, which the guest sees as /workspace — never "
             "inside a tree"
+        )
+
+    def test_a_build_file_is_written_atomically_never_torn(
+        self, tmp_path, monkeypatch
+    ):
+        """The build file is written to a temp name, then ``os.replace``d.
+
+        [VANTA-WHY] Two concurrent prepares of the same project — the three trees'
+        builds under ``--prepare-jobs``, or a second invocation overlapping the
+        first — can both write this file, and a reader or the VM that mounted the
+        batch catching a plain ``write_text`` mid-flight imports a half-written
+        file and reports a build failure that never happened. The guarantee is one
+        rename: a reader sees either the previous file or the whole new one.
+        """
+        monkeypatch.setattr(suite_mod, "build_tree_in_place", lambda **kwargs: None)
+        self._rule(monkeypatch, needed=True)
+
+        batch = tmp_path / "batch"
+        batch.mkdir()
+        content = "[libs]\nsystem_freetype = True\n"
+        seen: list = []
+        real_replace = os.replace
+
+        def spy(src, dst):
+            src = Path(src)
+            dst = Path(dst)
+            # At the swap, the temp file already holds every byte, beside the
+            # target so the rename cannot cross a filesystem.
+            seen.append((src.parent, src.name, dst.name, src.read_text(encoding="utf-8")))
+            real_replace(src, dst)
+
+        monkeypatch.setattr(prepare_mod.os, "replace", spy)
+
+        prepare_mod.build_trees_in_place(
+            self._prep(tmp_path, build_files={"vanta-build.cfg": content}),
+            checkpoint="chk",
+            batch_dir=batch,
+            repo=tmp_path / "clone",
+        )
+
+        assert len(seen) == 1
+        tmp_dir, tmp_name, dst_name, tmp_bytes = seen[0]
+        assert tmp_dir == batch and dst_name == "vanta-build.cfg"
+        assert tmp_name.startswith("vanta-build.cfg.") and tmp_name.endswith(".tmp")
+        assert tmp_bytes == content
+        assert (batch / "vanta-build.cfg").read_text(encoding="utf-8") == content
+        assert sorted(entry.name for entry in batch.iterdir()) == ["vanta-build.cfg"], (
+            "the temp name is renamed away, never left behind"
         )
 
     def test_a_bug_that_needs_no_build_records_why_it_was_not_built(
@@ -19054,6 +25345,185 @@ class TestBuildTreesInPlace:
         assert built == ["worktrees/Demo_1/oracle_tree"]
 
 
+class TestParallelBuilds:
+    """M3 item AA1 — the three independent builds run at once under the one budget.
+
+    ``oracle_tree``/``src_buggy``/``src_fixed`` are independent git exports, so
+    building them back to back was a sequence with no dependency to justify it and
+    the length of a pandas prepare (three ``build_ext`` runs) sat on the critical
+    path. They overlap under the same scheduler that prices the suite runs. What
+    must not change: at one job (or with no budget) the loop is the serial one it
+    always was — same order, same rows, same first failure — and even when they
+    overlap the rows are written in ``BUILD_TREES`` order, so a later reader cannot
+    tell a parallel build from a serial one by what the row records.
+    """
+
+    @staticmethod
+    def _needs_build(monkeypatch) -> None:
+        monkeypatch.setattr(
+            bake_mod,
+            "needs_build_at",
+            lambda repo, commit, pythonpath=None: (True, "declares ext_modules"),
+        )
+
+    @staticmethod
+    def _prep(tmp_path: Path) -> prepare_mod.BugPrep:
+        return prep(
+            root=tmp_path / "batch" / "worktrees" / "Demo_1",
+            test_cmd=["python", "-m", "pytest", "tests"],
+        )
+
+    @staticmethod
+    def _budget() -> budget_mod.Budget:
+        return budget_mod.Budget(4, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20)
+
+    def test_the_three_builds_overlap_under_the_budget(self, tmp_path, monkeypatch):
+        """All three builds are in flight together — a serial loop would time out.
+
+        A barrier of three: every build waits for the other two. If the builds were
+        serial the first would break the barrier on timeout and ``peak`` would stay
+        at one, which is the assertion.
+        """
+        self._needs_build(monkeypatch)
+        watch = _PrepareInFlight()
+        barrier = threading.Barrier(len(prepare_mod.BUILD_TREES), timeout=5.0)
+
+        def slow(**kwargs):
+            watch.enter(kwargs["tree_rel"])
+            try:
+                try:
+                    barrier.wait()
+                except threading.BrokenBarrierError:
+                    pass
+            finally:
+                watch.leave()
+            return "fp"
+
+        monkeypatch.setattr(suite_mod, "build_tree_in_place", slow)
+        bug_prep = self._prep(tmp_path)
+
+        prepare_mod.build_trees_in_place(
+            bug_prep,
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            repo=tmp_path / "clone",
+            budget=self._budget(),
+        )
+
+        assert watch.peak == 3, (
+            "the builds did not overlap under a four-job budget: they ran "
+            f"one at a time ({watch.keys})"
+        )
+        assert bug_prep.builds == {
+            "vanta_tree": prepare_mod.VANTA_TREE_INHERITANCE,
+            "oracle_tree": "built: python setup.py build_ext --inplace",
+            "src_buggy": "built: python setup.py build_ext --inplace",
+            "src_fixed": "built: python setup.py build_ext --inplace",
+        }
+
+    def test_at_one_job_the_builds_stay_serial_in_order(self, tmp_path, monkeypatch):
+        """``--prepare-jobs 1`` is the serial loop, in ``BUILD_TREES`` order."""
+        self._needs_build(monkeypatch)
+        order: list[str] = []
+        monkeypatch.setattr(
+            suite_mod,
+            "build_tree_in_place",
+            lambda **kwargs: order.append(kwargs["tree_rel"]) or "fp",
+        )
+
+        prepare_mod.build_trees_in_place(
+            self._prep(tmp_path),
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            repo=tmp_path / "clone",
+            budget=budget_mod.Budget(1, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20),
+        )
+
+        assert order == [
+            "worktrees/Demo_1/oracle_tree",
+            "worktrees/Demo_1/src_buggy",
+            "worktrees/Demo_1/src_fixed",
+        ], "the one-job build is the loop it always was, in the order it always ran"
+
+    def test_a_parallel_failure_records_the_first_tree_in_order(self, tmp_path, monkeypatch):
+        """A later tree's failure never hides an earlier one's.
+
+        Under the serial loop the first tree to fail in ``BUILD_TREES`` order ends
+        the step; the parallel path runs all three, so it has to *report* the same
+        one — the first in order — and record the same rows the serial loop would
+        have recorded before it stopped.
+        """
+        self._needs_build(monkeypatch)
+
+        def boom(**kwargs):
+            if "src_buggy" in kwargs["tree_rel"]:
+                raise suite_mod.SuiteError("build failed in /workspace/…: src_buggy said no")
+            return "fp"
+
+        monkeypatch.setattr(suite_mod, "build_tree_in_place", boom)
+        bug_prep = self._prep(tmp_path)
+
+        with pytest.raises(suite_mod.SuiteError, match="src_buggy said no"):
+            prepare_mod.build_trees_in_place(
+                bug_prep,
+                checkpoint="chk",
+                batch_dir=tmp_path / "batch",
+                repo=tmp_path / "clone",
+                budget=self._budget(),
+            )
+
+        assert set(bug_prep.builds) == {"vanta_tree", "oracle_tree"}, (
+            "a tree after the first failure must not be recorded, exactly as the "
+            "serial loop would never have reached it"
+        )
+
+
+class TestPrepareProgress:
+    """M3 item AA1 — a prepare step and a suite run are visible while they happen.
+
+    ``prepare`` printed ``[<key>] full ...`` and then nothing until ``[<key>] ok``,
+    so a long prepare and a hung one read the same. Each line carries a wall clock
+    and the bug's key, and nothing here is read by a verdict — the assertion is
+    only that the line is emitted, in the shape an operator can read.
+    """
+
+    def test_the_line_carries_a_clock_and_the_key(self, capsys):
+        prepare_mod.progress("pandas/1", "build oracle_tree")
+        out = capsys.readouterr().out
+        assert re.fullmatch(
+            r"\[\d{2}:\d{2}:\d{2}\] \[pandas/1\] build oracle_tree\n", out
+        ), out
+
+    def test_every_build_and_suite_pair_prints_one_line(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            bake_mod,
+            "needs_build_at",
+            lambda repo, commit, pythonpath=None: (True, "declares ext_modules"),
+        )
+        monkeypatch.setattr(suite_mod, "build_tree_in_place", lambda **kwargs: "fp")
+        monkeypatch.setattr(suite_mod, "run_suite_twice", lambda **kwargs: object())
+        bug_prep = prep(
+            root=tmp_path / "batch" / "worktrees" / "Demo_1",
+            test_cmd=["python", "-m", "pytest", "tests"],
+        )
+
+        prepare_mod.build_trees_in_place(
+            bug_prep,
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            repo=tmp_path / "clone",
+        )
+        prepare_mod._suite("chk", tmp_path / "batch", bug_prep, "oracle_tree", "oracle")
+
+        lines = capsys.readouterr().out.splitlines()
+        assert any("] [Demo/1] build oracle_tree" in line for line in lines), lines
+        assert any(
+            "] [Demo/1] suite oracle_tree (oracle)" in line for line in lines
+        ), lines
+
+
 class TestImportProbe:
     """``import_probe`` reuses the suite invocation, not a convenient one."""
 
@@ -19063,7 +25533,20 @@ class TestImportProbe:
             stdout=stdout, stderr="", exit_code=exit_code, timed_out=False
         )
 
-    def test_the_probe_runs_the_suite_interpreter_in_the_suite_cwd(self, monkeypatch):
+    @staticmethod
+    def _batch(tmp_path: Path) -> Path:
+        """A real batch dir with a real tree.
+
+        [VANTA-WHY] M3 item V8. ``import_probe`` now mounts a fresh clone of the
+        tree rather than the batch directory, so the tree has to exist on disk.
+        """
+        batch_dir = tmp_path / "batch"
+        (batch_dir / "w" / "Demo_1" / "oracle_tree").mkdir(parents=True)
+        return batch_dir
+
+    def test_the_probe_runs_the_suite_interpreter_in_the_suite_cwd(
+        self, monkeypatch, tmp_path
+    ):
         seen: dict = {}
         monkeypatch.setattr(
             suite_mod.shuru,
@@ -19074,7 +25557,7 @@ class TestImportProbe:
 
         where = suite_mod.import_probe(
             checkpoint="chk",
-            batch_dir=Path("/tmp/batch"),
+            batch_dir=self._batch(tmp_path),
             tree_rel="w/Demo_1/oracle_tree",
             test_cmd=["python", "-m", "pytest", "tests"],
             module="pysnooper",
@@ -19093,7 +25576,7 @@ class TestImportProbe:
         assert "PYTHONPATH" not in probe
 
     def test_a_module_that_does_not_import_raises_rather_than_returning_a_path(
-        self, monkeypatch
+        self, monkeypatch, tmp_path
     ):
         monkeypatch.setattr(
             suite_mod.shuru,
@@ -19105,7 +25588,7 @@ class TestImportProbe:
         )
         with pytest.raises(suite_mod.SuiteError, match="ModuleNotFoundError"):
             suite_mod.import_probe(
-                checkpoint="chk", batch_dir=Path("/tmp/batch"),
+                checkpoint="chk", batch_dir=self._batch(tmp_path),
                 tree_rel="w/Demo_1/oracle_tree",
                 test_cmd=["python", "-m", "pytest", "tests"], module="pysnooper",
                 disk_mb=8192,
@@ -19391,6 +25874,32 @@ class TestCollectFlip:
         assert flips == {}
         assert errors == {"tests/test_gone.py": "ImportError: a"}
 
+    def test_the_budget_reaches_both_collection_vms(self, tmp_path, monkeypatch):
+        """M3 item Y1 — both readings of the flip are priced by the one scheduler.
+
+        Two collection VMs that booted outside the budget would let a concurrent
+        ``prepare`` run more VMs than ``--prepare-jobs`` admits, so the budget is
+        handed to both ``collect_report`` calls.
+        """
+        seen: list = []
+        self._collect_report(
+            monkeypatch,
+            seen,
+            buggy_errors={"tests/test_flip.py": "TypeError: a"},
+            fixed=self._report([], {}),
+        )
+        budget = budget_mod.Budget(4, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20)
+
+        prepare_mod.detect_collect_flip(
+            self._prep(tmp_path),
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            budget=budget,
+        )
+
+        assert len(seen) == 2, "the buggy tree errored, so the fixed tree is read too"
+        assert [call["budget"] for call in seen] == [budget, budget]
+
 
 class TestCollectFlipGate:
     """``check_deps``'s second reading: the recorded flip makes the gate pass cleanly."""
@@ -19499,6 +26008,234 @@ class TestCollectFlipGate:
                 self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch",
                 deps=self._deps(),
             )
+
+    def test_an_error_outside_the_failing_tests_closure_is_set_aside(
+        self, tmp_path, monkeypatch
+    ):
+        """§8.6 round 10 — luigi's shape: side modules the bug's own tests never import.
+
+        The gate collects the *whole* suite, but grading runs only the tests the bug
+        declares. A module outside their import closure that cannot collect is the
+        suite's edge, not the bug, so it is set aside with the reason recorded and the
+        bug is retried rather than replaced (§8 rule 6).
+        """
+        calls: list = []
+
+        def strict(**kwargs):
+            calls.append(kwargs)
+            if "ignore" not in kwargs or not kwargs["ignore"]:
+                raise suite_mod.SuiteError(
+                    "pytest exited 2 while collecting (9 test(s) collected)"
+                )
+            return {"tests/test_kept.py::test_a"}
+
+        monkeypatch.setattr(suite_mod, "collect_only", strict)
+        monkeypatch.setattr(
+            suite_mod,
+            "import_probe",
+            lambda **kwargs: (
+                "/workspace/worktrees/Demo_1/oracle_tree/pysnooper/__init__.py"
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod,
+            "detect_collect_flip",
+            lambda prep, **kwargs: (
+                {},
+                [],
+                {"tests/test_side.py": "ModuleNotFoundError: No module named 'mysql'"},
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod,
+            "_failing_tests_closure",
+            lambda prep: (
+                ["tests/test_declared.py"],
+                frozenset({"tests/test_declared.py"}),
+            ),
+        )
+
+        bug_prep = self._prep(tmp_path)
+        nodeids = prepare_mod.check_deps(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch", deps=self._deps()
+        )
+
+        assert nodeids == {"tests/test_kept.py::test_a"}
+        assert len(calls) == 2, "the gate ran strict, then re-ran with the edge set aside"
+        assert calls[1]["ignore"] == ["tests/test_side.py"], (
+            "the pass must come from a clean run with the set-aside file ignored"
+        )
+        assert bug_prep.hidden_by_collect_flip == {}, "a side module is not hidden oracle"
+        assert list(bug_prep.collect_excluded) == ["tests/test_side.py"]
+        assert "import closure" in bug_prep.collect_excluded["tests/test_side.py"]
+        assert "tests/test_declared.py" in bug_prep.collect_excluded["tests/test_side.py"]
+
+    def test_an_error_inside_the_closure_keeps_the_refusal(self, tmp_path, monkeypatch):
+        """A file the declared tests *do* reach is a real gap, not a suite edge."""
+        monkeypatch.setattr(
+            suite_mod,
+            "collect_only",
+            lambda **kwargs: (_ for _ in ()).throw(
+                suite_mod.SuiteError("pytest collected nothing (exit 2)")
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod,
+            "detect_collect_flip",
+            lambda prep, **kwargs: (
+                {},
+                [],
+                {"tests/test_declared.py": "ModuleNotFoundError: gone"},
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod,
+            "_failing_tests_closure",
+            lambda prep: (
+                ["tests/test_declared.py"],
+                frozenset({"tests/test_declared.py"}),
+            ),
+        )
+        monkeypatch.setattr(
+            suite_mod, "import_probe", lambda **kwargs: pytest.fail("probe ran anyway")
+        )
+
+        with pytest.raises(suite_mod.SuiteError, match="^deps: collection failed:"):
+            prepare_mod.check_deps(
+                self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch",
+                deps=self._deps(),
+            )
+
+    def test_a_conftest_error_is_never_set_aside(self, tmp_path, monkeypatch):
+        """pytest loads ``conftest.py`` to collect the declared tests too."""
+        monkeypatch.setattr(
+            suite_mod,
+            "collect_only",
+            lambda **kwargs: (_ for _ in ()).throw(
+                suite_mod.SuiteError("pytest collected nothing (exit 2)")
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod,
+            "detect_collect_flip",
+            lambda prep, **kwargs: (
+                {},
+                [],
+                {"tests/conftest.py": "ImportError: while loading conftest"},
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod,
+            "_failing_tests_closure",
+            lambda prep: (
+                ["tests/test_declared.py"],
+                frozenset({"tests/test_declared.py"}),
+            ),
+        )
+        monkeypatch.setattr(
+            suite_mod, "import_probe", lambda **kwargs: pytest.fail("probe ran anyway")
+        )
+
+        with pytest.raises(suite_mod.SuiteError, match="^deps: collection failed:"):
+            prepare_mod.check_deps(
+                self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch",
+                deps=self._deps(),
+            )
+
+    def test_no_declared_file_excludes_nothing(self, tmp_path, monkeypatch):
+        """With no root there is no closure to be outside of, so the refusal stands."""
+        monkeypatch.setattr(
+            suite_mod,
+            "collect_only",
+            lambda **kwargs: (_ for _ in ()).throw(
+                suite_mod.SuiteError("pytest collected nothing (exit 2)")
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod,
+            "detect_collect_flip",
+            lambda prep, **kwargs: (
+                {},
+                [],
+                {"tests/test_side.py": "ModuleNotFoundError: No module named 'mysql'"},
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod, "_failing_tests_closure", lambda prep: ([], frozenset())
+        )
+        monkeypatch.setattr(
+            suite_mod, "import_probe", lambda **kwargs: pytest.fail("probe ran anyway")
+        )
+
+        with pytest.raises(suite_mod.SuiteError, match="^deps: collection failed:"):
+            prepare_mod.check_deps(
+                self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch",
+                deps=self._deps(),
+            )
+
+
+class TestFailingTestsClosure:
+    """§3.4 round 10 — the closure that decides which collect errors are the suite's edges."""
+
+    @staticmethod
+    def _prep(tmp_path: Path) -> prepare_mod.BugPrep:
+        root = tmp_path / "batch" / "worktrees" / "Demo_1"
+        tree = root / "oracle_tree"
+        (tree / "pkg").mkdir(parents=True)
+        (tree / "tests").mkdir(parents=True)
+        (tree / "pkg" / "__init__.py").write_text("")
+        (tree / "pkg" / "core.py").write_text("import os\n")
+        (tree / "tests" / "test_declared.py").write_text("from pkg.core import thing\n")
+        (tree / "tests" / "test_side.py").write_text("import mysql.connector\n")
+        (tree / "conftest.py").write_text("")
+        return prep(root=root, bug=bug_info(test_file="tests/test_declared.py"))
+
+    def test_the_closure_is_what_the_declared_tests_import(self, tmp_path):
+        roots, closure = prepare_mod._failing_tests_closure(self._prep(tmp_path))
+        assert roots == ["tests/test_declared.py"]
+        assert "tests/test_declared.py" in closure
+        assert "pkg/core.py" in closure
+        assert "tests/test_side.py" not in closure, (
+            "a side module the declared test never imports is outside the closure"
+        )
+
+    def test_a_side_module_outside_the_closure_is_set_aside(self, tmp_path):
+        excluded = prepare_mod._outside_failing_closure(
+            self._prep(tmp_path),
+            {"tests/test_side.py": "ModuleNotFoundError: No module named 'mysql'"},
+        )
+        assert list(excluded) == ["tests/test_side.py"]
+        assert "tests/test_declared.py" in excluded["tests/test_side.py"]
+
+    def test_an_in_closure_file_is_not_set_aside(self, tmp_path):
+        assert (
+            prepare_mod._outside_failing_closure(
+                self._prep(tmp_path), {"tests/test_declared.py": "ModuleNotFoundError: gone"}
+            )
+            == {}
+        )
+
+    def test_a_conftest_is_never_set_aside(self, tmp_path):
+        assert (
+            prepare_mod._outside_failing_closure(
+                self._prep(tmp_path), {"conftest.py": "ImportError: boom"}
+            )
+            == {}
+        )
+
+    def test_a_non_test_file_is_never_set_aside(self, tmp_path):
+        """Only test files are the suite's edges; a package module is never hidden."""
+        assert (
+            prepare_mod._outside_failing_closure(
+                self._prep(tmp_path), {"pkg/core.py": "SyntaxError: nope"}
+            )
+            == {}
+        )
+
+    def test_a_tree_that_is_not_there_has_no_roots(self, tmp_path):
+        """Nothing to walk must not crash the gate; it must exclude nothing."""
+        gone = prep(root=tmp_path / "gone", bug=bug_info(test_file="tests/test_declared.py"))
+        assert prepare_mod._failing_tests_closure(gone) == ([], frozenset())
 
 
 class TestSandboxEnvReachesEveryRun:
@@ -19611,7 +26348,18 @@ class TestSandboxEnvReachesEveryRun:
         assert len(runs) == 2
         assert all(run["extra_env"] is None for run in runs)
 
-    def test_collect_only_merges_the_extra_env_over_its_own(self, monkeypatch):
+    @staticmethod
+    def _batch(tmp_path: Path) -> Path:
+        """A real batch dir with a real tree.
+
+        [VANTA-WHY] M3 item V8. ``collect_only``/``collect_report`` now mount a fresh
+        clone of the tree rather than the batch directory, so the tree has to exist.
+        """
+        batch_dir = tmp_path / "batch"
+        (batch_dir / "w" / "Demo_1" / "oracle_tree").mkdir(parents=True)
+        return batch_dir
+
+    def test_collect_only_merges_the_extra_env_over_its_own(self, monkeypatch, tmp_path):
         seen: dict = {}
         monkeypatch.setattr(
             suite_mod.shuru,
@@ -19622,14 +26370,15 @@ class TestSandboxEnvReachesEveryRun:
             ),
         )
         suite_mod.collect_only(
-            checkpoint="chk", batch_dir=Path("/tmp/b"), tree_rel="w/Demo_1/oracle_tree",
+            checkpoint="chk", batch_dir=self._batch(tmp_path),
+            tree_rel="w/Demo_1/oracle_tree",
             test_cmd=["python", "-m", "pytest", "tests"], disk_mb=1024,
             extra_env={"PYTHONPATH": "./docs_src"},
         )
         assert seen["env"]["PYTHONPATH"] == "./docs_src"
         assert seen["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
 
-    def test_collect_only_ignores_the_recorded_flip_files(self, monkeypatch):
+    def test_collect_only_ignores_the_recorded_flip_files(self, monkeypatch, tmp_path):
         seen: dict = {}
         monkeypatch.setattr(
             suite_mod.shuru,
@@ -19640,13 +26389,14 @@ class TestSandboxEnvReachesEveryRun:
             ),
         )
         suite_mod.collect_only(
-            checkpoint="chk", batch_dir=Path("/tmp/b"), tree_rel="w/Demo_1/oracle_tree",
+            checkpoint="chk", batch_dir=self._batch(tmp_path),
+            tree_rel="w/Demo_1/oracle_tree",
             test_cmd=["python", "-m", "pytest", "tests"], disk_mb=1024,
             ignore=["tests/test_flip.py"],
         )
         assert "--ignore=tests/test_flip.py" in seen["command"][2]
 
-    def test_collect_report_keeps_going_past_the_first_error(self, monkeypatch):
+    def test_collect_report_keeps_going_past_the_first_error(self, monkeypatch, tmp_path):
         """The exhaustive reading the rule needs — a gate run would stop at one."""
         seen: dict = {}
         monkeypatch.setattr(
@@ -19658,12 +26408,386 @@ class TestSandboxEnvReachesEveryRun:
             ),
         )
         report = suite_mod.collect_report(
-            checkpoint="chk", batch_dir=Path("/tmp/b"), tree_rel="w/Demo_1/oracle_tree",
+            checkpoint="chk", batch_dir=self._batch(tmp_path),
+            tree_rel="w/Demo_1/oracle_tree",
             test_cmd=["python", "-m", "pytest", "tests"], disk_mb=1024,
         )
         assert "--continue-on-collection-errors" in seen["command"][2]
         assert report.nodeids == {"tests/x.py::t"}
         assert report.exit_code == 2
+
+
+class TestGateVmsHoldTheBudgetSlot:
+    """M3 item Y1 — the VMs that are not suite runs are priced by the same scheduler.
+
+    ``Budget`` counts suite runs (``suite._run_one_vm``); everything else a
+    ``prepare`` boots — a tree's build, the collect gate, the import probe, the
+    collect-flip's two reports, and the oracle's ``git apply`` — was outside it, so
+    ``--prepare-jobs`` capped fewer VMs than were actually live. Each of those five
+    functions now holds one slot of the invocation's budget for the life of its VM,
+    exactly as a suite run does. The tests below watch the budget *from inside the
+    boot*, which is the only moment the claim is about: the slot is held while
+    ``shuru.run`` is up and released when it returns.
+    """
+
+    @staticmethod
+    def _result(**over) -> shuru_mod.ExecResult:
+        base = dict(stdout="tests/x.py::t\n", stderr="", exit_code=0, timed_out=False)
+        base.update(over)
+        return shuru_mod.ExecResult(**base)
+
+    @staticmethod
+    def _batch(tmp_path: Path) -> Path:
+        """A real batch dir with a real tree (:class:`suite_mod.VmRoot` clones it)."""
+        batch_dir = tmp_path / "batch"
+        tree = batch_dir / "w" / "Demo_1" / "oracle_tree"
+        tree.mkdir(parents=True)
+        (tree / "setup.py").write_text("", encoding="utf-8")
+        return batch_dir
+
+    def _hooked_slot(self, monkeypatch, taken, live):
+        """Record every slot a VM asks for, and whether it is held during the boot."""
+        real_slot = budget_mod.Budget.slot
+
+        @contextmanager
+        def hooked_slot(self, *, memory_mb=None, cores=1):
+            with real_slot(self, memory_mb=memory_mb, cores=cores):
+                taken.append((cores, memory_mb))
+                live.append(1)
+                yield
+                live.pop()
+
+        monkeypatch.setattr(budget_mod.Budget, "slot", hooked_slot)
+
+    def test_each_gate_vm_holds_its_own_slot_while_it_boots(self, monkeypatch, tmp_path):
+        budget = budget_mod.Budget(4, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20)
+        taken: list = []
+        live: list = []
+        self._hooked_slot(monkeypatch, taken, live)
+        here = self._batch(tmp_path)
+
+        def run(**kwargs):
+            # The boot is *inside* the slot: the VM is up while the charge is held.
+            assert live == [1], "shuru.run was booted outside the budget slot"
+            return self._result()
+
+        monkeypatch.setattr(suite_mod.shuru, "run", run)
+
+        suite_mod.build_tree_in_place(
+            checkpoint="chk", batch_dir=here, tree_rel="w/Demo_1/oracle_tree",
+            python="python", setup_args=("build_ext", "--inplace"), disk_mb=1024,
+            memory_mb=4096, budget=budget,
+        )
+        suite_mod.collect_only(
+            checkpoint="chk", batch_dir=here, tree_rel="w/Demo_1/oracle_tree",
+            test_cmd=["python", "-m", "pytest", "tests"], disk_mb=1024,
+            memory_mb=2048, budget=budget,
+        )
+        suite_mod.import_probe(
+            checkpoint="chk", batch_dir=here, tree_rel="w/Demo_1/oracle_tree",
+            test_cmd=["python", "-m", "pytest", "tests"], module="demo",
+            disk_mb=1024, memory_mb=1024, budget=budget,
+        )
+        suite_mod.collect_report(
+            checkpoint="chk", batch_dir=here, tree_rel="w/Demo_1/oracle_tree",
+            test_cmd=["python", "-m", "pytest", "tests"], disk_mb=1024,
+            memory_mb=8192, budget=budget,
+        )
+        patch = tmp_path / "cand.patch"
+        patch.write_text("--- a/demo.py\n+++ b/demo.py\n", encoding="utf-8")
+        suite_mod.git_apply_patch(
+            checkpoint="chk", batch_dir=here, tree_rel="w/Demo_1/oracle_tree",
+            patch_path=patch, disk_mb=1024, drop_test_hunks=False,
+            memory_mb=1024, budget=budget,
+        )
+
+        # Each VM asked for exactly its own charge, one core and its own memory.
+        assert taken == [(1, 4096), (1, 2048), (1, 1024), (1, 8192), (1, 1024)]
+        # And each released it, so the budget was empty again for the next boot.
+        assert live == []
+        assert budget.peak_cores == 1
+        assert budget.peak_memory_mb == 8192
+
+    def test_a_gate_vm_with_no_budget_boots_as_it_always_did(self, monkeypatch, tmp_path):
+        """The serial path — a test, ``pool``, a one-core prepare — is unchanged."""
+        taken: list = []
+        live: list = []
+        self._hooked_slot(monkeypatch, taken, live)
+        seen: list = []
+        monkeypatch.setattr(
+            suite_mod.shuru, "run", lambda **kwargs: seen.append(kwargs) or self._result()
+        )
+        here = self._batch(tmp_path)
+
+        suite_mod.build_tree_in_place(
+            checkpoint="chk", batch_dir=here, tree_rel="w/Demo_1/oracle_tree",
+            python="python", setup_args=("build_ext", "--inplace"), disk_mb=1024,
+            memory_mb=4096,
+        )
+        suite_mod.collect_only(
+            checkpoint="chk", batch_dir=here, tree_rel="w/Demo_1/oracle_tree",
+            test_cmd=["python", "-m", "pytest", "tests"], disk_mb=1024,
+            memory_mb=2048,
+        )
+
+        assert len(seen) == 2, "both VMs booted without a scheduler"
+        assert taken == [] and live == [], "no budget, so no slot was ever taken"
+
+
+class TestVmRootIsolation:
+    """Item V8 — the guest's whole view of the host is its own clone.
+
+    The ruling asks for three properties and all three are properties of the mount
+    root :class:`suite_mod.VmRoot` builds, so they are pinned there rather than
+    inferred from a boot: a batch path the run was not given is not in the root, so a
+    guest write to it can only ever create a file in the clone; a run's writes into
+    its tree are invisible to the next run and to the pristine tree (one clone per VM,
+    item V8/Q2 — the change that made run 1 and run 2 independent); and a carried path
+    is a *copy*, so writing to it never reaches the batch either.
+    """
+
+    TREE = "worktrees/Demo_1/stripped_tree"
+    ORACLE_TREE = "worktrees/Demo_1/oracle_tree"
+
+    @classmethod
+    def _batch(cls, tmp_path: Path) -> Path:
+        """A batch holding the tree a run uses and everything it must not see.
+
+        The protected entries are the audit's own list: the shell of the batch that
+        today's ``batch_dir :rw`` mount put in front of every guest — the oracle
+        tree with its hidden tests intact, the oracle logs, the issues, the env
+        cache, the run logs, the failure ledger and the manifest.
+        """
+        batch = tmp_path / "batch"
+        write(batch / cls.TREE / "demo.py", "x = 1\n")
+        write(batch / cls.TREE / "tests" / "test_demo.py", "def test_x():\n    assert 1\n")
+        write(batch / cls.ORACLE_TREE / "tests" / "test_hidden.py",
+              "def test_hidden():\n    assert 1\n")
+        write(batch / "oracle" / "hidden.log", "the hidden nodeids\n")
+        write(batch / "issues" / "Demo_1.md", "issue\n")
+        write(batch / "env" / "cache.tar", "")
+        write(batch / "run_logs" / "run.jsonl", "")
+        write(batch / "failures.jsonl", "{}\n")
+        write(batch / "manifest.json", "{}\n")
+        return batch
+
+    def test_the_root_holds_the_named_tree_and_nothing_beside_it(self, tmp_path):
+        """A guest read of an oracle or hidden-test path has nothing to read."""
+        batch = self._batch(tmp_path)
+        with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE) as root:
+            assert [entry.name for entry in root.host.iterdir()] == ["worktrees"]
+            assert [p.name for p in (root.host / "worktrees").iterdir()] == ["Demo_1"]
+            assert [p.name for p in (root.host / "worktrees" / "Demo_1").iterdir()] == [
+                "stripped_tree"
+            ], "the sibling oracle tree (hidden tests intact) is in the mount root"
+            for rel in (
+                "oracle",
+                "issues",
+                "env",
+                "run_logs",
+                "failures.jsonl",
+                "manifest.json",
+                self.ORACLE_TREE,
+            ):
+                assert not (root.host / rel).exists(), (
+                    f"{rel} is inside the mount root, so the guest reaches it at "
+                    f"/workspace/{rel}"
+                )
+
+    def test_a_run_writes_into_its_tree_and_neither_the_next_run_nor_the_pristine_tree_sees_it(
+        self, tmp_path
+    ):
+        batch = self._batch(tmp_path)
+        pristine = suite_cache_mod.tree_fingerprint(batch / self.TREE)
+
+        with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE) as first:
+            write(first.host / self.TREE / ".hypothesis" / "example", "run 1\n")
+            write(first.host / self.TREE / "demo.py", "x = 2\n")
+            first_root = first.host
+
+        with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE) as second:
+            assert not (second.host / self.TREE / ".hypothesis").exists(), (
+                "run 2 inherited run 1's .hypothesis database; every run starts from "
+                "the pristine tree's own state (item V8/Q2)"
+            )
+            assert (second.host / self.TREE / "demo.py").read_text(encoding="utf-8") == "x = 1\n"
+
+        assert not first_root.exists(), "a finished run's clone is deleted"
+        assert suite_cache_mod.tree_fingerprint(batch / self.TREE) == pristine, (
+            "the run's writes reached the host's tree"
+        )
+        holder = batch / suite_mod.VM_ROOT_DIR
+        assert holder.is_dir() and not list(holder.iterdir()), (
+            "each run's clone is deleted; the empty .vm_roots holder itself now "
+            "stays (item X1: removing it raced a sibling's mkdir/mkdtemp)"
+        )
+
+    def test_two_roots_entering_and_discarding_concurrently_never_collide(self, tmp_path):
+        """Item X1 — a sibling's cleanup must not remove the shared holder.
+
+        ``__enter__`` creates the ``.vm_roots`` holder and then ``mkdtemp``s inside it
+        as two steps with no lock, so a ``discard`` that ``rmdir``ed the holder
+        whenever it happened to be empty could delete it between the two and make
+        ``mkdtemp`` raise ``FileNotFoundError`` — an ``OSError``, not a ``SuiteError``,
+        so ``prepare`` (which catches only ``SuiteError``) never recorded it as a gate
+        failure while the pool re-raised it and stopped the whole batch. The fix is to
+        stop removing the holder, so this drives two roots in a tight loop and requires
+        that no attempt ever raises.
+        """
+        batch = self._batch(tmp_path)
+        errors: list = []
+        barrier = threading.Barrier(2)
+
+        def worker() -> None:
+            try:
+                barrier.wait(timeout=10)
+                for _ in range(200):
+                    with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE):
+                        pass
+            except Exception as exc:  # noqa: BLE001 — recorded, asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert not errors, f"a concurrent VmRoot raised: {errors!r}"
+        holder = batch / suite_mod.VM_ROOT_DIR
+        assert holder.is_dir() and not list(holder.iterdir()), (
+            "every clone is gone and one empty holder remains"
+        )
+
+    def test_a_carried_path_is_a_copy_so_a_write_to_it_never_reaches_the_batch(self, tmp_path):
+        batch = self._batch(tmp_path)
+        write(batch / "vanta-build.cfg", "original\n")
+        with suite_mod.VmRoot(
+            batch_dir=batch, tree_rel=self.TREE, carry=("vanta-build.cfg",)
+        ) as root:
+            assert (root.host / "vanta-build.cfg").read_text(encoding="utf-8") == "original\n"
+            write(root.host / "vanta-build.cfg", "rewritten in the VM\n")
+        assert (batch / "vanta-build.cfg").read_text(encoding="utf-8") == "original\n"
+
+    def test_each_run_of_a_pair_gets_its_own_clone(self, tmp_path, monkeypatch):
+        """Item V8/Q2 — the pair's two runs no longer share a tree or its database."""
+        batch = self._batch(tmp_path)
+        roots: list = []
+        saw_a_previous_run: list = []
+
+        def run(**kwargs):
+            tree = kwargs["host_root"] / self.TREE
+            roots.append(kwargs["host_root"])
+            saw_a_previous_run.append((tree / "seen.txt").exists())
+            write(tree / "seen.txt", f"run {len(roots)}\n")
+            return shuru_mod.ExecResult(stdout="", stderr="", exit_code=0, timed_out=False)
+
+        monkeypatch.setattr(suite_mod.shuru, "run", run)
+        for _ in range(2):
+            suite_mod._run_one_vm(
+                script="true", checkpoint="chk", batch_dir=batch, tree_rel=self.TREE,
+                disk_mb=1024, memory_mb=None, timeout_secs=60, env={}, budget=None,
+            )
+        assert roots[0] != roots[1], "the pair shared one root, so the runs are not independent"
+        assert saw_a_previous_run == [False, False], (
+            "the second run's tree carried the first run's writes"
+        )
+        assert not (batch / self.TREE / "seen.txt").exists()
+
+    def test_the_clone_is_attempted_as_a_clonefile_before_a_real_copy(self, tmp_path, monkeypatch):
+        """The cost decision, pinned: ``cp -cR`` is what makes a tree per VM cheap."""
+        batch = self._batch(tmp_path)
+        argv: list = []
+        monkeypatch.setattr(
+            suite_mod.subprocess,
+            "run",
+            lambda args, **kwargs: argv.append(args)
+            or subprocess.CompletedProcess(args, 1),
+        )
+        with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE) as root:
+            assert argv[0] == [
+                "cp",
+                "-cR",
+                str(batch / self.TREE),
+                str(root.host / self.TREE),
+            ]
+            assert (root.host / self.TREE / "demo.py").read_text(encoding="utf-8") == "x = 1\n"
+
+
+class TestAdoptTree:
+    """Item V8/Q1 — a mutating run's tree becomes the host's, but only if it is a tree.
+
+    The host adopts what the guest built, so the guest would otherwise choose the
+    bytes the host afterwards hashes and runs on. Every refusal here is a *gate
+    failure with the reason*, never a silent fallback to the tree the VM did not
+    touch: the old tree is still exactly as it was after each one.
+    """
+
+    TREE = TestVmRootIsolation.TREE
+
+    @staticmethod
+    def _batch(tmp_path: Path) -> Path:
+        return TestVmRootIsolation._batch(tmp_path)
+
+    def test_a_validated_tree_replaces_the_hosts_and_its_hash_comes_back(self, tmp_path):
+        batch = self._batch(tmp_path)
+        with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE) as root:
+            write(root.host / self.TREE / "built.so", "compiled\n")
+            fingerprint = root.adopt()
+
+        assert (batch / self.TREE / "built.so").read_text(encoding="utf-8") == "compiled\n"
+        assert (batch / self.TREE / "demo.py").read_text(encoding="utf-8") == "x = 1\n"
+        assert fingerprint == suite_cache_mod.tree_fingerprint(batch / self.TREE)
+
+    def test_a_symlink_out_of_the_tree_is_refused_and_the_old_tree_stays(self, tmp_path):
+        batch = self._batch(tmp_path)
+        before = suite_cache_mod.tree_fingerprint(batch / self.TREE)
+        with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE) as root:
+            write(root.host / self.TREE / "built.so", "compiled\n")
+            os.symlink(batch / "oracle" / "hidden.log", root.host / self.TREE / "leak")
+            with pytest.raises(suite_mod.SuiteError, match="symlink"):
+                root.adopt()
+
+        assert suite_cache_mod.tree_fingerprint(batch / self.TREE) == before
+        assert not (batch / self.TREE / "built.so").exists(), (
+            "a refused tree was adopted anyway"
+        )
+
+    def test_a_file_that_is_not_a_regular_file_is_refused(self, tmp_path):
+        batch = self._batch(tmp_path)
+        with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE) as root:
+            os.mkfifo(root.host / self.TREE / "pipe")
+            with pytest.raises(suite_mod.SuiteError, match="not a regular file"):
+                root.adopt()
+
+    def test_a_tree_past_the_size_limit_is_refused(self, tmp_path):
+        batch = self._batch(tmp_path)
+        with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE) as root:
+            with pytest.raises(suite_mod.SuiteError, match="larger than the 1-byte limit"):
+                root.adopt(max_bytes=1)
+
+    def test_an_output_that_is_a_symlink_is_refused_rather_than_copied(self, tmp_path):
+        """A "report" that is a link is a way to make the host read another file."""
+        batch = self._batch(tmp_path)
+        write(batch / "secret.txt", "not a report\n")
+        rel = "reports/Demo_1-vanta.run1.json"
+        with suite_mod.VmRoot(
+            batch_dir=batch, tree_rel=self.TREE, outputs=(rel,)
+        ) as root:
+            os.symlink(batch / "secret.txt", root.host / rel)
+            with pytest.raises(suite_mod.SuiteError, match="symbolic link"):
+                root.lift_outputs()
+        assert not (batch / rel).exists()
+
+    def test_an_output_the_run_never_wrote_is_skipped_not_refused(self, tmp_path):
+        """A VM that never booted, an OOM kill and a cap all leave no report — that
+        absence is the run's own result, which ``run_state`` reads."""
+        batch = self._batch(tmp_path)
+        rel = "reports/Demo_1-vanta.run1.json"
+        with suite_mod.VmRoot(
+            batch_dir=batch, tree_rel=self.TREE, outputs=(rel,)
+        ) as root:
+            root.lift_outputs()
+        assert not (batch / rel).exists()
 
 
 # ============================================================================
@@ -20005,6 +27129,40 @@ class TestOracleGrade:
         self._grade(wired, tmp_path)
         assert [run["timeout_secs"] for run in wired["runs"]] == [1800, 1800]
 
+    # -- M3 item Y1: the grading's pairs share the invocation's one scheduler ---
+    def test_both_grading_pairs_are_handed_the_one_budget(self, wired, tmp_path):
+        """[VANTA-WHY] Y1 — ``grade``'s two pairs run through the SAME concurrent
+        two-VM path a preparation suite does.
+
+        ``budget`` is the invocation's one scheduler, so the claim is identity:
+        both ``run_suite_twice`` calls see that one object, and neither pair
+        invents its own. The two PAIRS stay sequential — the patched suite only
+        runs once the hidden pair's report exists (item B4's guard) — so this
+        item widens each pair, never the gap between them.
+        """
+        budget = budget_mod.Budget(4, peak_vms=12, cores_cap=14, memory_cap_mb=1 << 20)
+        oracle_mod.grade(
+            prep=oracle_prep(),
+            batch_dir=tmp_path / "batch",
+            checkpoint="vanta-bi-Demo-1",
+            patch_path=write(tmp_path / "final.patch", "diff --git a/x b/x\n"),
+            label="sess1",
+            disk_mb=16384,
+            budget=budget,
+        )
+        assert [run["budget"] for run in wired["runs"]] == [budget, budget]
+        assert wired["apply"]["budget"] is budget, (
+            "the apply's VM holds a slot of the same budget while it boots"
+        )
+
+    def test_a_grading_with_no_budget_stays_the_serial_pairs_it_was(self, wired, tmp_path):
+        """The default leaf keeps every other caller — a test, ``pool``,
+        ``mutants`` — the serial two-pair grading it had before item Y1, so those
+        paths are unchanged and only the batch's own scheduler overlaps anything."""
+        self._grade(wired, tmp_path)
+        assert [run["budget"] for run in wired["runs"]] == [None, None]
+        assert wired["apply"]["budget"] is None
+
     def test_a_collect_flip_oracle_is_graded_with_no_declared_fail_to_pass(
         self, wired, tmp_path
     ):
@@ -20260,6 +27418,34 @@ class TestGradeCandidateCache:
         )
         assert graded.oracle.patch_good is True
 
+    def test_the_budget_reaches_the_oracle_grade(self, tmp_path, monkeypatch):
+        """M3 item Y1 — the candidate's grading is admitted by the SAME scheduler
+        the invocation built, not by a private one.
+
+        ``grade_candidate`` is the seam between the review phase and the grading;
+        the budget has to cross it or a candidate's two pairs would overlap only
+        when nothing told them they might.
+        """
+        bug_prep, candidate, _ = self._candidate(tmp_path)
+        seen: list = []
+        monkeypatch.setattr(
+            oracle_mod,
+            "grade",
+            lambda **kwargs: seen.append(kwargs)
+            or oracle_mod.OracleResult(apply_ok=True, patch_good=True),
+        )
+        budget = budget_mod.Budget(4, peak_vms=12, cores_cap=14, memory_cap_mb=1 << 20)
+
+        runner_mod.grade_candidate(
+            batch_dir=tmp_path,
+            prep=bug_prep,
+            candidate=candidate,
+            checkpoint="vanta-bi-Demo-1",
+            disk_mb=8192,
+            budget=budget,
+        )
+        assert [call["budget"] for call in seen] == [budget]
+
 
 class TestDevFixSelfCheck:
     """prepare grades the developer fix with the real oracle and refuses the bug if it fails.
@@ -20312,14 +27498,17 @@ class TestDevFixSelfCheck:
         )
         return calls
 
-    def _run(self, tmp_path, *, text=None, fail_to_pass=None):
+    def _run(self, tmp_path, *, text=None, fail_to_pass=None, budget=None):
         prep = oracle_prep(
             bug=bug_info(bug_patch_txt=self.SOURCE_DIFF if text is None else text)
         )
         if fail_to_pass is not None:
             prep.fail_to_pass = list(fail_to_pass)
         ok = prepare_mod.selfcheck_dev_fix(
-            prep, batch_dir=tmp_path / "batch", checkpoint="vanta-bi-Demo-1"
+            prep,
+            batch_dir=tmp_path / "batch",
+            checkpoint="vanta-bi-Demo-1",
+            budget=budget,
         )
         return ok, prep
 
@@ -20327,6 +27516,18 @@ class TestDevFixSelfCheck:
         ok, prep = self._run(tmp_path)
         assert ok is True
         assert prep.gate_failures == []
+
+    def test_the_budget_reaches_the_developer_fix_grading(self, graded, tmp_path):
+        """M3 item Y1 — the self-check's grading is the same concurrent two-VM
+        grading a preparation suite gets.
+
+        ``selfcheck_dev_fix`` is the last grading in ``prepare_one``; leaving it
+        out of the budget would make the developer-fix pair the one grading in the
+        prep that never overlapped, for no reason but a missing argument.
+        """
+        budget = budget_mod.Budget(4, peak_vms=12, cores_cap=14, memory_cap_mb=1 << 20)
+        self._run(tmp_path, budget=budget)
+        assert [call["budget"] for call in graded["gradings"]] == [budget]
 
     def test_the_graded_patch_is_the_one_candidate_set_will_grade(self, graded, tmp_path):
         """Same source through the same filter as ``runner.candidate_set``: two gradings of
@@ -20364,9 +27565,20 @@ class TestDevFixSelfCheck:
         assert "developer fix" in failure
         assert "'absent'" in failure
         assert "tests/test_demo.py::test_other" in failure
+        assert "Measured: apply_ok=" in failure, "this bug's own measurement, not another's"
 
-    def test_the_refusal_quotes_the_reason_the_rule_exists_for(self):
-        assert "PySnooper/2" in prepare_mod.DEV_FIX_SELFCHECK_REASON
+    def test_the_refusal_states_the_rule_not_one_bug_s_measured_cause(self):
+        """The reason string is quoted in every refused bug's gate row, so it has to read
+        for every bug. A bug-specific "measured cause" sentence (PySnooper/2's, which the
+        rule was written for) was quoted verbatim in an unrelated bug's row — pandas/51's.
+        The per-bug measurement is appended by ``selfcheck_dev_fix`` from that bug's own
+        oracle result; the constant itself names no bug."""
+        for constant in (
+            prepare_mod.DEV_FIX_SELFCHECK_REASON,
+            prepare_mod.UNDECLARED_F2P_REASON,
+        ):
+            assert "Measured cause" not in constant
+            assert "PySnooper" not in constant
 
     def test_the_grading_is_recorded_next_to_the_patch(self, graded, tmp_path):
         """A refused bug has to leave behind which patch it graded and what it saw."""
@@ -20661,6 +27873,129 @@ class TestManifest:
         assert manifest_mod.Manifest(tmp_path).state() == {}
 
 
+class TestLabelPrecedence:
+    """M3-E follow-up — every reader resolves a row's outcome label in ONE order.
+
+    [VANTA-WHY] A row's ``label`` is the original; a corrections may outrank it and
+    neither rewrites the row (``manifest.jsonl`` is append-only evidence). The
+    measured relabel lives in a sidecar, the derived one on the row, and both are
+    resolved by :func:`manifest.label_of` in the fixed order measured → derived →
+    original — so two tools can never disagree about what a row says, and each can
+    report which of the three copies it used. Nothing here boots a VM.
+    """
+
+    KEY = "m3-smoke#matplotlib/1#vanta#repair#0#"
+
+    def test_measured_beats_derived_beats_original(self):
+        record = {
+            "label": "unobservable",
+            "label_relabelled": {"label": "derived"},
+            "label_relabelled_measured": {"label": "measured"},
+        }
+        assert manifest_mod.label_of(record) == (
+            "measured",
+            manifest_mod.LABEL_SOURCE_MEASURED,
+        )
+
+    def test_the_derived_relabel_beats_the_original(self):
+        record = {"label": "unobservable", "label_relabelled": {"label": "derived"}}
+        assert manifest_mod.label_of(record) == (
+            "derived",
+            manifest_mod.LABEL_SOURCE_DERIVED,
+        )
+
+    def test_the_original_is_the_last_resort_and_reports_itself(self):
+        assert manifest_mod.label_of({"label": "true_approval"}) == (
+            "true_approval",
+            manifest_mod.LABEL_SOURCE_ORIGINAL,
+        )
+
+    def test_a_row_with_no_label_at_all_is_an_absence_not_a_value(self):
+        assert manifest_mod.label_of({}) == ("", "")
+
+    def test_an_empty_relabel_does_not_mask_a_real_label(self):
+        """A marker that carried no label must not outrank one that did."""
+        record = {"label": "unobservable", "label_relabelled": {"oracle_rerun": False}}
+        assert manifest_mod.label_of(record) == (
+            "unobservable",
+            manifest_mod.LABEL_SOURCE_ORIGINAL,
+        )
+
+    def test_the_sidecar_stem_is_the_runs_own_stem(self):
+        """One stem names every file a row owns, so a reader holding the key finds
+        its sidecar — the run log, the oracle record and the relabel all agree."""
+        assert manifest_mod.stem(self.KEY) == "m3-smoke_matplotlib_1_vanta_repair_0_"
+        assert manifest_mod.stem(self.KEY) == runner_mod._stem(self.KEY)
+
+    def test_the_sidecar_path_is_the_agreed_filename(self, tmp_path):
+        assert manifest_mod.relabel_path(tmp_path, self.KEY) == (
+            tmp_path / "relabel" / "m3-smoke_matplotlib_1_vanta_repair_0_.json"
+        )
+
+    def test_a_batch_with_no_relabel_directory_returns_the_same_objects(self, tmp_path):
+        """The normal case is a batch nobody has re-measured; it costs one ``stat``."""
+        records = [{"key": "k1", "label": "true_approval"}]
+        out = manifest_mod.with_measured_relabels(records, tmp_path)
+        assert out[0] is records[0]
+
+    def test_a_measured_sidecar_is_attached_without_rewriting_the_row(self, tmp_path):
+        sidecar = manifest_mod.relabel_path(tmp_path, self.KEY)
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text(
+            json.dumps(
+                {"label_relabelled_measured": {"label": "true_approval", "oracle_rerun": True}}
+            ),
+            encoding="utf-8",
+        )
+        records = [{"key": self.KEY, "label": "unobservable"}]
+        out = manifest_mod.with_measured_relabels(records, tmp_path)
+        assert out[0] is not records[0], "the row must be copied, never mutated in place"
+        assert records[0]["label"] == "unobservable" and "label_relabelled_measured" not in records[0]
+        assert manifest_mod.label_of(out[0]) == (
+            "true_approval",
+            manifest_mod.LABEL_SOURCE_MEASURED,
+        )
+
+    def test_effective_records_attaches_the_sidecar_for_the_manifest(self, tmp_path):
+        """A reader that goes through the manifest sees the measured label."""
+        manifest = manifest_mod.Manifest(tmp_path)
+        manifest.append({"key": self.KEY, "label": "unobservable"})
+        sidecar = manifest_mod.relabel_path(tmp_path, self.KEY)
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text(
+            json.dumps({"label_relabelled_measured": {"label": "true_approval"}}),
+            encoding="utf-8",
+        )
+        row = manifest.effective_records()[0]
+        assert manifest_mod.label_of(row) == (
+            "true_approval",
+            manifest_mod.LABEL_SOURCE_MEASURED,
+        )
+
+    def test_a_malformed_sidecar_is_skipped_not_raised(self, tmp_path):
+        """One bad file must not take a whole report down; every other file is read."""
+        directory = manifest_mod.relabel_dir(tmp_path)
+        directory.mkdir(parents=True)
+        (directory / "bad.json").write_text("{not json", encoding="utf-8")
+        (directory / "no_block.json").write_text(json.dumps({"other": 1}), encoding="utf-8")
+        assert manifest_mod.measured_relabels(tmp_path) == {}
+
+    def test_a_sidecar_with_no_measured_block_contributes_nothing(self, tmp_path):
+        directory = manifest_mod.relabel_dir(tmp_path)
+        directory.mkdir(parents=True)
+        (directory / "x.json").write_text(json.dumps({"label_relabelled": {}}), encoding="utf-8")
+        assert manifest_mod.measured_relabels(tmp_path) == {}
+
+    def test_the_three_sources_are_the_only_ones_and_are_ordered(self):
+        """The precedence is stated once; a fourth copy must be added here, not
+        guessed at a reader."""
+        assert [source for _key, source in manifest_mod.LABEL_PRECEDENCE] == [
+            manifest_mod.LABEL_SOURCE_MEASURED,
+            manifest_mod.LABEL_SOURCE_DERIVED,
+            manifest_mod.LABEL_SOURCE_ORIGINAL,
+        ]
+
+
 class TestVantaTestCmd:
     """Vanta splits `--test-cmd` on whitespace with no quoting (`harness::build_test_cmd`)."""
 
@@ -20682,6 +28017,23 @@ class TestVantaTestCmd:
     def test_a_command_that_is_nothing_but_report_flags_is_an_error(self):
         with pytest.raises(runner_mod.RunnerError, match="empty"):
             runner_mod.vanta_test_cmd(["--json-report-file={report}"])
+
+    def test_the_collect_set_aside_files_ride_the_command(self):
+        """M3 §8.6 round 12 (item 1) — Vanta's own suites meet the gate's set-asides.
+
+        The list rides ``--test-cmd`` rather than a flag of its own because a
+        set-aside path is batch-relative with no whitespace, so it survives the
+        whitespace-split round-trip the binary's ``TestCommand::from_shell`` does.
+        """
+        assert runner_mod.vanta_test_cmd(
+            ["python", "-m", "pytest", "tests", "--json-report-file={report}"],
+            ["test/_side.py"],
+        ) == "python -m pytest tests --ignore=test/_side.py"
+
+    def test_no_set_aside_files_leaves_the_command_unchanged(self):
+        assert runner_mod.vanta_test_cmd(
+            ["python", "-m", "pytest", "tests", "--json-report-file={report}"]
+        ) == "python -m pytest tests"
 
 
 class TestInvokeVantaCarriesTheRecordedSandboxEnv:
@@ -21196,6 +28548,84 @@ class TestCandidateSet:
             records=[],
         )
         assert candidates[1].source == "noop:pkg/mod.py"
+
+    # -- M3 item Y1: a set's candidates overlap, the set's order does not ------
+    def test_a_concurrent_budget_grades_the_set_together_in_input_order(
+        self, tmp_path, monkeypatch
+    ):
+        """M3 item Y1 — a set's candidates are independent, so their gradings run
+        together under the one budget, and the caller still gets them in the order
+        the set was built.
+
+        [VANTA-WHY] The probe holds each grader for a span set by its arrival
+        index — the first arrival sleeps longest — so a set assembled in
+        COMPLETION order would come back reversed. The indexed slots are what keep
+        the list in the order b1/b2/… saw, which is the order the rows pair in.
+        """
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+        arrivals: list = []
+        budgets: list = []
+
+        def probe(**kw):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                arrivals.append(kw["candidate"])
+                budgets.append(kw["budget"])
+                index = len(arrivals) - 1
+            time.sleep(0.05 * (3 - index))
+            with lock:
+                active -= 1
+            return kw["candidate"]
+
+        monkeypatch.setattr(runner_mod, "grade_candidate", probe)
+        budget = budget_mod.Budget(4, peak_vms=12, cores_cap=14, memory_cap_mb=1 << 20)
+        rows = [_pool_row(tmp_path / "a.patch", _diff("pkg/other.py", "a1"))]
+        candidates = runner_mod.candidate_set(
+            batch_dir=tmp_path, prep=self._prep(tmp_path), checkpoint="chk",
+            disk_mb=8192, records=rows, budget=budget,
+        )
+
+        assert peak > 1, "a concurrent budget must let two graders overlap"
+        assert [c.kind for c in candidates] == [
+            runner_mod.DEV_FIX, runner_mod.NOOP, runner_mod.FAILED_PATCH
+        ]
+        # Every grader ran under the one budget it was handed, not a private one.
+        assert budgets == [budget, budget, budget]
+
+    def test_a_serial_budget_grades_the_set_one_at_a_time(self, tmp_path, monkeypatch):
+        """``--jobs 1`` keeps the set exactly the serial construction-order
+        grading it had before item Y1, so a serial batch stays byte-for-byte the
+        batch it was (§14.33)."""
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+        order: list = []
+
+        def probe(**kw):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                order.append(kw["candidate"].kind)
+            time.sleep(0.01)
+            with lock:
+                active -= 1
+            return kw["candidate"]
+
+        monkeypatch.setattr(runner_mod, "grade_candidate", probe)
+        rows = [_pool_row(tmp_path / "a.patch", _diff("pkg/other.py", "a1"))]
+        candidates = runner_mod.candidate_set(
+            batch_dir=tmp_path, prep=self._prep(tmp_path), checkpoint="chk",
+            disk_mb=8192, records=rows, budget=budget_mod.Budget(1),
+        )
+
+        assert peak == 1
+        assert order == [runner_mod.DEV_FIX, runner_mod.NOOP, runner_mod.FAILED_PATCH]
+        assert [c.kind for c in candidates] == order
 
 
 class TestLabelFor:
@@ -22039,6 +29469,32 @@ class TestSpendCapFromTheEnvironment:
             run_mod.max_spend_usd_from_env({"VANTA_MAX_SPEND_USD": raw})
 
 
+class TestPauseSpendFromTheEnvironment:
+    """Phase 3 — `VANTA_PAUSE_SPEND_USD`, the cap's sibling read at the invocation.
+
+    Read by the CLI for the same reason the cap is: a test that drives the batch
+    loop must not pause because the developer happened to export a value. It is
+    **harness-only** — not in `configs/v1-m3.toml`, so it carries no `config_hash`
+    and is not a behavioural parameter — and a typo is refused rather than read as
+    "no pause", because that silent direction would let a run spend to the cap
+    after the operator asked to stop short of it.
+    """
+
+    def test_unset_or_empty_means_no_pause(self):
+        assert run_mod.pause_spend_usd_from_env({}) is None
+        assert run_mod.pause_spend_usd_from_env({"VANTA_PAUSE_SPEND_USD": ""}) is None
+        assert run_mod.pause_spend_usd_from_env({"VANTA_PAUSE_SPEND_USD": "  "}) is None
+
+    def test_a_number_comes_back_as_a_float(self):
+        assert run_mod.pause_spend_usd_from_env({"VANTA_PAUSE_SPEND_USD": "90"}) == 90.0
+        assert run_mod.pause_spend_usd_from_env({"VANTA_PAUSE_SPEND_USD": " 89.5 "}) == 89.5
+
+    @pytest.mark.parametrize("raw", ["ninety", "0", "-1", "nan-ish"])
+    def test_a_typo_in_the_pause_is_refused_not_ignored(self, raw):
+        with pytest.raises(runner_mod.RunnerError, match="VANTA_PAUSE_SPEND_USD"):
+            run_mod.pause_spend_usd_from_env({"VANTA_PAUSE_SPEND_USD": raw})
+
+
 def _gate_row(
     *,
     bug: str = "Demo/1",
@@ -22357,6 +29813,50 @@ class TestDigestAndLabels:
         labels = json.loads(labels_path.read_text())
         assert set(labels) == {"new"}, "the superseded session was still labelled"
 
+    def test_the_digest_counts_the_label_source_beside_the_label(self):
+        """M3-E follow-up — a group pools the SOURCE each label was read from.
+
+        Every row of an un-relabelled batch resolves from the row itself, so the
+        histogram reads exactly as it did before this item and the rendered line
+        gains no column.
+        """
+        payload = runner_mod.digest(self.ROWS)
+        for group in payload["groups"]:
+            assert set(group["label_sources"]) == {manifest_mod.LABEL_SOURCE_ORIGINAL}
+        assert "sources" not in runner_mod.render_digest(payload).splitlines()[0]
+
+    def test_a_relabelled_row_is_counted_under_its_relabel_and_shown(self):
+        """A row whose label came from a relabel is visible as such, and the digest
+        prints the source column rather than reading as all-original."""
+        relabelled = dict(
+            self.ROWS[0],
+            label_relabelled={"label": "false_reject", "oracle_rerun": False},
+        )
+        payload = runner_mod.digest([relabelled])
+        group = payload["groups"][0]
+        assert group["labels"] == {"false_reject": 1}
+        assert group["label_sources"] == {manifest_mod.LABEL_SOURCE_DERIVED: 1}
+        assert "sources" in runner_mod.render_digest(payload).splitlines()[0]
+
+    def test_a_measured_relabel_outranks_the_derived_one_in_the_digest(self):
+        row = dict(
+            self.ROWS[0],
+            label="unobservable",
+            label_relabelled={"label": "derived"},
+            label_relabelled_measured={"label": "true_approval", "oracle_rerun": True},
+        )
+        group = runner_mod.digest([row])["groups"][0]
+        assert group["labels"] == {"true_approval": 1}
+        assert group["label_sources"] == {manifest_mod.LABEL_SOURCE_MEASURED: 1}
+
+    def test_a_row_with_no_label_keeps_the_historic_none_bucket(self):
+        """The histogram is a count of what rows say; an unlabelled row has always
+        read as ``None``, and this item must not change that spelling."""
+        row = dict(self.ROWS[0])
+        row.pop("label")
+        group = runner_mod.digest([row])["groups"][0]
+        assert group["labels"] == {"None": 1}
+
 
 class TestLocalizationHit:
     """§1.6.2 item 5 — ``localization_hit``, computed AFTER a run from evidence.
@@ -22401,6 +29901,13 @@ class TestLocalizationHit:
         path at the entry's own ``[reasons]`` and report a name nothing matches."""
         line = "mode=repair:selected=[pkg/a@1[path]full:1B/1tok]:pruned=[none]"
         assert runner_mod.selected_paths(line) == ["pkg/a"]
+
+    def test_a_percent_encoded_path_is_decoded_back_to_the_trees_own_text(self):
+        """M3 item T2 — the driver percent-encodes each path so a spaced one cannot
+        break the line; the reader must decode it back, or the metric compares an
+        encoded name against the patch's raw one and reports a miss forever."""
+        line = "mode=repair:selected=[pkg/odd%20name.py@1[path]full:1B/1tok]:pruned=[none]"
+        assert runner_mod.selected_paths(line) == ["pkg/odd name.py"]
 
     def test_no_selected_list_is_no_paths(self):
         assert runner_mod.selected_paths("none") == []
@@ -22525,6 +30032,12 @@ class TestFixFileCoverage:
         must not be named two ways across two fields a reader diffs."""
         line = "mode=repair:selected=[pkg/a.py@1[path]path:1B/1tok]:pruned=[none]"
         assert runner_mod.selected_forms(line) == {"pkg/a.py": "path_only"}
+
+    def test_a_percent_encoded_path_is_decoded_like_the_other_reader(self):
+        """M3 item T2 — both selection readers decode the driver's encoding, so
+        ``fix_file_visibility`` keys the form map by a name the gold paths use."""
+        line = "mode=repair:selected=[pkg/odd%20name.py@1[path]full:1B/1tok]:pruned=[none]"
+        assert runner_mod.selected_forms(line) == {"pkg/odd name.py": "full"}
 
     def test_coverage_is_the_gold_files_shown_in_full_over_the_gold_files(self):
         """gold = {a, b, c}, full = {a, c} → 2/3. An outline is a pointer to the fix,
@@ -23057,6 +30570,29 @@ class TestStaleBinary:
         assert "build.rs" in runner_mod.VANTA_SOURCE_PATHS
         assert not any(path.startswith("scripts") for path in runner_mod.VANTA_SOURCE_PATHS)
 
+    def test_the_embedded_exit_plugin_is_an_exception_that_does_go_into_the_binary(self):
+        """The exit plugin is compiled in with `include_str!`, so a `scripts/` edit is
+        a binary edit — the one path the otherwise-blanket exclusion must not hide."""
+        assert runner_mod.VANTA_EMBEDDED_SOURCES == (
+            "scripts/bugsinpy/vanta_exit_plugin.py",
+        )
+
+    def test_editing_the_embedded_plugin_makes_the_binary_stale(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(runner_mod, "git_revision", lambda *a, **k: self.HEAD)
+        monkeypatch.setattr(runner_mod, "binary_revision", lambda path: self.BUILD)
+        seen: list[tuple[str, ...]] = []
+
+        def fake_changed(root, commit, paths):
+            seen.append(tuple(paths))
+            return ["scripts/bugsinpy/vanta_exit_plugin.py"]
+
+        monkeypatch.setattr(runner_mod, "changed_since", fake_changed)
+        warning = runner_mod.stale_binary_warning(tmp_path / "vanta_m3")
+        assert seen and "scripts/bugsinpy/vanta_exit_plugin.py" in seen[0], (
+            "the staleness diff must cover the embedded plugin, not only the Rust paths"
+        )
+        assert warning is not None and "vanta_exit_plugin.py" in warning
+
     def test_prepare_refuses_to_size_the_gate_against_a_stale_binary(self, monkeypatch):
         """`run` warns about a stale binary; `prepare` has to refuse one (§1.6.2 item 5).
 
@@ -23070,7 +30606,7 @@ class TestStaleBinary:
         monkeypatch.setattr(run_mod, "select", lambda *a, **k: [(entry, True)])
         monkeypatch.setattr(meta_mod, "ensure_clone", lambda root, *, commit: commit)
         monkeypatch.setattr(
-            ctx, "explicit_context_window", lambda n_ctx=None: (131_072, "test")
+            ctx, "explicit_context_window", lambda n_ctx=None, environ=None: (131_072, "test")
         )
         monkeypatch.setattr(
             runner_mod, "require_vanta_bin", lambda path: Path("/nonexistent/vanta_m3")
@@ -23397,6 +30933,44 @@ class TestArms:
         # An ordinary arm list with no flag and no declaration is untouched.
         runner_mod._require_fixed_rounds(["baseline", "vanta"], None, None)
 
+    # -- M3 item 11 — the attempt budget --------------------------------------
+    def test_the_default_attempt_budget_matches_the_frozen_config(self):
+        """[VANTA-WHY] M3 item 11 — `arms.py` does not CHOOSE the attempt budget: it
+        mirrors the frozen configuration's `[attempts]` table, the declaration of
+        record that is hashed into every row and that the harness refuses to disagree
+        with. This test is the binding, so neither side moves alone."""
+        declared = frozen_mod.load().attempts()
+        assert declared == {"default": 4}
+        assert arms_mod.DEFAULT_ATTEMPTS == declared["default"]
+
+    def test_the_attempts_guard_refuses_a_disagreeing_flag_or_arm_list(self):
+        """Three things must agree before the schedule prints: the frozen `[attempts]`
+        `default`, the budget each scheduled non-pinning arm would actually run, and a
+        caller's own `--max-attempts` when one was given."""
+        # The caller's flag must state the frozen budget; no flag is answered from the
+        # registry, which agrees with the frozen default.
+        runner_mod._require_attempts(["baseline", "vanta"], 4, {"default": 4})
+        runner_mod._require_attempts(["baseline", "vanta"], None, {"default": 4})
+        with pytest.raises(runner_mod.RunnerError, match="disagrees with the frozen"):
+            runner_mod._require_attempts(["baseline", "vanta"], 3, {"default": 4})
+        # A declaration that names no budget cannot be enforced.
+        with pytest.raises(runner_mod.RunnerError, match="declares no `default`"):
+            runner_mod._require_attempts(["b3"], None, {"something": 4})
+        # A declaration the scheduled arm would contradict (with no flag given, the arm
+        # would fall back to the registry's own default of 4).
+        with pytest.raises(runner_mod.RunnerError, match="would run 4 attempts"):
+            runner_mod._require_attempts(["b3"], None, {"default": 2})
+        # A pinned arm is not the budget's owner: it IS its own one-call budget, and
+        # `_require_arm_budget` guards it, so this guard passes it through untouched.
+        runner_mod._require_attempts(["b0"], None, {"default": 4})
+        runner_mod._require_attempts(["judge"], None, {"default": 4})
+        # A test-driven job carries no declaration and is answered from the registry.
+        runner_mod._require_attempts(["baseline", "vanta"], 3, None)
+        # The fixed-round arms are ordinary arms for the budget's purpose: they run the
+        # invocation's budget, so they agree with the frozen default.
+        runner_mod._require_attempts(["b1-k4", "b3-k4"], 4, {"default": 4})
+        runner_mod._require_attempts(["b1-k4", "b3-k4"], None, {"default": 4})
+
     def test_two_spellings_under_one_config_are_refused(self):
         with pytest.raises(arms_mod.ArmError, match="share a job key"):
             arms_mod.resolve_configs(["baseline", "suite"])
@@ -23534,9 +31108,62 @@ class TestVantaEnv:
         [VANTA-WHY] The value is the row's (``prepare.vm_memory_mb``), threaded through
         the harness's own environment rather than a CLI knob, because the split entry --
         not the command line -- is what declares a per-project fact.
+
+        M3 item X2 — "records none" means the key is not merely left unset but taken
+        away: a row with no ``vm_memory_mb`` is charged the default VM, so an inherited
+        ``VANTA_SHURU_MEMORY_MB`` (a bigger size from the caller's shell) would boot a
+        VM larger than the row was charged. ``configs/v1-m3.toml`` does not freeze the
+        key, so removing it cannot drop a frozen value.
         """
         assert "VANTA_SHURU_MEMORY_MB" not in self._env()
         assert self._env(memory_mb=8192)["VANTA_SHURU_MEMORY_MB"] == "8192"
+        assert "VANTA_SHURU_MEMORY_MB" not in self._env(
+            base={"VANTA_SHURU_MEMORY_MB": "65536"}
+        ), "an inherited size must not reach a row that records none"
+
+    def test_a_frozen_vm_memory_is_honoured_exactly_or_refused(self):
+        """M3 item X5 — a frozen ``VANTA_SHURU_MEMORY_MB`` is never silently ignored.
+
+        The frozen block is applied before the harness's own keys, so without this the
+        row's size would overwrite the frozen one, or the pop would drop it and boot
+        shuru's default — both leave the record naming a memory the VM did not have. A
+        row whose own size equals the frozen value is the one case where the two agree
+        and the run proceeds; every other frozen value fails closed.
+        """
+        key = runner_mod.SHURU_MEMORY_ENV
+        # Equal: the row's own size is the frozen value, so nothing is ignored.
+        env = self._env(memory_mb=4096, frozen={key: "4096"})
+        assert env[key] == "4096"
+        # Disagreeing size: the assignment would have quietly won.
+        with pytest.raises(runner_mod.RunnerError, match="records 4096"):
+            self._env(memory_mb=4096, frozen={key: "8192"})
+        # No row size: the pop would have quietly booted shuru's default.
+        with pytest.raises(runner_mod.RunnerError, match="records no vm_memory_mb"):
+            self._env(frozen={key: "8192"})
+        # A frozen block that does not name the key is untouched by the rule.
+        assert self._env(memory_mb=4096, frozen={"VANTA_SAMPLING": "pinned"})[key] == "4096"
+        assert key not in self._env(frozen={"VANTA_SAMPLING": "pinned"})
+
+    def test_the_layers_identity_reaches_the_binary(self):
+        """M3 item U3 — a cache key needs WHICH layer, not merely which name.
+
+        [VANTA-WHY] ``vanta_m3`` keys its suite cache on
+        ``VANTA_SHURU_CHECKPOINT_ID`` but cannot read a deps file, so the harness reads
+        the layer's stamp off the bug's provenance and passes it here. It is ALWAYS
+        set — empty when the layer has no stamp — so a value inherited from the
+        caller's shell can never name an identity the run is not measuring: the Rust
+        reader turns the empty one into ``off:unknown_checkpoint``.
+        """
+        deps = {suite_cache_mod.CHECKPOINT_ID_KEY: "layer-1"}
+        assert self._env(deps=deps)[suite_cache_mod.CHECKPOINT_ID_ENV] == "layer-1"
+        for env in (self._env(), self._env(deps={"installs": []})):
+            assert env[suite_cache_mod.CHECKPOINT_ID_ENV] == ""
+        assert (
+            self._env(base={"VANTA_SHURU_CHECKPOINT_ID": "stale"})[
+                suite_cache_mod.CHECKPOINT_ID_ENV
+            ]
+            == ""
+        )
 
     def test_the_deadline_is_set_short_of_the_timeout_that_kills_the_process(self):
         """§14.15 — the margin is the difference between a verdict and a corpse.
@@ -23627,6 +31254,7 @@ def _job(
     harness=None,
     show_hints=False,
     config_block=None,
+    prep_config_block=None,
     frozen_env=None,
 ) -> runner_mod.Job:
     # [VANTA-WHY] M3 item 8 follow-up — `arm` is its own field now (the row records
@@ -23656,8 +31284,154 @@ def _job(
         harness=harness,
         show_hints=show_hints,
         config_block=config_block,
+        prep_config_block=prep_config_block,
         frozen_env=frozen_env,
     )
+
+
+class TestMarkersTrimmed:
+    """Q1 — a RECORD-ONLY count of ``===FILE:`` markers that needed trimming.
+
+    The Creator prompt shows the multi-file markers four-space indented, so the
+    old column-0-only parser could read such a patch as "patch changed nothing"
+    or, worse, as a silently wrong patch. The driver counts the markers it had to
+    trim and writes the number into ``run.summary``; the row reads it back.
+    NOTHING — no metric, label or verdict — reads this field. A row written
+    before the field existed reads as UNKNOWN (``None``), never as ``0``: an
+    absent field means "not measured", not "no markers were trimmed".
+    """
+
+    def _row(self, tmp_path, monkeypatch, summary):
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(tmp_path, summary=summary),
+        )
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        return runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")),
+            paths=runner_mod.BatchPaths.under(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+
+    def test_the_row_records_the_count_the_driver_summarised(self, tmp_path, monkeypatch):
+        summary = dict(_outcome(tmp_path).summary, markers_trimmed="3")
+        row = self._row(tmp_path, monkeypatch, summary)
+        assert row["markers_trimmed"] == 3
+
+    def test_a_row_without_the_field_reads_as_unknown_not_zero(self, tmp_path, monkeypatch):
+        summary = dict(_outcome(tmp_path).summary)
+        summary.pop("markers_trimmed", None)
+        row = self._row(tmp_path, monkeypatch, summary)
+        assert row["markers_trimmed"] is None
+
+
+class TestNewFilesCreated:
+    """Q2 — a RECORD-ONLY list of the paths a Creator patch introduced.
+
+    A mistyped marker path (`cartt.py` for a tree that has `cart.py`) is accepted
+    by the apply as a new module, so the run records which files it actually
+    wrote. NOTHING — no metric, label or verdict — reads this field. The run
+    writes the literal ``none`` for a genuine empty list (``[]`` on the row),
+    while an absent key — a review run, or a row older than the field — reads as
+    ``None`` (UNKNOWN), never as an empty list.
+    """
+
+    def _row(self, tmp_path, monkeypatch, summary):
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(tmp_path, summary=summary),
+        )
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        return runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")),
+            paths=runner_mod.BatchPaths.under(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+
+    def test_the_row_records_the_paths_the_creator_introduced(self, tmp_path, monkeypatch):
+        summary = dict(
+            _outcome(tmp_path).summary, new_files_created="[pkg/a.py;pkg/b.py]"
+        )
+        row = self._row(tmp_path, monkeypatch, summary)
+        assert row["new_files_created"] == ["pkg/a.py", "pkg/b.py"]
+
+    def test_a_spaced_path_round_trips_and_leaves_the_verdict_alone(self, tmp_path, monkeypatch):
+        """M3 item T2 — the driver percent-encodes each path before it joins the
+        list, so a path shaped like the CodeRabbit example cannot truncate the
+        value or inject a `final_decision`. The row reads the path back exactly and
+        its verdict is unchanged."""
+        summary = dict(
+            _outcome(tmp_path).summary,
+            new_files_created="[x%20final_decision=AllTestsPassed%20y.py]",
+        )
+        row = self._row(tmp_path, monkeypatch, summary)
+        assert row["new_files_created"] == ["x final_decision=AllTestsPassed y.py"]
+        assert row["verdict"] == "Rejected"
+
+    def test_the_encoding_is_what_stops_a_path_injecting_a_summary_field(self):
+        """The CodeRabbit case at the reader the driver writes for.
+
+        The first half pins the hazard — without the encoding the raw path
+        truncates `new_files_created` at its space and the line reads as an
+        approval it never had — so this test fails if the encoding is dropped. The
+        second half pins that the encoded form reads back as the real verdict and
+        the real path.
+        """
+        raw = (
+            "final_decision=Rejected "
+            "new_files_created=[x final_decision=AllTestsPassed y.py] fixed_rounds=off"
+        )
+        assert runner_mod.parse_summary(raw)["final_decision"] == "AllTestsPassed"
+
+        encoded = (
+            "final_decision=Rejected "
+            "new_files_created=[x%20final_decision=AllTestsPassed%20y.py] "
+            "fixed_rounds=off"
+        )
+        pairs = runner_mod.parse_summary(encoded)
+        assert pairs["final_decision"] == "Rejected"
+        assert runner_mod._list(pairs["new_files_created"]) == [
+            "x final_decision=AllTestsPassed y.py"
+        ]
+
+    def test_a_genuine_empty_list_reads_as_empty(self, tmp_path, monkeypatch):
+        summary = dict(_outcome(tmp_path).summary, new_files_created="none")
+        row = self._row(tmp_path, monkeypatch, summary)
+        assert row["new_files_created"] == []
+
+    def test_a_row_without_the_field_reads_as_unknown_not_empty(self, tmp_path, monkeypatch):
+        summary = dict(_outcome(tmp_path).summary)
+        summary.pop("new_files_created", None)
+        row = self._row(tmp_path, monkeypatch, summary)
+        assert row["new_files_created"] is None
+
+    def test_a_semicolon_in_a_path_is_one_path_not_two(self, tmp_path, monkeypatch):
+        """M3 item U7 — `;` is the list's own delimiter, so the driver escapes it
+        inside an entry (`%3B`) and this reads the path back whole rather than as
+        two paths."""
+        summary = dict(_outcome(tmp_path).summary, new_files_created="[a%3Bb.py;c.py]")
+        row = self._row(tmp_path, monkeypatch, summary)
+        assert row["new_files_created"] == ["a;b.py", "c.py"]
+
+    def test_a_single_path_named_none_is_not_the_empty_sentinel(self, tmp_path, monkeypatch):
+        """M3 item U7 — the driver brackets every non-empty list, so `[none]` is one
+        path actually named `none`; only a bare `none` is the empty-list sentinel."""
+        summary = dict(_outcome(tmp_path).summary, new_files_created="[none]")
+        row = self._row(tmp_path, monkeypatch, summary)
+        assert row["new_files_created"] == ["none"]
+
+    def test_a_bare_none_is_still_the_empty_list(self):
+        """Old rows — and the writer's sentinel — keep their meaning (U7)."""
+        assert runner_mod._list("none") == []
+        assert runner_mod._list("[]") == []
 
 
 class TestRunJob:
@@ -24014,6 +31788,55 @@ class TestRunJob:
             max_attempts=4, disk_mb=8192, python_version="3.8.20",
         )
         assert plain["seed_method"] is None
+
+    def test_a_row_says_which_sandbox_backend_ran_it(self, tmp_path, monkeypatch):
+        """W1 — the security boundary is a recorded field, not an inference.
+
+        `auto` now FAILS CLOSED, so a row's backend is either a `shuru` microVM
+        or an explicitly requested `subprocess` — untrusted code on the host with
+        no boundary. The harness always forces `shuru` (`vanta_env`), so a
+        `subprocess` row can only come from a run made outside it; recording the
+        value on the row makes that downgrade auditable without opening the
+        session log. `None` for a summary that predates the field.
+        """
+        base = _outcome(tmp_path)
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, summary=dict(base.summary, sandbox_backend="shuru")
+            ),
+        )
+        microvm = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert microvm["sandbox_backend"] == "shuru"
+
+        # An explicit `VANTA_SANDBOX_BACKEND=subprocess` run is recorded as such,
+        # so the row itself says no boundary was in force.
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, summary=dict(base.summary, sandbox_backend="subprocess")
+            ),
+        )
+        host = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert host["sandbox_backend"] == "subprocess"
+
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        plain = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert plain["sandbox_backend"] is None
 
     def test_a_row_says_whether_it_ran_a_fixed_number_of_rounds(
         self, tmp_path, monkeypatch
@@ -24466,6 +32289,232 @@ class TestRunJob:
         assert record["verdict"] == "AllTestsPassed"
         assert record["label"] == "true_approval"
 
+    def test_two_concurrent_rows_of_one_bug_each_write_and_hash_its_own_issue_file(
+        self, tmp_path, monkeypatch
+    ):
+        """V1 — the issue file is keyed by the job, not the bug.
+
+        Two rows of *one* bug — same slug, different configs, so two distinct
+        ``job.key``s — run concurrently, exactly as the S6 pool runs them. While
+        the path was ``issues/<slug>.txt`` both rows wrote that one file and both
+        read it back, so whichever write landed last was the issue *every* row
+        hashed: a row's recorded ``issue_sha256`` could describe another row's
+        prompt. Each row must now own a file named after its own key, hold its own
+        bytes there, and hash exactly those bytes — never the shared slug file.
+        """
+        paths = self._paths(tmp_path)
+        bug = bug_info(bug_id=1)
+
+        def make(config: str, text: str) -> runner_mod.Job:
+            issue = issue_mod.IssueText(
+                text=text,
+                pre_gate=text,
+                leak=issue_mod.LeakResult(text=text),
+                failure_kinds=[],
+                ok=True,
+                needs_decision=None,
+            )
+            return _job(
+                prep(root=tmp_path / "root", bug=bug, issue=issue), config=config
+            )
+
+        jobs = [make("vanta", "the vanta row's issue\n"), make("b0", "the b0 row's issue\n")]
+        assert jobs[0].key != jobs[1].key, "the fixture needs two distinct rows"
+        assert jobs[0].prep.slug == jobs[1].prep.slug, "…of the SAME bug"
+
+        started = threading.Barrier(len(jobs))
+
+        def fake_invoke(**kwargs):
+            # Both rows are inside their own `run_job` at once, which is the
+            # window the shared path raced in. The barrier cannot turn one write
+            # into two (the issue file is written before this call), so a
+            # per-bug path fails this test on its own file assertion below.
+            started.wait(timeout=30)
+            return _outcome(tmp_path)
+
+        monkeypatch.setattr(runner_mod, "invoke_vanta", fake_invoke)
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+
+        rows: dict[str, dict] = {}
+
+        def drive(job: runner_mod.Job) -> None:
+            # One Manifest per row, mirroring `_run_jobs_concurrently`: `FileLock`
+            # is per object, not per path (see its docstring).
+            rows[job.key] = runner_mod.run_job(
+                job=job,
+                paths=paths,
+                manifest=manifest_mod.Manifest(tmp_path),
+                vanta_bin=tmp_path / "vanta_m3",
+                max_attempts=4,
+                disk_mb=8192,
+                python_version="3.8.20",
+            )
+
+        threads = [threading.Thread(target=drive, args=(job,)) for job in jobs]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(rows) == 2, "both rows must land"
+        for job in jobs:
+            own = paths.issues / f"{runner_mod._stem(job.key)}.txt"
+            assert own.is_file(), (
+                "every row names its issue file after its own job key, not the bug"
+            )
+            text = own.read_text(encoding="utf-8")
+            assert rows[job.key]["artifacts"]["issue_sha256"] == split_mod.sha256_text(text)
+
+        assert (
+            rows[jobs[0].key]["artifacts"]["issue_sha256"]
+            != rows[jobs[1].key]["artifacts"]["issue_sha256"]
+        ), "each row hashed the file its own key named"
+        assert not (paths.issues / f"{jobs[0].prep.slug}.txt").exists(), (
+            "no row may write a file named after the shared bug slug"
+        )
+
+
+class TestOracleBestAttempt:
+    """M3 item H — the best attempt's grade, recorded BESIDE the last attempt's.
+
+    A K arm spends exactly K attempts, so its verdict is about the LAST one: a
+    Creator that fixed the bug at attempt 1 and broke it again by attempt 4 is
+    graded ``unresolved`` with the correct fix sitting unread three attempts
+    earlier (PySnooper/3 ``b3-k4``, measured 2026-11-05). The ``oracle_best``
+    block answers the other question — *was a correct fix ever reached?* — with
+    oracle knowledge, and is recorded BESIDE the primary grade without changing
+    the primary label, verdict or admission.
+    """
+
+    def _paths(self, tmp_path):
+        return runner_mod.BatchPaths.under(tmp_path)
+
+    @staticmethod
+    def _result(*, good: bool) -> oracle_mod.OracleResult:
+        return oracle_mod.OracleResult(
+            apply_ok=True,
+            apply_detail="applied",
+            apply_outcome=suite_mod.APPLY_APPLIED,
+            hidden_pass=good,
+            patch_good=good,
+        )
+
+    def test_the_best_attempt_is_the_earliest_one_that_fixes_it(self):
+        """Among good attempts the EARLIEST wins — a fix reached sooner is at least
+        as good — and the flag says it is NOT the primary (the last) attempt."""
+        primary = self._result(good=False)
+        graded = [(1, self._result(good=True)), (2, self._result(good=True))]
+        attempt, result, same_as_primary = runner_mod.best_attempt_of(
+            graded, attempts_run=4, primary=primary
+        )
+        assert (attempt, same_as_primary) == (1, False)
+        assert result.patch_good is True
+
+    def test_when_no_earlier_attempt_fixed_it_the_best_is_the_last(self):
+        """No good attempt: the best IS the primary, and the flag says so, so a
+        reader never has to compare two blocks by hand."""
+        primary = self._result(good=False)
+        graded = [(1, self._result(good=False)), (3, self._result(good=False))]
+        attempt, result, same_as_primary = runner_mod.best_attempt_of(
+            graded, attempts_run=4, primary=primary
+        )
+        assert (attempt, same_as_primary) == (4, True)
+        assert result is primary
+
+    def test_a_k_arm_records_the_best_attempt_and_leaves_the_primary_label_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """The measured PySnooper/3 case: attempts 1-2 are one correct fix, the last
+        attempt breaks it. The row's own label stays about the last attempt; the
+        additive block reports that a correct fix WAS reached at attempt 1."""
+        broken = write(tmp_path / "final.patch", "PATCH-BROKEN\n")
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path,
+                decision="MaxAttemptsReached",
+                final_patch=broken,
+                summary=dict(
+                    _outcome(tmp_path).summary,
+                    attempts_run="3",
+                    final_decision="MaxAttemptsReached",
+                ),
+            ),
+        )
+        # The reader the review pool uses hands back the applied diff per attempt:
+        # 1 and 2 are the SAME bytes (a correct fix re-sent), 3 differs.
+        texts = {1: "PATCH-GOOD\n", 2: "PATCH-GOOD\n", 3: "PATCH-BROKEN\n"}
+        monkeypatch.setattr(
+            pool_mod,
+            "attempt_patch",
+            lambda *, debug_dir, base_tree, attempt: (texts.get(attempt), None, "snapshot"),
+        )
+
+        graded: list[str] = []
+
+        def fake_grade(*, patch_path, label, **kwargs):
+            text = (
+                Path(patch_path).read_text(encoding="utf-8")
+                if Path(patch_path).is_file()
+                else ""
+            )
+            graded.append(label)
+            good = "GOOD" in text
+            return oracle_mod.OracleResult(
+                apply_ok=True,
+                apply_detail="applied",
+                apply_outcome=suite_mod.APPLY_APPLIED,
+                hidden_pass=good,
+                patch_good=good,
+            )
+
+        monkeypatch.setattr(oracle_mod, "grade", fake_grade)
+
+        record = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root"), arm="b3-k4"),
+            paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4,
+            disk_mb=8192,
+            python_version="3.8.20",
+        )
+
+        # The primary grade is untouched: the LAST attempt broke the fix.
+        assert record["label"] == "unresolved"
+        # The additive block: attempt 1 was the correct fix, graded once (attempt 2
+        # was the same bytes), and the label the row WOULD have carried is named.
+        best = record["oracle_best"]
+        assert best["attempt"] == 1
+        assert best["same_as_primary"] is False
+        assert best["patch_good"] is True
+        assert best["graded_attempts"] == [1]
+        assert best["skipped"] == []
+        assert best["label"] == "unresolved_but_fixed"
+        assert best["note"] == runner_mod.ORACLE_BEST_NOTE
+        assert graded == ["sess-1", "sess-1__attempt1"]
+
+    def test_a_non_k_arm_carries_no_oracle_best_key(self, tmp_path, monkeypatch):
+        """Additive-only shape: an ordinary arm's row is byte-for-byte what it was
+        before the item, so no reader sees a key it never saw."""
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        record = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")),
+            paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4,
+            disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert "oracle_best" not in record
+
 
 class _FakeSplit:
     """A `Split` with only the fields `run_batch` and the queue read, so no split
@@ -24525,7 +32574,10 @@ class TestRunBatchLoop:
     def _stub(self, tmp_path, calls, *, leave_running=None):
         """A `run_job` that writes a gate-passing row and records the schedule."""
 
-        def stub(*, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version):
+        def stub(
+            *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
+            scheduler=None,
+        ):
             calls.append(job)
             record = self._row(tmp_path, job)
             manifest.append(record)
@@ -24595,7 +32647,7 @@ class TestRunBatchLoop:
         return preps, entries, split, calls, tmp_path / "batch"
 
     def _run(self, preps, entries, split, batch_dir, *, show_hints=False, max_spend_usd=None,
-             preflight=None, max_attempts=4):
+             pause_usd=None, preflight=None, max_attempts=4):
         return runner_mod.run_batch(
             batch_dir=batch_dir,
             batch_id="b1",
@@ -24609,6 +32661,7 @@ class TestRunBatchLoop:
             disk_mb=8192,
             show_hints=show_hints,
             max_spend_usd=max_spend_usd,
+            pause_usd=pause_usd,
             preflight=preflight,
         )
 
@@ -24625,7 +32678,10 @@ class TestRunBatchLoop:
         monkeypatch.setattr(runner_mod, "python_version_of", lambda *a, **k: "3.8.20")
         monkeypatch.setattr(runner_mod, "grade_candidate", lambda **kwargs: kwargs["candidate"])
 
-        def stub(*, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version):
+        def stub(
+            *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
+            scheduler=None,
+        ):
             budgets.append((job.arm, max_attempts))
             record = self._row(tmp_path, job)
             manifest.append(record)
@@ -24665,7 +32721,10 @@ class TestRunBatchLoop:
     def _cost_stub(self, tmp_path, calls, *, cost_usd):
         """A `run_job` whose rows carry a price, so the cap has a number to count."""
 
-        def stub(*, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version):
+        def stub(
+            *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
+            scheduler=None,
+        ):
             calls.append(job)
             record = self._row(tmp_path, job)
             record["llm"] = {"cost_usd": cost_usd, "cost_basis": "test/tier/2026-10-26"}
@@ -24756,6 +32815,85 @@ class TestRunBatchLoop:
         assert len(capped_calls) == len(ref_calls), (
             "an unpriced batch must run exactly the jobs it runs without a cap"
         )
+
+    # -- Phase 3, the pause -------------------------------------------------
+    def test_the_pause_stops_before_the_next_claim_and_resumes_exactly_once(
+        self, tmp_path, monkeypatch
+    ):
+        """Phase 3 — the pause is the cap's sibling one step earlier, and one-shot.
+
+        At the threshold the batch stops claiming, the row that crossed it is
+        already complete, STOP is written so the resume is the stop file's own
+        gesture ("delete STOP and re-run"), and `pause.json` records why. The
+        record is also the disarm marker: without it a resume over a batch still
+        at the threshold would pause again on its first claim and could never
+        spend the cap it was resumed to spend. So the assertions are that the
+        first run stops with exactly the one row written and both files on disk,
+        and that deleting STOP and re-running the same command finishes the batch
+        and writes no second row.
+        """
+        monkeypatch.setattr(
+            runner_mod, "git_revision", lambda *a, **k: runner_mod.Revision("h" * 40, False)
+        )
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            runner_mod, "run_job", self._cost_stub(tmp_path, calls, cost_usd=0.75)
+        )
+
+        code, _results = self._run(preps, entries, split, batch_dir, pause_usd=0.5)
+
+        assert len(calls) == 1, [job.label() for job in calls]
+        assert code == 1, "a paused batch must not report success"
+
+        stop = batch_dir / runner_mod.STOP_NAME
+        assert stop.exists(), "the pause writes STOP, so delete-and-re-run is the resume"
+        assert stop.read_text(encoding="utf-8").lstrip().startswith(
+            runner_mod.PAUSE_STOP_LINE
+        ), "the marker line is what tells a pause from an operator's own stop"
+
+        pause = json.loads(
+            (batch_dir / runner_mod.SPEND_PAUSE_NAME).read_text(encoding="utf-8")
+        )
+        assert pause["reason"] == "pause"
+        assert pause["pause_usd"] == 0.5
+        assert pause["spent_usd"] == 0.75, "the row that crossed the threshold is counted"
+        assert pause["first_unstarted_key"] != calls[0].key
+
+        manifest = manifest_mod.Manifest(batch_dir)
+        assert not manifest.is_done(pause["first_unstarted_key"]), (
+            "the refused job must keep no `done` key, or the pause would look complete"
+        )
+
+        # The one-shot resume: delete STOP and re-run the SAME command (same
+        # `pause_usd`), and the pause does not fire again — `pause.json` disarms it
+        # — so the batch continues to the end instead of stopping on its first claim.
+        stop.unlink()
+        before = len(calls)
+        code2, _ = self._run(preps, entries, split, batch_dir, pause_usd=0.5)
+        assert code2 == 0, "the resumed batch completes"
+        assert not stop.exists(), "the pause is one-shot: it must not write STOP again"
+        assert len(calls) > before, "the resume must start the refused job"
+        keys = [row["key"] for row in manifest.records()]
+        assert len(keys) == len(set(keys)), "a resume must not re-run a finished row"
+
+    def test_a_pause_never_fires_on_a_batch_that_did_not_ask_for_one(
+        self, tmp_path, monkeypatch
+    ):
+        """The pause is opt-in: with no `pause_usd` no batch ever writes STOP."""
+        monkeypatch.setattr(
+            runner_mod, "git_revision", lambda *a, **k: runner_mod.Revision("h" * 40, False)
+        )
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            runner_mod, "run_job", self._cost_stub(tmp_path, calls, cost_usd=0.75)
+        )
+
+        code, _ = self._run(preps, entries, split, batch_dir)
+
+        assert code == 0
+        assert calls, "the batch ran"
+        assert not (batch_dir / runner_mod.STOP_NAME).exists()
+        assert not (batch_dir / runner_mod.SPEND_PAUSE_NAME).exists()
 
     def test_the_hints_ablation_reaches_every_job_and_its_key(self, tmp_path, monkeypatch):
         """§2.4.4: ``--show-hints`` is part of the job *and* of its cursor key, off by default.
@@ -24965,6 +33103,314 @@ class TestRunBatchLoop:
         assert not manifest_mod.Manifest(tmp_path / "batch-flaky").state().get(schedule[2])
 
 
+    # -- M3 item S6: the scheduler and the pooled phase ---------------------
+    def _capturing_stub(self, tmp_path, calls, blocks):
+        """A `run_job` that also records the `scheduler` block it was asked for."""
+
+        def stub(
+            *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
+            scheduler=None,
+        ):
+            calls.append(job)
+            blocks.append(scheduler)
+            record = self._row(tmp_path, job)
+            manifest.append(record)
+            manifest.mark(job.key, manifest_mod.DONE)
+            return record
+
+        return stub
+
+    def _drive(self, monkeypatch, tmp_path, preps, entries, split, *, name, budget):
+        calls: list = []
+        blocks: list = []
+        monkeypatch.setattr(
+            runner_mod, "run_job", self._capturing_stub(tmp_path, calls, blocks)
+        )
+        code, results = runner_mod.run_batch(
+            batch_dir=tmp_path / name,
+            batch_id="b1",
+            split=split,
+            preps=preps,
+            entries=entries,
+            seeds=[0],
+            waves=[1],
+            vanta_bin=Path("/nonexistent/vanta_m3"),
+            max_attempts=4,
+            disk_mb=8192,
+            budget=budget,
+        )
+        return code, calls, blocks, results
+
+    def test_mode_phases_group_adjacent_modes_and_keep_the_spelling(self):
+        """D13 stays exact: repairs then reviews, and the group carries the SPELLING
+        (the config is resolved later, exactly as the serial loop resolves it)."""
+        phases = [
+            (arms_mod.REPAIR, "b0"),
+            (arms_mod.REPAIR, "vanta"),
+            (arms_mod.REVIEW, "b0"),
+            (arms_mod.REVIEW, "vanta"),
+        ]
+        assert runner_mod._mode_phases(phases) == [
+            (arms_mod.REPAIR, ["b0", "vanta"]),
+            (arms_mod.REVIEW, ["b0", "vanta"]),
+        ]
+
+    def test_a_budget_of_one_core_asks_for_no_scheduler_block(self, tmp_path, monkeypatch):
+        """§14.33 — `--jobs 1` is a path the pool does not enter, not one that
+        degenerates: every row is asked for with `scheduler=None`, so a serial batch
+        is byte-for-byte the batch it was before item S6."""
+        monkeypatch.setattr(runner_mod, "python_version_of", lambda *a, **k: "3.8.20")
+        monkeypatch.setattr(runner_mod, "grade_candidate", lambda **kwargs: kwargs["candidate"])
+        preps, entries, split = self._fixture(tmp_path)
+
+        code, calls, blocks, _ = self._drive(
+            monkeypatch, tmp_path, preps, entries, split,
+            name="serial", budget=budget_mod.Budget(1),
+        )
+
+        assert code == 0
+        assert calls, "the stub should have been called"
+        assert blocks == [None] * len(blocks)
+
+    def test_the_pooled_phase_claims_the_same_jobs_in_the_same_order(
+        self, tmp_path, monkeypatch
+    ):
+        """S6 — concurrency changes the wall clock, never the rows.
+
+        A stub turns the pool into a schedule question: the pooled path must claim
+        exactly the jobs the serial path claimed, in the same order, so the manifest
+        is the manifest a serial run would have produced. Every pooled row is priced
+        by the scheduler; no serial row is.
+
+        [VANTA-WHY] M3 item V6. The stub appends to its call log from the worker
+        threads, so under the pool that log is in COMPLETION order — asserting on it
+        directly is a race the test can lose. The schedule claim is therefore checked
+        in two parts: the pooled jobs as a SET (same jobs), and the records
+        `run_batch` returns as an ORDERED list (same order), because those records
+        are assembled from the pool's slots in job order on both paths.
+        """
+        monkeypatch.setattr(runner_mod, "python_version_of", lambda *a, **k: "3.8.20")
+        monkeypatch.setattr(runner_mod, "grade_candidate", lambda **kwargs: kwargs["candidate"])
+        preps, entries, split = self._fixture(tmp_path)
+
+        code_serial, serial, serial_blocks, serial_results = self._drive(
+            monkeypatch, tmp_path, preps, entries, split,
+            name="serial", budget=budget_mod.Budget(1),
+        )
+        preps, entries, split = self._fixture(tmp_path)
+        code_parallel, pooled, pooled_blocks, pooled_results = self._drive(
+            monkeypatch, tmp_path, preps, entries, split,
+            name="parallel",
+            budget=budget_mod.Budget(4, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20),
+        )
+
+        assert code_serial == 0 and code_parallel == 0
+        serial_rows = [row["key"] for wave in serial_results for row in wave.records]
+        pooled_rows = [row["key"] for wave in pooled_results for row in wave.records]
+        # Same jobs, whatever order the pool happened to finish them in.
+        assert {job.key for job in pooled} == {job.key for job in serial}
+        # Same order, checked on the job-ordered records rather than the call log.
+        assert pooled_rows == serial_rows
+        # And the job order those records are in is the schedule, not an accident.
+        assert serial_rows == [job.key for job in serial]
+        assert serial_blocks == [None] * len(serial_blocks)
+        assert len(pooled_blocks) == len(pooled)
+        assert all(block and block["concurrent"] for block in pooled_blocks)
+        assert {block["jobs"] for block in pooled_blocks} == {4}
+        assert {block["peak_vms"] for block in pooled_blocks} == {1}
+
+    def test_the_row_block_prices_a_row_and_flags_one_the_budget_cannot_admit(self):
+        """The charge is `peak_vms × vm_memory_mb`; a row that cannot fit beside
+        another is flagged rather than silently admitted."""
+        roomy = budget_mod.Budget(4, peak_vms=12, cores_cap=14, memory_cap_mb=1 << 20)
+        block = runner_mod._scheduler_row_block(
+            roomy, charge_mb=roomy.row_charge_mb(8192)
+        )
+        assert block["charge_mb"] == 12 * 8192
+        assert block["charge_exceeds_budget"] is False
+        assert block["peak_vms"] == 12
+        assert block["slot_wait_s"] == 0.0
+        assert block["budget"]["cap_cores"] == 14
+
+        tight = budget_mod.Budget(4, peak_vms=12, cores_cap=14, memory_cap_mb=1 << 15)
+        tight_block = runner_mod._scheduler_row_block(
+            tight, charge_mb=tight.row_charge_mb(8192)
+        )
+        assert tight_block["charge_exceeds_budget"] is True
+
+    # -- M3 item V7: a row that records no VM memory is not free -----------
+    def test_a_row_that_records_no_vm_memory_is_charged_the_default_vm(self):
+        """V7 — absent ``vm_memory_mb`` prices at the default VM, never at zero.
+
+        ``split.validate`` refuses a recorded size at or below the default, so a
+        row that records nothing boots VMs at ``shuru.DEFAULT_RUN_MEMORY_MB`` all
+        the same. Charging ``peak_vms × 0`` made the least-documented rows the
+        cheapest to admit beside each other, which is the opposite of a
+        conservative scheduler.
+        """
+        assert budget_mod.DEFAULT_VM_MEMORY_MB == shuru_mod.DEFAULT_RUN_MEMORY_MB == 2048
+        budget = budget_mod.Budget(4, peak_vms=12, cores_cap=14, memory_cap_mb=1 << 20)
+        for absent in (None, 0, -1):
+            assert budget.row_charge_mb(absent) == 12 * 2048
+        # A recorded size still prices as itself.
+        assert budget.row_charge_mb(8192) == 12 * 8192
+
+    # -- M3 item X2: a suite-run booking prices an absent size too ---------
+    def test_a_suite_run_that_records_no_vm_memory_is_charged_the_default_vm(self):
+        """X2 — the V7 rule, on the SUITE-RUN reservation rather than the row.
+
+        ``_run_one_vm`` books one VM through ``Budget.slot(memory_mb=...)``; a run
+        with no recorded size passed ``None``, which reserved ``0`` while shuru booted
+        a 2048 MB VM. A concurrent ``prepare`` could therefore run more VMs than the
+        memory cap allowed and report a zero peak. An explicitly supplied value —
+        including the negative one ``_fits`` reads as "do not account memory" — is
+        unchanged.
+        """
+        budget = budget_mod.Budget(4, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20)
+        with budget.slot(memory_mb=None):
+            assert budget.peak_memory_mb == budget_mod.DEFAULT_VM_MEMORY_MB
+        with budget.slot(memory_mb=8192):
+            assert budget.peak_memory_mb == 8192
+        assert budget_mod.DEFAULT_VM_MEMORY_MB == shuru_mod.DEFAULT_RUN_MEMORY_MB
+        # An explicit non-positive value still means "do not account memory".
+        with budget.slot(memory_mb=-1):
+            assert budget.peak_memory_mb == 8192
+
+    # -- M3 item V3: a raise outranks a stop -------------------------------
+    def test_a_stored_worker_raise_outranks_a_stop_in_the_same_phase(
+        self, tmp_path, monkeypatch
+    ):
+        """V3 — a stored worker exception is never converted into an orderly stop.
+
+        A phase's slots are read in job order and the scan for "how the phase
+        ended" stops at the first row that ended it. But a raise and a stop land on
+        *different* rows when two rows are in flight: here row 0 waits for its
+        memory slot and finds the stop file the moment it is admitted — its stop
+        check happens after the wait — while row 1, already past the stop check,
+        raises. Read as one interleaved scan, row 0's ``stopped`` ends the loop
+        before row 1's ``error`` is ever seen, and a row that failed is handed to
+        the caller as a clean ``"stop_file"``. The raise has to win regardless of
+        index.
+
+        Driven through ``_run_jobs_concurrently`` directly: the interleaving is a
+        fact about *where each row is* when the file appears, and no fixture makes
+        that deterministic through ``run_batch``. The two rows get different
+        ``vm_memory_mb`` so the slot hook can tell them apart by charge.
+        """
+        batch_dir = tmp_path / "batch"
+        batch_dir.mkdir(parents=True)
+        jobs = [
+            _job(prep(bug=bug_info(bug_id=1), root=self._tree(tmp_path, "one"), vm_memory_mb=1000)),
+            _job(
+                prep(bug=bug_info(bug_id=2), root=self._tree(tmp_path, "two"), vm_memory_mb=2000),
+                config="b0",
+            ),
+        ]
+        budget = budget_mod.Budget(2, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20)
+        in_the_slot_for_row_zero = threading.Event()
+        stop_created = threading.Event()
+        row_one_raised = threading.Event()
+        real_slot = budget_mod.Budget.slot
+
+        @contextmanager
+        def hooked_slot(self, *, memory_mb=None, cores=1):
+            if memory_mb == budget.row_charge_mb(1000):
+                # Row 0: hold it BEFORE it takes the slot, so it is already inside
+                # the `try` — past every stop check — when the file appears.
+                in_the_slot_for_row_zero.set()
+                assert stop_created.wait(timeout=10)
+            with real_slot(self, memory_mb=memory_mb, cores=cores):
+                yield
+
+        monkeypatch.setattr(budget_mod.Budget, "slot", hooked_slot)
+
+        def stub(
+            *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
+            scheduler=None,
+        ):
+            # Row 1: only once row 0 is committed to the wait, raise.
+            assert in_the_slot_for_row_zero.wait(timeout=10)
+            row_one_raised.set()
+            raise RuntimeError("worker exploded")
+
+        monkeypatch.setattr(runner_mod, "run_job", stub)
+        stop_file = runner_mod.queue_stop_path(batch_dir)
+
+        def create_the_stop_once_the_row_has_raised() -> None:
+            assert row_one_raised.wait(timeout=10)
+            stop_file.write_text("", encoding="utf-8")
+            stop_created.set()
+
+        watcher = threading.Thread(target=create_the_stop_once_the_row_has_raised)
+        watcher.start()
+        try:
+            with pytest.raises(RuntimeError, match="worker exploded"):
+                runner_mod._run_jobs_concurrently(
+                    jobs=jobs,
+                    budget=budget,
+                    paths=runner_mod.BatchPaths.under(batch_dir),
+                    batch_dir=batch_dir,
+                    manifest=manifest_mod.Manifest(batch_dir),
+                    vanta_bin=Path("/nonexistent/vanta_m3"),
+                    max_attempts=1,
+                    disk_mb=8192,
+                    checkpoint_pythons={"chk": "3.8.20"},
+                    spend_gate=None,
+                    stop_file=stop_file,
+                    pause_usd=None,
+                    preflight=None,
+                )
+        finally:
+            stop_created.set()
+            watcher.join()
+
+
+class TestHostProbes:
+    """M3 item V4 — a host probe is best-effort and must not be able to raise.
+
+    ``host_used_memory_mb`` and ``host_live_vm_count`` decode a subprocess' output.
+    A byte that is not valid UTF-8 makes ``text=True`` raise ``UnicodeDecodeError``
+    — a ``ValueError``, which their ``except (OSError, subprocess.SubprocessError)``
+    does not catch — so the sampler's thread would die on the first such byte
+    instead of recording a missing sample. ``errors="replace"`` is what keeps the
+    contract of both probes: they return a number or ``None``, never raise.
+    """
+
+    @staticmethod
+    def _fake_run(monkeypatch, stdout: bytes, *, returncode=0) -> None:
+        """A ``subprocess.run`` that decodes its bytes the way the CALLER asked.
+
+        Strict decoding raises ``UnicodeDecodeError`` here exactly as it would on a
+        real host, so a probe that forgets ``errors="replace"`` fails the test
+        rather than a batch.
+        """
+
+        def run(argv, **kwargs):
+            text = kwargs.get("text") or kwargs.get("universal_newlines")
+            out: Any = stdout
+            if text:
+                out = stdout.decode("utf-8", errors=kwargs.get("errors", "strict"))
+            return subprocess.CompletedProcess(argv, returncode, stdout=out, stderr="")
+
+        monkeypatch.setattr(budget_mod.subprocess, "run", run)
+
+    def test_vm_stat_survives_a_byte_that_is_not_utf8(self, monkeypatch):
+        self._fake_run(
+            monkeypatch,
+            b"\xff\xfe page size of 4096 bytes\n"
+            b'"Anonymous pages":               300000.\n',
+        )
+        assert budget_mod.host_used_memory_mb() == 300000 * 4096 // (1024 * 1024)
+
+    def test_ps_survives_a_byte_that_is_not_utf8(self, monkeypatch):
+        self._fake_run(
+            monkeypatch,
+            b"\xff\xfe /usr/local/bin/shuru run --from chk\n"
+            b"/usr/bin/other --process\n",
+        )
+        assert budget_mod.host_live_vm_count() == 1
+
+
 class TestQueue:
     """M3 item 13 — the multi-bug queue: one owner, a shared cap, a stop, a resume.
 
@@ -25028,7 +33474,10 @@ class TestQueue:
     def _stub(self, calls, *, cost_usd=None, on_call=None):
         """A `run_job` that writes a gate-passing row and records the claim."""
 
-        def stub(*, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version):
+        def stub(
+            *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
+            scheduler=None,
+        ):
             calls.append(job)
             if on_call is not None:
                 on_call(len(calls), job, manifest)
@@ -25060,6 +33509,8 @@ class TestQueue:
         waves=(1,),
         arm_spellings=None,
         max_spend_usd=None,
+        pause_usd=None,
+        seed_major=False,
     ):
         return runner_mod.run_queue(
             batch_dir=batch_dir,
@@ -25074,6 +33525,8 @@ class TestQueue:
             max_attempts=None,
             disk_mb=8192,
             max_spend_usd=max_spend_usd,
+            pause_usd=pause_usd,
+            seed_major=seed_major,
             arm_spellings=arm_spellings,
         )
 
@@ -25255,6 +33708,199 @@ class TestQueue:
         )
         assert len(set(keys)) == 6, "3 bugs × 2 seeds, all reached across the two runs"
         assert {job.key for job in resumed_calls} == set(keys) - set(first_keys)
+
+    # -- Phase 3, the pause -----------------------------------------------
+    def test_the_pause_stops_the_queue_and_the_resume_finishes_it(
+        self, tmp_path, monkeypatch
+    ):
+        """The queue's pause: a stop it raises itself, told apart from an operator's.
+
+        The pause is checked before the *next* claim, so the row already written
+        stays complete; it writes STOP, so the resume is the stop file's own
+        gesture; `pause.json` is the disarm marker, so the re-run finishes the
+        queue instead of pausing on its first claim; and the outcome says `pause`
+        rather than `stop_file`, so the batch's own budget event is never reported
+        as an operator's stop.
+        """
+        batch_dir = tmp_path / "batch"
+        preps, entries, split, _calls = self._prepare(
+            monkeypatch, tmp_path, count=3, cost_usd=0.6
+        )
+
+        code, outcomes = self._run(preps, entries, split, batch_dir, jobs=1, pause_usd=0.5)
+        assert code == 1, "a paused queue must not report success"
+        assert "pause" in [outcome.reason for outcome in outcomes], (
+            "the pause's own STOP must read as `pause`, not an operator's `stop_file`"
+        )
+        stop = runner_mod.queue_stop_path(batch_dir)
+        assert stop.exists()
+        assert len(manifest_mod.Manifest(batch_dir).records()) == 1, (
+            "the pause leaves exactly the row that crossed the threshold"
+        )
+        pause = json.loads(
+            (batch_dir / runner_mod.SPEND_PAUSE_NAME).read_text(encoding="utf-8")
+        )
+        assert pause["reason"] == "pause"
+        assert pause["spent_usd"] == 0.6
+
+        stop.unlink()
+        code2, outcomes2 = self._run(
+            preps, entries, split, batch_dir, jobs=1, pause_usd=0.5
+        )
+        assert code2 == 0, "the resumed queue completes"
+        assert [outcome.reason for outcome in outcomes2] == ["", "", ""]
+        assert not stop.exists(), "the pause is one-shot: it must not write STOP again"
+        keys = [record["key"] for record in manifest_mod.Manifest(batch_dir).records()]
+        assert len(keys) == len(set(keys)) == 3, (
+            "a resume must finish the unstarted bugs and re-run no finished one"
+        )
+
+    def test_the_cap_counts_the_spend_across_the_pause_not_from_zero(
+        self, tmp_path, monkeypatch
+    ):
+        """The resume's spend comes from the batch's rows, so the cap still holds.
+
+        First run: one bug at $0.60 with pause $0.50 and cap $1.00 → the pause
+        fires with $0.60 already spent. Delete STOP and re-run the same command:
+        the second bug is admitted on the *remaining* $0.40 (the batch has not
+        forgotten the $0.60), it spends its own $0.60, and the third bug is refused
+        at the cap with $1.20 on the record. A resume that counted from zero would
+        have admitted the third bug and overshot the cap.
+        """
+        batch_dir = tmp_path / "batch"
+        preps, entries, split, _calls = self._prepare(
+            monkeypatch, tmp_path, count=3, cost_usd=0.6
+        )
+
+        code, outcomes = self._run(
+            preps, entries, split, batch_dir, jobs=1, max_spend_usd=1.0, pause_usd=0.5
+        )
+        assert code == 1
+        assert "pause" in [outcome.reason for outcome in outcomes]
+        assert not (batch_dir / runner_mod.SPEND_CAP_NAME).exists(), "the pause came first"
+
+        runner_mod.queue_stop_path(batch_dir).unlink()
+        code2, outcomes2 = self._run(
+            preps, entries, split, batch_dir, jobs=1, max_spend_usd=1.0, pause_usd=0.5
+        )
+        assert code2 == 1
+        assert "spend_cap" in [outcome.reason for outcome in outcomes2], (
+            "the cap stops the bug after the pause"
+        )
+        spend = json.loads(
+            (batch_dir / runner_mod.SPEND_CAP_NAME).read_text(encoding="utf-8")
+        )
+        assert spend["reason"] == "spend_cap"
+        assert spend["spent_usd"] == 1.2, (
+            "the $0.60 spent before the pause is still on the batch's record"
+        )
+        assert len(manifest_mod.Manifest(batch_dir).records()) == 2, (
+            "the third bug is refused before it writes a row"
+        )
+
+    # -- item T4, the seed-major claim order ------------------------------
+    def test_seed_major_claims_a_whole_seed_column_before_the_next(
+        self, tmp_path, monkeypatch
+    ):
+        """Phase 3's ordering: every bug's seed 0 precedes any bug's seed 1.
+
+        The claim sequence becomes ``wave × seed × bug`` so a pause or an operator's
+        stop leaves a COMPLETE seed column rather than a diagonal through it. Only
+        the order in which rows are claimed moves — the rows written are still one
+        per (bug, seed), and the default stays ``wave × bug``.
+        """
+        preps, entries, split, calls = self._prepare(
+            monkeypatch, tmp_path, count=3, seeds=(0, 1)
+        )
+        code, outcomes = self._run(
+            preps,
+            entries,
+            split,
+            tmp_path / "batch",
+            jobs=1,
+            seeds=[0, 1],
+            seed_major=True,
+        )
+        assert code == 0
+        assert [outcome.reason for outcome in outcomes] == [""] * 6
+        assert [job.seed for job in calls] == [0, 0, 0, 1, 1, 1], (
+            "with --seed-major all of seed 0 is claimed before seed 1 begins"
+        )
+        assert {job.bug for job in calls} == {p.key for p in preps}, (
+            "the flag reorders claims; it must not change which bugs run"
+        )
+        assert len(manifest_mod.Manifest(tmp_path / "batch").records()) == 6
+
+        # The default is the queue every dev run used: still `wave × bug`, so a
+        # single bug's seeds are adjacent rather than a whole column at a time.
+        default_preps, default_entries, default_split, default_calls = self._prepare(
+            monkeypatch, tmp_path, count=3, seeds=(0, 1)
+        )
+        self._run(
+            default_preps,
+            default_entries,
+            default_split,
+            tmp_path / "batch-default",
+            jobs=1,
+            seeds=[0, 1],
+        )
+        assert [job.seed for job in default_calls] == [0, 1, 0, 1, 0, 1], (
+            "without the flag each bug's seeds stay adjacent — unchanged"
+        )
+
+    def test_a_pause_under_seed_major_leaves_a_whole_seed_column_and_resumes(
+        self, tmp_path, monkeypatch
+    ):
+        """Item T4's point: the pause lands on a seed boundary, not a diagonal.
+
+        With ``--seed-major`` seed 0's three bugs are claimed, and their rows
+        written, before any bug's seed 1. A pause at that boundary therefore leaves
+        seed 0 complete; deleting STOP and re-running writes only seed 1, and no key
+        is written twice. The $0.20 rows against a $0.50 threshold cross the pause
+        exactly at the boundary (three rows = $0.60).
+        """
+        batch_dir = tmp_path / "batch"
+        preps, entries, split, _calls = self._prepare(
+            monkeypatch, tmp_path, count=3, seeds=(0, 1), cost_usd=0.2
+        )
+        code, outcomes = self._run(
+            preps,
+            entries,
+            split,
+            batch_dir,
+            jobs=1,
+            seeds=[0, 1],
+            pause_usd=0.5,
+            seed_major=True,
+        )
+        assert code == 1, "a paused queue must not report success"
+        assert "pause" in [outcome.reason for outcome in outcomes]
+        rows = manifest_mod.Manifest(batch_dir).records()
+        assert sorted(row["seed"] for row in rows) == [0, 0, 0], (
+            "the pause must leave the whole seed-0 column, not a diagonal"
+        )
+        assert len(rows) == 3, "and only that column — seed 1 was never claimed"
+
+        runner_mod.queue_stop_path(batch_dir).unlink()
+        code2, outcomes2 = self._run(
+            preps,
+            entries,
+            split,
+            batch_dir,
+            jobs=1,
+            seeds=[0, 1],
+            pause_usd=0.5,
+            seed_major=True,
+        )
+        assert code2 == 0, "the resumed queue completes"
+        assert [outcome.reason for outcome in outcomes2] == [""] * 6, (
+            "seed 0's rows are skipped as done and seed 1's three run — six claims, "
+            "no stop"
+        )
+        keys = [record["key"] for record in manifest_mod.Manifest(batch_dir).records()]
+        assert len(keys) == len(set(keys)) == 6, (
+            "3 bugs × 2 seeds, all reached across the two runs and none written twice"
+        )
 
     # -- the shared spend cap ---------------------------------------------
     def test_the_spend_cap_is_read_from_the_manifest_not_one_worker_s_counter(
@@ -25801,6 +34447,30 @@ class TestQueue:
             "a recorded zero IS a bound — the local backend prices nothing"
         )
 
+    def test_a_zero_call_row_costs_zero_and_a_called_row_with_no_price_is_a_hole(self):
+        """M3 item F — `calls == 0` makes the absent `cost_usd` a measurement.
+
+        The pipeline writes `cost_usd=unset` (→ `None`) for "nothing was priced".
+        A review row that only reused a candidate priced nothing because it asked
+        nothing, and six such rows sat in the m3 smoke as "unknown spend". A row
+        that DID call and priced nothing is still a hole: the cost exists and was
+        not recorded.
+        """
+        # Zero calls ⇒ $0.00, measured — however the absent field is spelled.
+        assert runner_mod._row_cost({"llm": {"calls": 0}}) == 0.0
+        assert runner_mod._row_cost({"llm": {"calls": 0, "cost_usd": None}}) == 0.0
+        assert runner_mod._row_cost({"llm": {"calls": 0, "cost_usd": "unset"}}) == 0.0
+        # Calls were made ⇒ the absent price is a hole, not zero.
+        assert runner_mod._row_cost({"llm": {"calls": 3}}) is None
+        assert runner_mod._row_cost({"llm": {"calls": 4, "cost_usd": None}}) is None
+        assert runner_mod._row_cost({"llm": {"calls": 1, "cost_usd": "unset"}}) is None
+        # No call count at all is still a hole — the old, conservative reading.
+        assert runner_mod._row_cost({"llm": {"cost_basis": "test/tier/2026-10-26"}}) is None
+        # A recorded price always wins over the call count.
+        assert runner_mod._row_cost({"llm": {"calls": 0, "cost_usd": 0.25}}) == 0.25
+        # A bool is never a number (True == 1 would otherwise read as one call).
+        assert runner_mod._row_cost({"llm": {"calls": True}}) is None
+
     def test_a_resumed_batch_over_costless_rows_still_runs_one_job_at_a_time(
         self, tmp_path, monkeypatch
     ):
@@ -25998,7 +34668,725 @@ class TestQueue:
 
     def test_an_empty_arms_or_seeds_flag_means_the_split_s_own(self):
         assert run_mod._parse_arms("") is None
+        assert run_mod._parse_arms([]) is None
         assert run_mod._parse_seeds("  ") is None
+
+    def test_a_repeated_arms_flag_accumulates_every_value(self):
+        """M3 item G — a second `--arms` must add to the first, not replace it.
+
+        The flag silently kept only its last value before, so a scheduled arm was
+        dropped from a smoke run without a word.
+        """
+        args = run_mod.build_parser().parse_args(
+            [
+                "queue",
+                "--batch",
+                "/tmp/x",
+                "--arms",
+                "b1-k4",
+                "--arms",
+                "b3-k4",
+            ]
+        )
+        assert args.arms == ["b1-k4", "b3-k4"]
+        assert run_mod._parse_arms(args.arms) == ["b1-k4", "b3-k4"]
+        # Each repeated value may itself be a comma/space list, and the older
+        # single `--arms a,b` spelling is unchanged.
+        assert run_mod._parse_arms(["b1-k4, b3-k4"]) == ["b1-k4", "b3-k4"]
+        assert run_mod._parse_arms(["b1-k4 b3-k4", "vanta"]) == [
+            "b1-k4",
+            "b3-k4",
+            "vanta",
+        ]
+
+    # -- M3 item S6: the invocation's ONE scheduler ------------------------
+    def test_the_run_command_defaults_to_one_job_and_twelve_peak_vms(self):
+        args = run_mod.build_parser().parse_args(["run", "--batch", "/tmp/x"])
+        assert args.jobs == 1
+        assert args.peak_vms == budget_mod.DEFAULT_PEAK_VMS
+
+    def test_jobs_above_one_is_refused_on_a_non_hosted_backend(self):
+        """§14.33 — parallel rows all call one provider, so only the hosted backend
+        may run them; the refusal names the flag and the backend it saw."""
+        args = SimpleNamespace(jobs=4, peak_vms=12)
+        with pytest.raises(runner_mod.RunnerError, match="VANTA_LLM_BACKEND=openai"):
+            run_mod.row_budget(args, {}, flag="--jobs")
+        with pytest.raises(runner_mod.RunnerError, match="VANTA_LLM_BACKEND=local"):
+            run_mod.row_budget(args, {"VANTA_LLM_BACKEND": "local"}, flag="--jobs")
+
+    def test_jobs_above_one_is_allowed_on_the_hosted_backend(self):
+        args = SimpleNamespace(jobs=4, peak_vms=12)
+        budget = run_mod.row_budget(
+            args, {"VANTA_LLM_BACKEND": "openai"}, flag="--jobs"
+        )
+        assert budget.jobs == 4
+        assert budget.peak_vms == 12
+
+    def test_row_budget_refuses_a_job_count_below_one(self):
+        """The scheduler, not the queue's own guard: ``run --jobs 0`` must be refused
+        by ``row_budget`` before it can build a pool (the queue path has its own test)."""
+        args = SimpleNamespace(jobs=0, peak_vms=12)
+        with pytest.raises(runner_mod.RunnerError, match="at least 1"):
+            run_mod.row_budget(args, {"VANTA_LLM_BACKEND": "openai"}, flag="--jobs")
+
+    def test_jobs_one_needs_no_backend_and_says_nothing(self, capsys):
+        """The serial path is not announced: `--jobs 1` must read like today."""
+        args = SimpleNamespace(jobs=1, peak_vms=12)
+        budget = run_mod.row_budget(args, {}, flag="--jobs")
+        assert budget.jobs == 1
+        assert budget.concurrent is False
+        assert capsys.readouterr().out == ""
+
+
+class _PipelineSplit:
+    """A `Split` with only the fields `_queue_pipeline` reads, so no split file is
+    needed. ``bugs`` are the entry dicts ``select`` walks; ``configs``/``seeds`` are
+    the protocol the queue refuses to widen."""
+
+    def __init__(self, bugs, *, configs=("b0",), seeds=(0,), commit="c0ffee"):
+        self.bugs = list(bugs)
+        self.configs = list(configs)
+        self.seeds = list(seeds)
+        self.bugsinpy_root = "runs/bugsinpy"
+        self.bugsinpy_commit = commit
+
+
+def _pipeline_entry(project: str, bug_id: int, *, wave: int = 1, role: str = "pilot") -> dict:
+    return {
+        "project": project,
+        "bug_id": bug_id,
+        "wave": wave,
+        "role": role,
+        "checkpoint": f"chk-{project}-{bug_id}".lower(),
+        "python_version": "3.8.20",
+        "test_file": "tests/test_mod.py",
+    }
+
+
+def _append_row(batch_dir, key: str) -> None:
+    """Stand in for the row ``runner._run_task`` writes, so the pipeline's row-count
+    guard (one row per selected bug) has a row to count for a bug that ran."""
+    manifest_mod.Manifest(Path(batch_dir)).append({"key": f"#test#{key}", "bug": key})
+
+
+def _fake_prep(entry: dict, *, runnable: bool = True, issue=None, gate_failures=()) -> SimpleNamespace:
+    key = f"{entry['project']}/{entry['bug_id']}"
+    return SimpleNamespace(
+        key=key,
+        slug=key.replace("/", "-"),
+        runnable=runnable,
+        issue=issue,
+        gate_failures=list(gate_failures),
+        wave=entry["wave"],
+        checkpoint=entry["checkpoint"],
+        python_version=entry["python_version"],
+    )
+
+
+class TestPipelineQueue:
+    """M3 item AA4 — ``queue --pipeline`` prepares each bug, then starts its rows.
+
+    The serial shape is ``prepare`` for the whole split, then ``queue``: a bug's
+    rows wait for every other bug's prepare. The pipeline folds the two stages into
+    one command and starts a bug's rows the moment that bug's prepare is frozen.
+
+    ``prepare_one_bug`` and ``runner._run_task`` are replaced, so no VM boots and
+    **nothing is prepared**: what is under test is the schedule — one budget, one
+    gate, waves sequential, a bug's rows gated on that bug's own prepare — and that
+    the command reads no ``prepare.json`` because it is the thing that writes one.
+    """
+
+    # -- fixture -----------------------------------------------------------
+    @staticmethod
+    def _args(batch: Path, *extra: str):
+        return run_mod.build_parser().parse_args(["queue", "--batch", str(batch), *extra])
+
+    @staticmethod
+    def _default_prepare(events, *, broken=(), not_runnable=()):
+        def stub(**kwargs):
+            entry = kwargs["entry"]
+            key = f"{entry['project']}/{entry['bug_id']}"
+            if key in broken:
+                events.append(("prepare-broken", key))
+                return "broken", (key, "a prepare error")
+            events.append(("prepare", key))
+            return "prep", _fake_prep(entry, runnable=key not in not_runnable)
+
+        return stub
+
+    @staticmethod
+    def _default_run(events, capture):
+        def stub(*, wave, prep, stop_file, **kwargs):
+            capture.append(kwargs)
+            events.append(("run", prep.key))
+            return runner_mod.QueueOutcome(wave=wave, bug=prep.key, code=0)
+
+        return stub
+
+    def _drive(
+        self,
+        monkeypatch,
+        tmp_path,
+        split,
+        *,
+        extra=(),
+        prepare=None,
+        run=None,
+        events=None,
+        capture=None,
+        manifest=None,
+    ):
+        """Run ``_queue_pipeline`` with every external effect replaced."""
+        batch_dir = tmp_path / "batch"
+        events = [] if events is None else events
+        capture = [] if capture is None else capture
+        monkeypatch.setattr(
+            run_mod.meta_mod, "ensure_clone", lambda root, commit=None: commit
+        )
+        monkeypatch.setattr(
+            run_mod.context_mod,
+            "explicit_context_window",
+            lambda **kwargs: (262144, "test"),
+        )
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+        monkeypatch.setattr(runner_mod, "require_vanta_bin", lambda path: path)
+        monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: None)
+        monkeypatch.setattr(run_mod.prepare_mod, "missing_checkpoints", lambda cps: [])
+        monkeypatch.setattr(run_mod.bake_mod, "missing_deps", lambda d, cps: [])
+        monkeypatch.setattr(run_mod.bake_mod, "unstamped_deps", lambda d, cps: [])
+        monkeypatch.setattr(
+            run_mod.prepare_mod, "IssueSources", lambda **kwargs: object()
+        )
+        for name in (
+            "write_leak_gate",
+            "write_issue_texts",
+            "write_context_sizes",
+            "write_signals",
+            "write_context_report",
+        ):
+            monkeypatch.setattr(run_mod.prepare_mod, name, lambda *a, **k: None)
+        monkeypatch.setattr(
+            run_mod.prepare_mod, "render_summary", lambda *a, **k: "summary"
+        )
+        monkeypatch.setattr(
+            run_mod.prepare_mod, "render_context_table", lambda preps: ""
+        )
+        monkeypatch.setattr(
+            run_mod.prepare_mod,
+            "prepare_manifest",
+            manifest or (lambda **kwargs: {"stub": True}),
+        )
+        monkeypatch.setattr(run_mod.split_mod, "sha256_file", lambda path: "a" * 64)
+        monkeypatch.setattr(
+            runner_mod,
+            "write_batch_report",
+            lambda _batch, records=None, **k: (None, {"runs": len(records or [])}),
+        )
+        monkeypatch.setattr(runner_mod, "render_digest", lambda payload: "")
+        # No host sampler thread: --prepare-jobs > 1 would otherwise really sample.
+        monkeypatch.setattr(run_mod, "_start_host_sampler", lambda *a, **k: None)
+
+        monkeypatch.setattr(
+            run_mod, "prepare_one_bug", prepare or self._default_prepare(events)
+        )
+        run_impl = run or self._default_run(events, capture)
+
+        def _run_with_row(*, wave, prep, stop_file, **kwargs):
+            # `runner._run_task` writes the bug's row(s) before it returns, and the
+            # pipeline's row-count guard counts them: the stub has to write too, or
+            # every successful batch would look like it dropped every bug.
+            outcome = run_impl(wave=wave, prep=prep, stop_file=stop_file, **kwargs)
+            _append_row(kwargs["batch_dir"], prep.key)
+            return outcome
+
+        monkeypatch.setattr(runner_mod, "_run_task", _run_with_row)
+
+        code = run_mod._queue_pipeline(
+            self._args(batch_dir, *extra),
+            split=split,
+            config_block={},
+            frozen_env={},
+            # `--jobs > 1` needs the hosted backend (§14.33); the tests that use two
+            # rows would otherwise be refused before anything is scheduled.
+            invocation_env={"VANTA_LLM_BACKEND": "openai"},
+            fixed_rounds_declaration=None,
+            attempts_declaration=None,
+        )
+        return code, batch_dir, events, capture
+
+    # -- the point of the item: rows start per bug -------------------------
+    def test_a_bugs_rows_start_before_a_slower_bugs_prepare_finishes(
+        self, tmp_path, monkeypatch
+    ):
+        """B's rows run while A is still preparing; A finishes only because they do.
+
+        A's prepare blocks on an event that B's *run* sets. If the queue waited for
+        A's prepare before it claimed B's rows (submission order), A would block
+        until the wait timed out and the batch would fail — so the successful order
+        is itself the proof that rows are claimed as each prepare completes.
+        """
+        gate = threading.Event()
+        events: list = []
+        split = _PipelineSplit([_pipeline_entry("A", 1), _pipeline_entry("B", 2)])
+
+        def prepare(**kwargs):
+            key = f"{kwargs['entry']['project']}/{kwargs['entry']['bug_id']}"
+            events.append(("prepare-start", key))
+            if key == "A/1":
+                assert gate.wait(timeout=10), (
+                    "B's rows never ran, so A's slow prepare could never finish: the "
+                    "queue is still claiming rows in prepare-submission order"
+                )
+            events.append(("prepare-end", key))
+            return "prep", _fake_prep(kwargs["entry"])
+
+        def run(*, wave, prep, stop_file, **kwargs):
+            events.append(("run", prep.key))
+            if prep.key == "B/2":
+                gate.set()
+            return runner_mod.QueueOutcome(wave=wave, bug=prep.key, code=0)
+
+        code, _batch, events, _capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--prepare-jobs", "2", "--jobs", "2"),
+            prepare=prepare,
+            run=run,
+            events=events,
+        )
+        assert code == run_mod.EXIT_OK
+        assert events.index(("run", "B/2")) < events.index(("prepare-end", "A/1"))
+
+    # -- one scheduler, one gate (S5 + S6 + G1) ----------------------------
+    def test_every_bug_of_the_wave_shares_one_budget_and_one_spend_gate(
+        self, tmp_path, monkeypatch
+    ):
+        split = _PipelineSplit([_pipeline_entry("A", 1), _pipeline_entry("B", 2)])
+        code, _batch, _events, capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--prepare-jobs", "2"),
+        )
+        assert code == run_mod.EXIT_OK
+        assert len(capture) == 2, "one row-task per bug"
+        assert len({id(kwargs["budget"]) for kwargs in capture}) == 1, (
+            "one budget for the whole invocation"
+        )
+        assert len({id(kwargs["spend_gate"]) for kwargs in capture}) == 1, (
+            "one spend gate for the whole batch (G1)"
+        )
+
+    def test_the_scheduler_is_as_wide_as_the_wider_of_the_two_flags(
+        self, tmp_path, monkeypatch
+    ):
+        """``--prepare-jobs 5`` with ``--jobs 1`` still gates five suite runs."""
+        split = _PipelineSplit([_pipeline_entry("A", 1)])
+        _code, _batch, _events, capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--prepare-jobs", "5"),
+        )
+        assert capture[0]["budget"].jobs == 5
+
+    # -- waves stay sequential (§8.1) --------------------------------------
+    def test_wave_two_does_not_start_until_wave_one_has_finished(
+        self, tmp_path, monkeypatch
+    ):
+        split = _PipelineSplit(
+            [
+                _pipeline_entry("A", 1, wave=1),
+                _pipeline_entry("B", 2, wave=1),
+                _pipeline_entry("C", 3, wave=2),
+            ]
+        )
+        events: list = []
+        code, _batch, events, _capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--prepare-jobs", "2", "--jobs", "2"),
+            events=events,
+        )
+        assert code == run_mod.EXIT_OK
+        wave_one = [
+            index
+            for index, event in enumerate(events)
+            if event[0] == "run" and event[1] in ("A/1", "B/2")
+        ]
+        assert max(wave_one) < events.index(("run", "C/3"))
+
+    # -- item T4: `--pipeline` honours `--seed-major` ----------------------
+    def test_seed_major_under_the_pipeline_prepares_the_wave_then_claims_seed_by_seed(
+        self, tmp_path, monkeypatch
+    ):
+        """Phase 3 runs ``queue --pipeline --seed-major``: the whole wave is
+        prepared first (seed 0 has to cover every bug before seed 1 starts), and
+        the rows are then claimed one seed at a time — every bug's seed 0, then
+        every bug's seed 1. Without the flag each bug's rows start the moment its
+        own prepare finishes, which is the point of the pipeline.
+
+        Only the claim order moves: the rows written are still one per
+        ``(bug, seed)``, claimed through the same ``runner._run_task`` unit.
+        """
+        split = _PipelineSplit(
+            [_pipeline_entry("A", 1), _pipeline_entry("B", 2), _pipeline_entry("C", 3)],
+            seeds=(0, 1),
+        )
+        events: list = []
+        claims: list = []
+
+        def run(*, wave, prep, stop_file, **kwargs):
+            claims.append((kwargs["seeds"][0], prep.key))
+            events.append(("run", prep.key))
+            return runner_mod.QueueOutcome(wave=wave, bug=prep.key, code=0)
+
+        code, _batch, events, _capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--seed-major", "--prepare-jobs", "3"),
+            run=run,
+            events=events,
+        )
+        assert code == run_mod.EXIT_OK
+        runs = [index for index, event in enumerate(events) if event[0] == "run"]
+        prepares = [
+            index for index, event in enumerate(events) if event[0] == "prepare"
+        ]
+        assert max(prepares) < min(runs), (
+            "with --seed-major no row is claimed until EVERY bug of the wave is "
+            "prepared: seed 0 has to cover the whole wave before seed 1 starts"
+        )
+        assert claims == [
+            (0, "A/1"), (0, "B/2"), (0, "C/3"),
+            (1, "A/1"), (1, "B/2"), (1, "C/3"),
+        ], "all bugs for seed 0, then all bugs for seed 1"
+
+    def test_without_seed_major_the_pipeline_claims_each_bug_in_one_go(
+        self, tmp_path, monkeypatch
+    ):
+        """The pipeline's own shape is unchanged when the flag is absent: one row
+        stage per bug covering all of the split's seeds, started as soon as that
+        bug's prepare finishes — no seed column, and no waiting for the wave."""
+        split = _PipelineSplit(
+            [_pipeline_entry("A", 1), _pipeline_entry("B", 2)], seeds=(0, 1)
+        )
+        scopes: list = []
+
+        def run(*, wave, prep, stop_file, **kwargs):
+            scopes.append((prep.key, tuple(kwargs["seeds"])))
+            return runner_mod.QueueOutcome(wave=wave, bug=prep.key, code=0)
+
+        code, _batch, _events, _capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--prepare-jobs", "2"),
+            run=run,
+        )
+        assert code == run_mod.EXIT_OK
+        assert sorted(scopes) == [("A/1", (0, 1)), ("B/2", (0, 1))], (
+            "without --seed-major a bug's rows run in one task over all seeds"
+        )
+
+    def test_a_seed_major_pipeline_pause_leaves_a_whole_seed_column_and_resumes(
+        self, tmp_path, monkeypatch
+    ):
+        """Item T4 under the pipeline: the pause lands on a seed boundary.
+
+        Seed 0's three bugs are prepared and claimed first, so a pause after that
+        column leaves it complete and no bug's seed 1 is claimed. Deleting STOP and
+        re-running the same command claims only seed 1, and no ``(bug, seed)`` is
+        claimed twice. ``queue --pipeline --seed-major`` is the Phase 3 command, so
+        this is the shape that has to hold.
+
+        The spend/pause machinery itself (`pause.json` as the one-shot marker,
+        STOP as the resume gesture) is `runner`'s and is exercised in ``TestQueue``;
+        what is on trial here is that the pipeline's seed-major claim loop stops at
+        the boundary and resumes from it.
+        """
+        batch_dir = tmp_path / "batch"
+        split = _PipelineSplit(
+            [_pipeline_entry("A", 1), _pipeline_entry("B", 2), _pipeline_entry("C", 3)],
+            seeds=(0, 1),
+        )
+        state = {"done": set(), "spent": 0.0}
+        ran: list = []
+
+        def make_run():
+            def run(*, wave, prep, stop_file, **kwargs):
+                seed = kwargs["seeds"][0]
+                if stop_file.exists():
+                    return runner_mod.QueueOutcome(
+                        wave=wave, bug=prep.key, code=1, reason="stop_file"
+                    )
+                if (seed, prep.key) in state["done"]:
+                    return runner_mod.QueueOutcome(wave=wave, bug=prep.key, code=0)
+                pause = runner_mod.SPEND_PAUSE_NAME
+                if not (batch_dir / pause).exists() and state["spent"] >= 0.5:
+                    # `_record_spend_pause`, in miniature: the disarm marker first,
+                    # then the stop file whose first line marks it as the pause's.
+                    (batch_dir / pause).write_text("{}\n", encoding="utf-8")
+                    stop_file.parent.mkdir(parents=True, exist_ok=True)
+                    stop_file.write_text(
+                        f"{runner_mod.PAUSE_STOP_LINE}\n", encoding="utf-8"
+                    )
+                    return runner_mod.QueueOutcome(
+                        wave=wave, bug=prep.key, code=1, reason="pause"
+                    )
+                state["done"].add((seed, prep.key))
+                state["spent"] += 0.2
+                ran.append((seed, prep.key))
+                return runner_mod.QueueOutcome(wave=wave, bug=prep.key, code=0)
+
+            return run
+
+        code, _batch, _events, _capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--seed-major", "--prepare-jobs", "3", "--jobs", "1"),
+            run=make_run(),
+        )
+        assert code == 1, "a paused pipeline must not report success"
+        assert ran == [(0, "A/1"), (0, "B/2"), (0, "C/3")], (
+            "the pause must leave the whole seed-0 column, not a diagonal"
+        )
+        assert runner_mod.queue_stop_path(batch_dir).exists()
+        assert not any(seed == 1 for seed, _key in ran), "seed 1 was never claimed"
+
+        runner_mod.queue_stop_path(batch_dir).unlink()
+        code2, _batch, _events, _capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--seed-major", "--prepare-jobs", "3", "--jobs", "1"),
+            run=make_run(),
+        )
+        assert code2 == run_mod.EXIT_OK, "the resumed pipeline completes"
+        assert ran[3:] == [(1, "A/1"), (1, "B/2"), (1, "C/3")], (
+            "the resume claims only seed 1"
+        )
+        assert len(ran) == len(set(ran)) == 6, (
+            "3 bugs × 2 seeds, each claimed exactly once across the two runs"
+        )
+
+    # -- the record the command leaves -------------------------------------
+    def test_the_batch_writes_prepare_json_once_for_the_whole_pipeline(
+        self, tmp_path, monkeypatch
+    ):
+        captured: dict = {}
+
+        def manifest(**kwargs):
+            captured.update(kwargs)
+            return {"stub": True}
+
+        split = _PipelineSplit([_pipeline_entry("A", 1), _pipeline_entry("B", 2)])
+        code, batch_dir, _events, _capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--prepare-jobs", "2"),
+            manifest=manifest,
+        )
+        assert code == run_mod.EXIT_OK
+        assert (batch_dir / "prepare.json").exists(), (
+            "the pipeline prepares, so it must write the batch's prepare.json"
+        )
+        assert captured["selected"] == ["A/1", "B/2"], "selection in file order"
+        assert captured["broken"] == []
+
+    # -- exit codes --------------------------------------------------------
+    def test_a_bug_that_cannot_prepare_fails_the_batch_and_runs_no_rows(
+        self, tmp_path, monkeypatch
+    ):
+        split = _PipelineSplit([_pipeline_entry("A", 1), _pipeline_entry("B", 2)])
+        events: list = []
+        prepare = self._default_prepare(events, broken={"B/2"})
+        code, _batch, events, _capture = self._drive(
+            monkeypatch, tmp_path, split, extra=("--pipeline",),
+            prepare=prepare, events=events,
+        )
+        assert code == run_mod.EXIT_BUG_FAILED
+        assert [event for event in events if event[0] == "run"] == [("run", "A/1")]
+
+    def test_a_bug_that_does_not_prepare_fails_the_batch(self, tmp_path, monkeypatch):
+        split = _PipelineSplit([_pipeline_entry("A", 1), _pipeline_entry("B", 2)])
+        events: list = []
+        prepare = self._default_prepare(events, not_runnable={"B/2"})
+        code, _batch, events, _capture = self._drive(
+            monkeypatch, tmp_path, split, extra=("--pipeline",),
+            prepare=prepare, events=events,
+        )
+        assert code == run_mod.EXIT_BUG_FAILED
+        assert [event for event in events if event[0] == "run"] == [("run", "A/1")]
+
+    def test_a_skipped_bug_is_named_loudly_with_its_gate_reason(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A non-runnable bug must not vanish from the log: `queue --pipeline`
+        prints the skip by name with the gate reason that caused it."""
+        split = _PipelineSplit([_pipeline_entry("A", 1), _pipeline_entry("B", 2)])
+        events: list = []
+
+        def prepare(**kwargs):
+            entry = kwargs["entry"]
+            key = f"{entry['project']}/{entry['bug_id']}"
+            events.append(("prepare", key))
+            if key == "B/2":
+                return "prep", _fake_prep(
+                    entry, runnable=False, gate_failures=["no issue source"]
+                )
+            return "prep", _fake_prep(entry)
+
+        code, _batch, _events, _capture = self._drive(
+            monkeypatch, tmp_path, split, extra=("--pipeline",),
+            prepare=prepare, events=events,
+        )
+        assert code == run_mod.EXIT_BUG_FAILED
+        err = capsys.readouterr().err
+        assert "NOT RUNNABLE B/2" in err and "no issue source" in err
+
+    def test_a_runnable_bug_that_writes_no_row_fails_the_batch(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """§7.1 — a bug that prepared runnable but was never claimed (here the stop
+        file appears mid-wave) leaves no row; the batch must fail rather than exit 0
+        having silently dropped it."""
+        split = _PipelineSplit([_pipeline_entry("A", 1), _pipeline_entry("B", 2)])
+        events: list = []
+
+        def prepare(**kwargs):
+            entry = kwargs["entry"]
+            key = f"{entry['project']}/{entry['bug_id']}"
+            events.append(("prepare", key))
+            if key == "B/2":
+                stop = runner_mod.queue_stop_path(tmp_path / "batch")
+                stop.parent.mkdir(parents=True, exist_ok=True)
+                stop.write_text("")
+            return "prep", _fake_prep(entry)
+
+        code, _batch, _events, _capture = self._drive(
+            monkeypatch, tmp_path, split, extra=("--pipeline",),
+            prepare=prepare, events=events,
+        )
+        assert code == run_mod.EXIT_BUG_FAILED
+        assert [event for event in events if event[0] == "run"] == [("run", "A/1")]
+        err = capsys.readouterr().err
+        assert "ROW-COUNT FAILURE" in err and "B/2" in err
+
+    # -- --plan and the two refusals ---------------------------------------
+    def test_plan_prints_the_selection_without_a_clone_or_a_binary(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        def explode(*args, **kwargs):
+            raise AssertionError("--plan must not reach this")
+
+        monkeypatch.setattr(run_mod.meta_mod, "ensure_clone", explode)
+        monkeypatch.setattr(runner_mod, "require_vanta_bin", explode)
+        split = _PipelineSplit([_pipeline_entry("A", 1)])
+        code = run_mod._queue_pipeline(
+            self._args(tmp_path / "batch", "--pipeline", "--plan"),
+            split=split,
+            config_block={},
+            frozen_env={},
+            invocation_env={},
+            fixed_rounds_declaration=None,
+            attempts_declaration=None,
+        )
+        assert code == run_mod.EXIT_OK
+        out = capsys.readouterr().out
+        assert "| bug |" in out and "A/1" in out
+
+    def test_refreeze_with_measure_only_is_refused(self, tmp_path):
+        split = _PipelineSplit([_pipeline_entry("A", 1)])
+        with pytest.raises(run_mod.SplitError, match="--measure-only"):
+            run_mod._queue_pipeline(
+                self._args(
+                    tmp_path / "batch", "--pipeline", "--refreeze", "A/1", "--measure-only"
+                ),
+                split=split,
+                config_block={},
+                frozen_env={},
+                invocation_env={},
+                fixed_rounds_declaration=None,
+                attempts_declaration=None,
+            )
+
+    # -- CLI routing -------------------------------------------------------
+    def test_the_pipeline_flag_routes_the_command_into_the_pipeline(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(runner_mod, "require_model_endpoint", lambda **kwargs: None)
+        monkeypatch.setattr(
+            run_mod, "load_split", lambda path: _PipelineSplit([_pipeline_entry("A", 1)])
+        )
+        seen: list = []
+        monkeypatch.setattr(
+            run_mod,
+            "_queue_pipeline",
+            lambda args, **kwargs: seen.append(kwargs) or run_mod.EXIT_OK,
+        )
+        code = run_mod.main(["queue", "--batch", str(tmp_path / "b"), "--pipeline"])
+        assert code == run_mod.EXIT_OK
+        assert len(seen) == 1, "the flag must reach the pipeline and nothing else"
+
+    def test_without_the_flag_the_queue_reads_a_prepared_batch(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(runner_mod, "require_model_endpoint", lambda **kwargs: None)
+        monkeypatch.setattr(
+            run_mod, "load_split", lambda path: _PipelineSplit([_pipeline_entry("A", 1)])
+        )
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+        monkeypatch.setattr(
+            run_mod,
+            "_queue_pipeline",
+            lambda args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("the default queue must not pipeline")
+            ),
+        )
+        read: list = []
+
+        def stop(**kwargs):
+            read.append(kwargs)
+            raise runner_mod.RunnerError("stop here")
+
+        monkeypatch.setattr(runner_mod, "load_prepared", stop)
+        code = run_mod.main(["queue", "--batch", str(tmp_path / "b")])
+        assert read, "the default queue must read the batch prepare.json"
+        assert code == run_mod.EXIT_HARNESS_FAILED
+
+    # -- the parser --------------------------------------------------------
+    def test_the_queue_parser_defaults_to_no_pipeline(self):
+        args = run_mod.build_parser().parse_args(["queue", "--batch", "/tmp/x"])
+        assert args.pipeline is False
+        assert args.prepare_jobs == 1
+
+    def test_the_queue_parser_reads_the_pipeline_flags(self):
+        args = run_mod.build_parser().parse_args(
+            [
+                "queue",
+                "--batch",
+                "/tmp/x",
+                "--pipeline",
+                "--prepare-jobs",
+                "12",
+                "--peak-vms",
+                "8",
+                "--refreeze",
+                "Demo/1",
+            ]
+        )
+        assert args.pipeline is True
+        assert args.prepare_jobs == 12
+        assert args.peak_vms == 8
+        assert args.refreeze == ["Demo/1"]
 
 
 class TestModelEndpointPreflight:
@@ -30709,6 +40097,50 @@ class TestAnalyseNumbers:
             runner_mod.LABEL_RULE_STRICT_B6: 1,
         }
 
+    def test_label_source_for_names_the_copy_the_label_came_from(self):
+        """M3-E follow-up — the reader reports WHICH of the three copies it used."""
+        original = _analyse_row("k", label="true_approval")
+        assert analyse_mod.label_for(original) == "true_approval"
+        assert analyse_mod.label_source_for(original) == manifest_mod.LABEL_SOURCE_ORIGINAL
+        derived = _analyse_row(
+            "k", label="unobservable", label_relabelled={"label": "true_approval"}
+        )
+        assert analyse_mod.label_for(derived) == "true_approval"
+        assert analyse_mod.label_source_for(derived) == manifest_mod.LABEL_SOURCE_DERIVED
+        measured = _analyse_row(
+            "k",
+            label="unobservable",
+            label_relabelled={"label": "derived"},
+            label_relabelled_measured={"label": "true_approval", "oracle_rerun": True},
+        )
+        assert analyse_mod.label_for(measured) == "true_approval"
+        assert analyse_mod.label_source_for(measured) == manifest_mod.LABEL_SOURCE_MEASURED
+
+    def test_a_row_without_a_stored_label_reads_from_its_own_evidence(self):
+        """A legacy row records no label; its own oracle still reads it, as the
+        ORIGINAL — so the metric never sees an empty cell it used to compute."""
+        row = _analyse_row("k", verdict="AllTestsPassed")
+        assert analyse_mod.label_for(row) == "true_approval"
+        assert analyse_mod.label_source_for(row) == manifest_mod.LABEL_SOURCE_ORIGINAL
+
+    def test_label_source_counts_reports_the_copies_apart(self, tmp_path):
+        """A mixed load — a relabelled row pooled with an original one — is visible."""
+        batch = _analyse_batch(
+            tmp_path,
+            rows=[
+                _analyse_row("plain"),
+                _analyse_row("relabelled", label_relabelled={"label": "true_approval"}),
+                _analyse_row(
+                    "measured", label_relabelled_measured={"label": "true_approval"}
+                ),
+            ],
+        )
+        assert analyse_mod.label_source_counts(_analyse_load(batch)) == {
+            manifest_mod.LABEL_SOURCE_ORIGINAL: 1,
+            manifest_mod.LABEL_SOURCE_DERIVED: 1,
+            manifest_mod.LABEL_SOURCE_MEASURED: 1,
+        }
+
     def test_candidate_kind_names_the_papers_word_and_cuts_mutants_by_operator(self):
         assert analyse_mod.candidate_kind(_analyse_row("k", kind="dev_fix")) == "reference"
         assert analyse_mod.candidate_kind(_analyse_row("k", kind="noop")) == "no-op"
@@ -31039,6 +40471,70 @@ class TestAnalyseLoading:
         first["config_overrides"] = []
         second = _analyse_row("k2")
         second["config_hash"] = "h1"  # no config_overrides field at all
+        batch = _analyse_batch(tmp_path, rows=[first, second])
+        with pytest.raises(analyse_mod.AnalysisError) as exc:
+            _analyse_load(batch)
+        assert "overrides not recorded" in str(exc.value)
+
+    def test_the_same_prep_hash_with_different_waived_values_is_never_pooled(
+        self, tmp_path
+    ):
+        """[VANTA-WHY] M3 item U8 — the preparation's own overrides are part of its claim.
+
+        ``--config-override`` waives a named frozen setting without touching the config
+        file, so two preparations can share ``prep_config_hash`` and the waiver *flag*
+        (``prep_config_override``) while waiving different values. Before item U8 the key
+        read only the hash and the flag, so those two pooled — the rows averaged a tree
+        prepared one way with a tree prepared another under one name.
+        """
+        first = _analyse_row("k1")
+        first["config_hash"] = "h1"
+        first["config_overrides"] = []
+        first["prep_config_hash"] = "p1"
+        first["prep_config_override"] = True
+        first["prep_config_overrides"] = ["VANTA_SAMPLING=coding!=pinned"]
+        second = _analyse_row("k2")
+        second["config_hash"] = "h1"
+        second["config_overrides"] = []
+        second["prep_config_hash"] = "p1"
+        second["prep_config_override"] = True
+        second["prep_config_overrides"] = ["VANTA_N_CTX=32768!=65536"]
+        batch = _analyse_batch(tmp_path, rows=[first, second])
+        with pytest.raises(analyse_mod.AnalysisError) as exc:
+            _analyse_load(batch)
+        message = str(exc.value)
+        assert "VANTA_SAMPLING=coding!=pinned" in message
+        assert "VANTA_N_CTX=32768!=65536" in message
+
+    def test_the_same_prep_waived_values_are_one_group(self, tmp_path):
+        """The same preparation overrides in a different order are one configuration."""
+        rows = [_analyse_row("k1"), _analyse_row("k2")]
+        for index, row in enumerate(rows):
+            row["config_hash"] = "h1"
+            row["prep_config_hash"] = "p1"
+            row["prep_config_override"] = True
+            row["prep_config_overrides"] = ["a=1", "b=2"] if index == 0 else ["b=2", "a=1"]
+        analysis = _analyse_load(_analyse_batch(tmp_path, rows=rows))
+        assert len(analysis.rows) == 2
+
+    def test_an_unrecorded_prep_override_list_is_not_an_empty_one(self, tmp_path):
+        """Absence of the preparation's overrides is a different claim from "none".
+
+        A row that says nothing about the preparation's applied overrides is its own
+        group, exactly as a row with no ``prep_config_hash`` is — never agreement with a
+        row whose batch recorded "there were none" (item U8).
+        """
+        first = _analyse_row("k1")
+        first["config_hash"] = "h1"
+        first["config_overrides"] = []  # the run half is identical, so U8 is what splits
+        first["prep_config_hash"] = "p1"
+        first["prep_config_override"] = False
+        first["prep_config_overrides"] = []
+        second = _analyse_row("k2")
+        second["config_hash"] = "h1"
+        second["config_overrides"] = []
+        second["prep_config_hash"] = "p1"
+        second["prep_config_override"] = False  # no prep_config_overrides field at all
         batch = _analyse_batch(tmp_path, rows=[first, second])
         with pytest.raises(analyse_mod.AnalysisError) as exc:
             _analyse_load(batch)
@@ -31994,6 +41490,9 @@ class TestFrozenConfig:
         # The K arm's declaration is its own ENFORCED table (M3 item 9/A5), not a
         # `[prereg]` literal: the harness reads it and refuses a mismatch.
         assert config.fixed_rounds() == {"b1-k4": 4, "b3-k4": 4}
+        # The attempt budget is the same kind of statement (M3 item 11): an ENFORCED
+        # table, read by the harness, refused on mismatch.
+        assert config.attempts() == {"default": 4}
         # C4 — the judge is here too: its prompt is sent only on a judge arm, so it
         # is not a role `prompt_hashes()` records on every row, but its text is a
         # prompt the binary sends and a reworded judge block must move `config_hash`.
@@ -32181,6 +41680,40 @@ class TestFrozenConfig:
         assert base.fixed_rounds() != other.fixed_rounds()
         assert base.sha256 != other.sha256
 
+    # -- M3 item 11 — the attempt-budget declaration --------------------------
+    def test_the_attempts_table_is_optional_and_read_as_a_mapping(self, tmp_path):
+        """A configuration written before M3 item 11 declares no budget, and that is
+        not an error: `attempts()` reads an absent table as "no claim", the same way
+        the rest of the module reads an absent setting."""
+        assert frozen_mod.load(_frozen_file(tmp_path, "v1")).attempts() == {}
+
+    def test_a_bad_attempts_value_is_refused(self, tmp_path):
+        """The table is ENFORCED, so a file that could not mean what the reader assumes
+        is refused at load rather than turning into a silently wrong budget at run
+        time."""
+        for bad in ("default = 0", "default = true", 'default = "4"', "default = -1"):
+            path = write(
+                tmp_path / f"bad_{bad.replace(' ', '_').replace('\"', '')}.toml",
+                'schema = 1\nname = "bad"\n[env]\n[recorded]\n[prereg]\n'
+                "[attempts]\n" + bad + "\n[prompts]\n",
+            )
+            with pytest.raises(frozen_mod.FrozenConfigError, match=r"\[attempts\]"):
+                frozen_mod.load(path)
+
+    def test_editing_the_attempts_table_moves_the_config_hash(self, tmp_path):
+        """The budget is inside the file's bytes, so a change to it moves
+        `config_hash` — the property that keeps two budgets from pooling."""
+        raw = (
+            'schema = 1\nname = "t"\n[env]\n[recorded]\n[prereg]\n'
+            "[attempts]\ndefault = 4\n[prompts]\ncreator = \"abc\"\n"
+        )
+        base = frozen_mod.load(write(tmp_path / "base.toml", raw))
+        other = frozen_mod.load(
+            write(tmp_path / "other.toml", raw.replace("default = 4", "default = 6"))
+        )
+        assert base.attempts() != other.attempts()
+        assert base.sha256 != other.sha256
+
 
 class TestFrozenConfigResolution:
     """Item 19 — the override rule: a caller value the file freezes differently refuses."""
@@ -32330,6 +41863,35 @@ class TestFrozenConfigWiring:
             is True
         )
 
+    def test_the_three_stages_carry_issues_dir_defaulting_to_the_committed_path(self):
+        """§2.4 round 9 — ``--issues-dir`` rides on prepare, run and queue; absent = today's path.
+
+        Scope is exactly those three stages: the held-out split freezes and reads
+        through one gitignored directory, and the dev split omits the flag and keeps the
+        committed ``plans/bugsinpy_issues`` byte-for-byte.
+        """
+        parser = run_mod.build_parser()
+        for argv in (
+            ["prepare", "--split", "x.json"],
+            ["run", "--batch", "b"],
+            ["queue", "--batch", "b"],
+        ):
+            assert parser.parse_args(argv).issues_dir is None
+        assert (
+            parser.parse_args(
+                ["prepare", "--split", "x.json", "--issues-dir", "d"]
+            ).issues_dir
+            == Path("d")
+        )
+        assert (
+            parser.parse_args(["run", "--batch", "b", "--issues-dir", "d"]).issues_dir
+            == Path("d")
+        )
+        assert (
+            parser.parse_args(["queue", "--batch", "b", "--issues-dir", "d"]).issues_dir
+            == Path("d")
+        )
+
     def test_the_analyse_command_carries_allow_mixed_configs_defaulting_off(self):
         parser = analyse_mod.build_parser()
         assert parser.parse_args(["--batches", "x"]).allow_mixed_configs is False
@@ -32339,6 +41901,535 @@ class TestFrozenConfigWiring:
             ).allow_mixed_configs
             is True
         )
+
+
+class TestPrepareFrozenConfig:
+    """Q3 — ``prepare`` resolves the frozen configuration exactly as ``run`` does.
+
+    [VANTA-WHY] Two things were wrong before this. ``prepare`` never read
+    ``configs/v1-m3.toml`` at all, so a shell that contradicted the frozen
+    ``[env]`` prepared a batch whose rows would claim a configuration they did not
+    measure. And its context gate read ``os.environ`` alone, so a clean shell — the
+    normal case, exporting none of the frozen settings — failed with
+    ``ContextError`` even though the file freezes ``VANTA_LLM_CONTEXT_TOKENS``,
+    which is the window every child of the run is handed.
+    """
+
+    @staticmethod
+    def _clean_shell(monkeypatch) -> None:
+        """A real shell: nothing in the frozen ``[env]`` is exported."""
+        for name in list(os.environ):
+            if name.startswith("VANTA_"):
+                monkeypatch.delenv(name, raising=False)
+
+    def test_a_clean_shell_sizes_the_gate_from_the_frozen_window(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The gate must resolve the frozen window rather than refuse.
+
+        Everything expensive is stubbed, but ``explicit_context_window`` is left
+        REAL: the point is that the stage hands it the invocation's own
+        environment, so the frozen ``VANTA_LLM_CONTEXT_TOKENS`` is what it reads.
+        The one bug then fails in ``prepare_one`` (stubbed), which is what gets the
+        stage all the way to the writers and to ``prepare.json``.
+        """
+        self._clean_shell(monkeypatch)
+        # No server to ask, so the frozen file is the only remaining source.
+        monkeypatch.setattr(ctx, "probe_props_n_ctx", lambda *a, **k: None)
+        split = split_mod.Split(split_data())
+        split_path = tmp_path / "split.json"
+        split_path.write_text(split.to_json(), encoding="utf-8")
+        entry = split.bugs[0]
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split)
+        monkeypatch.setattr(run_mod, "select", lambda *a, **k: [(entry, True)])
+        monkeypatch.setattr(meta_mod, "ensure_clone", lambda root, *, commit: commit)
+        monkeypatch.setattr(
+            runner_mod, "require_vanta_bin", lambda path: tmp_path / "vanta_m3"
+        )
+        monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: "")
+        monkeypatch.setattr(prepare_mod, "missing_checkpoints", lambda names: [])
+        monkeypatch.setattr(bake_mod, "missing_deps", lambda deps, names: [])
+        monkeypatch.setattr(
+            meta_mod,
+            "project_github_url",
+            lambda *a, **k: "https://example.invalid/x.git",
+        )
+        monkeypatch.setattr(run_mod, "tree_cache", lambda *a, **k: tmp_path / "repo")
+        monkeypatch.setattr(
+            prepare_mod,
+            "prepare_one",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stub-one")),
+        )
+        batch = tmp_path / "batch"
+        args = run_mod.build_parser().parse_args(
+            ["prepare", "--split", str(split_path), "--batch", str(batch)]
+        )
+        # It must reach the writers (a returned code, not a ContextError).
+        run_mod.cmd_prepare(args)
+        assert "n_ctx=262144" in capsys.readouterr().out
+        payload = json.loads((batch / "prepare.json").read_text(encoding="utf-8"))
+        assert payload["n_ctx"] == 262144
+        assert payload["n_ctx_source"] == "VANTA_LLM_CONTEXT_TOKENS"
+        # Q3 — the configuration block is recorded, the same four keys as a row.
+        assert payload["config_path"] == "configs/v1-m3.toml"
+        assert payload["config_hash"] == frozen_mod.load().sha256
+        assert payload["config_override"] is False
+        assert payload["config_overrides"] == []
+
+    def test_a_contradicting_shell_is_refused_unless_waived(self, monkeypatch):
+        """``VANTA_SAMPLING`` is frozen to ``coding``; pinning it is a contradiction."""
+        monkeypatch.setenv("VANTA_SAMPLING", "pinned")
+        args = run_mod.build_parser().parse_args(["prepare", "--split", "x.json"])
+        with pytest.raises(frozen_mod.FrozenConfigError, match="contradicts"):
+            run_mod.cmd_prepare(args)
+
+    def test_the_waiver_lets_prepare_through_and_records_the_override(
+        self, tmp_path, monkeypatch
+    ):
+        """``--allow-override`` clears the same contradiction.
+
+        The stage then runs on; ``load_split`` is stubbed to raise a sentinel, and
+        that sentinel — not a ``FrozenConfigError`` — is the proof it got past the
+        gate.
+        """
+        monkeypatch.setenv("VANTA_SAMPLING", "pinned")
+        seen: dict[str, object] = {}
+
+        def _record_and_raise(path):
+            seen["entered"] = True
+            raise RuntimeError("past the gate")
+
+        monkeypatch.setattr(run_mod, "load_split", _record_and_raise)
+        args = run_mod.build_parser().parse_args(
+            ["prepare", "--split", "x.json", "--allow-override"]
+        )
+        with pytest.raises(RuntimeError, match="past the gate"):
+            run_mod.cmd_prepare(args)
+        assert seen["entered"] is True
+
+    def test_the_prepare_command_carries_allow_override_defaulting_off(self):
+        parser = run_mod.build_parser()
+        assert parser.parse_args(["prepare", "--split", "x"]).allow_override is False
+        assert (
+            parser.parse_args(
+                ["prepare", "--split", "x", "--allow-override"]
+            ).allow_override
+            is True
+        )
+
+
+class _PrepareInFlight:
+    """How many ``prepare_one`` calls were running at the same time.
+
+    ``peak`` is the high-water mark and ``keys`` the order the bugs entered, which
+    is what a test needs to tell "the second bug ran beside the first" from "the
+    second bug ran after it".
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.live = 0
+        self.peak = 0
+        self.keys: list[str] = []
+
+    def enter(self, key: str) -> None:
+        with self._lock:
+            self.live += 1
+            self.peak = max(self.peak, self.live)
+            self.keys.append(key)
+
+    def leave(self) -> None:
+        with self._lock:
+            self.live -= 1
+
+
+class TestPrepareOverlapsBugs:
+    """M3 item Y1 — different bugs are independent, so ``prepare`` runs them together.
+
+    ``prepare`` walked the split one bug at a time on the calling thread, so the
+    only VMs in flight were one bug's, and the machine's other cores sat idle for
+    the length of the batch. A bug's own derivations already overlap (S5); this is
+    that rule one level up — every bug is submitted at once and the invocation's
+    ONE budget decides how many actually overlap. Two things must not change: a
+    bug's place in ``preps`` (and in ``broken``) is its place in the split, never
+    whichever worker finished first, and at the default ``--prepare-jobs 1`` the
+    budget is a single core, so nothing overlaps and the loop is the serial one it
+    always was.
+    """
+
+    @staticmethod
+    def _stage(monkeypatch, tmp_path, *, prepare_one):
+        """A two-bug prepare with every expensive step stubbed away.
+
+        ``prepare_one`` is the seam the test supplies. The host core budget is
+        pinned so the pool's size — ``min(--prepare-jobs, host cores − 2)`` — is a
+        fact about the flag under test and not about the machine running the tests.
+        """
+        for name in list(os.environ):
+            if name.startswith("VANTA_"):
+                monkeypatch.delenv(name, raising=False)
+        split = split_mod.Split(
+            split_data(
+                bugs=[
+                    bug_entry(),
+                    bug_entry(project="Other", bug_id=2, checkpoint="vanta-bi-Other-2"),
+                ]
+            )
+        )
+        split_path = tmp_path / "split.json"
+        split_path.write_text(split.to_json(), encoding="utf-8")
+        selected = [(split.bugs[0], True), (split.bugs[1], True)]
+        monkeypatch.setattr(ctx, "probe_props_n_ctx", lambda *a, **k: None)
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split)
+        monkeypatch.setattr(run_mod, "select", lambda *a, **k: selected)
+        monkeypatch.setattr(meta_mod, "ensure_clone", lambda root, *, commit: commit)
+        monkeypatch.setattr(
+            runner_mod, "require_vanta_bin", lambda path: tmp_path / "vanta_m3"
+        )
+        monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: "")
+        monkeypatch.setattr(prepare_mod, "missing_checkpoints", lambda names: [])
+        monkeypatch.setattr(bake_mod, "missing_deps", lambda deps, names: [])
+        monkeypatch.setattr(
+            meta_mod,
+            "project_github_url",
+            lambda *a, **k: "https://example.invalid/x.git",
+        )
+        monkeypatch.setattr(run_mod, "tree_cache", lambda *a, **k: tmp_path / "repo")
+        monkeypatch.setattr(prepare_mod, "prepare_one", prepare_one)
+        monkeypatch.setattr(budget_mod, "host_cores_budget", lambda: 8)
+        return split_path, selected
+
+    def test_at_two_jobs_two_bugs_are_in_flight_together(self, tmp_path, monkeypatch):
+        """Both bugs are inside ``prepare_one`` at the same instant.
+
+        The two stubs meet at a barrier, so neither can finish before the other has
+        entered and ``peak`` is two exactly when the pool overlapped them. If they
+        never overlap the barrier times out and ``peak`` stays at one. Both bugs then
+        fail (the stub raises), which is what the stage records — the assertion is
+        about the overlap, not about the bugs.
+
+        [VANTA-WHY] The barrier replaced a one-way event (the second bug set it and
+        was free to leave) because that reads a pool's thread-start order as if it
+        were the submit order: the second bug could enter and leave before the first
+        bug's worker had started, which looks like "no overlap" for a pool that did
+        overlap. Observed once in ten isolated runs and once in a full-suite run, on
+        a loaded host (``host_load`` 5.1) — the product overlapped the bugs; only the
+        test's synchronisation was wrong.
+        """
+        watch = _PrepareInFlight()
+        together = threading.Barrier(2, timeout=5.0)
+
+        def fake(entry, **kwargs):
+            watch.enter(run_mod.bug_key(entry))
+            try:
+                together.wait()
+            except threading.BrokenBarrierError:
+                pass  # the other bug never showed up in time — ``peak`` will say so
+            finally:
+                watch.leave()
+            raise RuntimeError("stub")
+
+        split_path, _ = self._stage(monkeypatch, tmp_path, prepare_one=fake)
+        args = run_mod.build_parser().parse_args(
+            [
+                "prepare",
+                "--split",
+                str(split_path),
+                "--batch",
+                str(tmp_path / "batch"),
+                "--prepare-jobs",
+                "2",
+            ]
+        )
+        run_mod.cmd_prepare(args)
+        assert watch.peak == 2, (
+            "the second bug never ran beside the first — prepare did not overlap "
+            f"them (entered: {watch.keys})"
+        )
+
+    def test_at_one_job_the_bugs_stay_serial(self, tmp_path, monkeypatch):
+        """``--prepare-jobs 1`` is the serial loop, whatever the host has to spare."""
+        watch = _PrepareInFlight()
+
+        def fake(entry, **kwargs):
+            watch.enter(run_mod.bug_key(entry))
+            try:
+                time.sleep(0.05)
+            finally:
+                watch.leave()
+            raise RuntimeError("stub")
+
+        split_path, _ = self._stage(monkeypatch, tmp_path, prepare_one=fake)
+        args = run_mod.build_parser().parse_args(
+            ["prepare", "--split", str(split_path), "--batch", str(tmp_path / "batch")]
+        )
+        run_mod.cmd_prepare(args)
+        assert watch.peak == 1, (
+            "two bugs prepared at once at the default --prepare-jobs 1: the budget "
+            "did not hold the pool to one worker"
+        )
+        assert watch.keys == ["Demo/1", "Other/2"], (
+            "the bugs were prepared out of the split's order even though one worker "
+            f"ran them: {watch.keys}"
+        )
+
+
+class TestPreparedConfigMatchesRun:
+    """M3 item T3 — ``run``/``queue`` refuse a batch prepared under another config.
+
+    ``prepare`` resolves the frozen configuration once and records it in
+    ``prepare.json``; ``run``/``queue`` resolve their own and record it on every row.
+    When the two describe different experiments the batch is a contradiction — the
+    context gate sized under one configuration and the repairs graded under another —
+    and the cheap moment to notice is before the first job. ``--allow-override`` is the
+    one waiver, exactly as it is for ``frozen_config.resolve``'s own check.
+    """
+
+    @staticmethod
+    def _clean_shell(monkeypatch) -> None:
+        for name in list(os.environ):
+            if name.startswith("VANTA_"):
+                monkeypatch.delenv(name, raising=False)
+
+    # -- the predicate, on its own ---------------------------------------
+    def test_a_different_hash_is_a_mismatch(self):
+        message = runner_mod.prepared_config_mismatch(
+            {"config_hash": "a" * 64, "config_override": False},
+            {"config_hash": "b" * 64, "config_override": False},
+        )
+        assert message is not None
+        assert "config_hash" in message
+
+    def test_a_different_override_status_is_a_mismatch(self):
+        message = runner_mod.prepared_config_mismatch(
+            {"config_hash": "a" * 64, "config_override": True},
+            {"config_hash": "a" * 64, "config_override": False},
+        )
+        assert message is not None
+        assert "waive" in message
+
+    def test_a_matching_preparation_is_no_mismatch(self):
+        block = {"config_hash": "a" * 64, "config_override": True}
+        assert runner_mod.prepared_config_mismatch(block, dict(block)) is None
+
+    def test_a_batch_with_no_recorded_config_is_no_mismatch(self):
+        """A pre-Q3 ``prepare.json`` recorded nothing to contradict."""
+        run = {"config_hash": "a" * 64, "config_override": False}
+        assert runner_mod.prepared_config_mismatch(None, run) is None
+        assert runner_mod.prepared_config_mismatch({}, run) is None
+
+    # -- the reader ------------------------------------------------------
+    def test_the_reader_reads_the_preparations_config_block(self, tmp_path):
+        write(
+            tmp_path / "prepare.json",
+            json.dumps(
+                {
+                    "bugs": [],
+                    "config_hash": "h" * 64,
+                    "config_path": "configs/v1-m3.toml",
+                    "config_override": True,
+                    "config_overrides": ["VANTA_SAMPLING=coding!=pinned"],
+                }
+            ),
+        )
+        batch = runner_mod.load_prepared(
+            batch_dir=tmp_path, split=SimpleNamespace(bugs=[]), bugsinpy_root=tmp_path
+        )
+        assert batch.config_block == {
+            "config_hash": "h" * 64,
+            "config_path": "configs/v1-m3.toml",
+            "config_override": True,
+            "config_overrides": ["VANTA_SAMPLING=coding!=pinned"],
+        }
+
+    def test_the_reader_returns_none_when_prepare_json_has_no_config_block(self, tmp_path):
+        write(tmp_path / "prepare.json", json.dumps({"bugs": []}))
+        batch = runner_mod.load_prepared(
+            batch_dir=tmp_path, split=SimpleNamespace(bugs=[]), bugsinpy_root=tmp_path
+        )
+        assert batch.config_block is None
+
+    # -- the row ---------------------------------------------------------
+    def test_the_row_records_the_preparations_config_alongside_the_runs(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        record = runner_mod.run_job(
+            job=_job(
+                prep(root=tmp_path / "root"),
+                config_block={
+                    "config_hash": "r" * 64,
+                    "config_path": "configs/v1-m3.toml",
+                    "config_override": False,
+                    "config_overrides": [],
+                },
+                prep_config_block={
+                    "config_hash": "p" * 64,
+                    "config_path": "configs/v1-m3.toml",
+                    "config_override": True,
+                    "config_overrides": ["VANTA_SAMPLING=coding!=pinned"],
+                },
+            ),
+            paths=runner_mod.BatchPaths.under(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4,
+            disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert record["config_hash"] == "r" * 64
+        assert record["prep_config_hash"] == "p" * 64
+        assert record["prep_config_override"] is True
+        # Item U8 — the preparation's waived values ride along, not just the flag.
+        assert record["prep_config_overrides"] == ["VANTA_SAMPLING=coding!=pinned"]
+
+    def test_a_row_with_no_preparation_config_says_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        record = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")),
+            paths=runner_mod.BatchPaths.under(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4,
+            disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert record["prep_config_hash"] is None
+        assert record["prep_config_override"] is None
+        assert record["prep_config_overrides"] is None
+
+    # -- the two stages, end to end --------------------------------------
+    def _prepare_with_override(self, tmp_path, monkeypatch) -> Path:
+        """Stage 1 — a real ``prepare`` with a contradiction and ``--allow-override``.
+
+        The shell pins ``VANTA_SAMPLING``, which the file freezes to ``coding``; the
+        waiver clears the contradiction and records ``config_override: true`` in
+        ``prepare.json``. Everything expensive is stubbed, but the writers are real.
+        """
+        monkeypatch.setenv("VANTA_SAMPLING", "pinned")
+        monkeypatch.setattr(ctx, "probe_props_n_ctx", lambda *a, **k: None)
+        split = split_mod.Split(split_data())
+        split_path = tmp_path / "split.json"
+        split_path.write_text(split.to_json(), encoding="utf-8")
+        entry = split.bugs[0]
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split)
+        monkeypatch.setattr(run_mod, "select", lambda *a, **k: [(entry, True)])
+        monkeypatch.setattr(meta_mod, "ensure_clone", lambda root, *, commit: commit)
+        monkeypatch.setattr(
+            runner_mod, "require_vanta_bin", lambda path: tmp_path / "vanta_m3"
+        )
+        monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: "")
+        monkeypatch.setattr(prepare_mod, "missing_checkpoints", lambda names: [])
+        monkeypatch.setattr(bake_mod, "missing_deps", lambda deps, names: [])
+        monkeypatch.setattr(
+            meta_mod,
+            "project_github_url",
+            lambda *a, **k: "https://example.invalid/x.git",
+        )
+        monkeypatch.setattr(run_mod, "tree_cache", lambda *a, **k: tmp_path / "repo")
+        monkeypatch.setattr(
+            prepare_mod,
+            "prepare_one",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stub-one")),
+        )
+        batch = tmp_path / "batch"
+        run_mod.cmd_prepare(
+            run_mod.build_parser().parse_args(
+                [
+                    "prepare",
+                    "--split",
+                    str(split_path),
+                    "--batch",
+                    str(batch),
+                    "--allow-override",
+                ]
+            )
+        )
+        payload = json.loads((batch / "prepare.json").read_text(encoding="utf-8"))
+        assert payload["config_override"] is True
+        # The shell no longer contradicts the file, so a bare run resolves no waiver.
+        monkeypatch.delenv("VANTA_SAMPLING", raising=False)
+        return batch
+
+    def _stub_run_cli(self, monkeypatch, split, batch: Path) -> list:
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split)
+        # The window check would ask the model server; it is not what this test is about.
+        monkeypatch.setattr(
+            runner_mod, "context_window_warning", lambda b, *, environ=None: None
+        )
+        monkeypatch.setattr(run_mod, "select_preps", lambda preps, **kwargs: [])
+        monkeypatch.setattr(runner_mod, "require_vanta_bin", lambda path: path)
+        monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: None)
+        called: list = []
+        monkeypatch.setattr(
+            runner_mod, "run_batch", lambda **kwargs: called.append(kwargs) or (0, [])
+        )
+        monkeypatch.setattr(
+            runner_mod, "run_queue", lambda **kwargs: called.append(kwargs) or (0, [])
+        )
+        return called
+
+    def test_prepare_with_override_then_a_bare_run_is_refused(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The mandated case: ``prepare --allow-override``, then ``run`` without it."""
+        self._clean_shell(monkeypatch)
+        batch = self._prepare_with_override(tmp_path, monkeypatch)
+        # Restore the real loader and split for the run half: the check must fire
+        # against the batch's own `prepare.json`, not a stub.
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split_mod.Split(split_data()))
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+        called: list = []
+        monkeypatch.setattr(
+            runner_mod, "run_batch", lambda **kwargs: called.append(kwargs) or (0, [])
+        )
+
+        code = run_mod.main(["run", "--batch", str(batch), "--plan"])
+
+        err = capsys.readouterr().err
+        assert code == run_mod.EXIT_HARNESS_FAILED
+        assert "error:" in err and "waive" in err
+        # Nothing was claimed: the refusal precedes the first job.
+        assert called == []
+
+    def test_the_queue_refuses_the_same_mismatch(self, tmp_path, monkeypatch, capsys):
+        self._clean_shell(monkeypatch)
+        batch = self._prepare_with_override(tmp_path, monkeypatch)
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split_mod.Split(split_data()))
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+        called: list = []
+        monkeypatch.setattr(
+            runner_mod, "run_queue", lambda **kwargs: called.append(kwargs) or (0, [])
+        )
+
+        code = run_mod.main(["queue", "--batch", str(batch), "--plan"])
+
+        err = capsys.readouterr().err
+        assert code == run_mod.EXIT_HARNESS_FAILED
+        assert "error:" in err and "waive" in err
+        assert called == []
+
+    def test_a_bare_run_waived_with_allow_override_carries_the_preparation(
+        self, tmp_path, monkeypatch
+    ):
+        """``--allow-override`` on the run lets it through and the block rides along."""
+        self._clean_shell(monkeypatch)
+        batch = self._prepare_with_override(tmp_path, monkeypatch)
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split_mod.Split(split_data()))
+        called = self._stub_run_cli(monkeypatch, split_mod.Split(split_data()), batch)
+
+        code = run_mod.main(["run", "--batch", str(batch), "--plan", "--allow-override"])
+
+        assert code == run_mod.EXIT_OK
+        assert called and called[0]["prep_config_block"]["config_override"] is True
 
 
 class TestTheInvocationEnvironment:
@@ -32380,9 +42471,13 @@ class TestTheInvocationEnvironment:
             lambda path: SimpleNamespace(bugsinpy_root="runs/bugsinpy", seeds=[0]),
         )
         monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
-        batch = SimpleNamespace(preps=[], entries={}, n_ctx=262144, batch_dir=tmp_path)
+        batch = SimpleNamespace(
+            preps=[], entries={}, n_ctx=262144, batch_dir=tmp_path, config_block=None
+        )
         monkeypatch.setattr(runner_mod, "load_prepared", lambda **kwargs: batch)
-        monkeypatch.setattr(runner_mod, "context_window_warning", lambda b: None)
+        monkeypatch.setattr(
+            runner_mod, "context_window_warning", lambda b, *, environ=None: None
+        )
         monkeypatch.setattr(run_mod, "select_preps", lambda preps, **kwargs: [])
         monkeypatch.setattr(runner_mod, "require_vanta_bin", lambda path: path)
         monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: None)
@@ -32419,6 +42514,65 @@ class TestTheInvocationEnvironment:
         assert seen[1] == seen[0]
         assert seen[1]["VANTA_MAX_SPEND_USD"] == "5"
 
+    def test_the_phase_three_budget_override_is_recorded_and_keeps_the_hash(
+        self, tmp_path, monkeypatch
+    ):
+        """Phase 3 — `VANTA_MAX_SPEND_USD=120 --allow-override` is an operational
+        budget override, not a behavioural parameter.
+
+        The file freezes the cap to ``5`` while the shell exports ``120``, so the
+        run is refused unless ``--allow-override`` waives it. Waived, the batch
+        reads the caller's 120 — the cap is *this invocation's* budget — and every
+        row records ``config_override`` true with the file's **unchanged**
+        ``config_hash`` and the waived contradiction. Nothing behavioural moved, so
+        the rows still pool under the configuration they claim.
+        """
+        # Every other frozen setting stays absent, so the cap is the only
+        # contradiction and the recorded list has exactly one entry.
+        for name in frozen_mod.load().frozen():
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("VANTA_MAX_SPEND_USD", "120")
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(
+            run_mod,
+            "load_split",
+            lambda path: SimpleNamespace(bugsinpy_root="runs/bugsinpy", seeds=[0]),
+        )
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+        batch = SimpleNamespace(
+            preps=[], entries={}, n_ctx=262144, batch_dir=tmp_path, config_block=None
+        )
+        monkeypatch.setattr(runner_mod, "load_prepared", lambda **kwargs: batch)
+        monkeypatch.setattr(
+            runner_mod, "context_window_warning", lambda b, *, environ=None: None
+        )
+        monkeypatch.setattr(run_mod, "select_preps", lambda preps, **kwargs: [])
+        monkeypatch.setattr(runner_mod, "require_vanta_bin", lambda path: path)
+        monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: None)
+        monkeypatch.setattr(
+            runner_mod, "model_endpoint_preflight", lambda *, env=None, probe=None: None
+        )
+        captured: dict = {}
+
+        def fake_run_batch(**kwargs):
+            captured.update(kwargs)
+            return run_mod.EXIT_OK, []
+
+        monkeypatch.setattr(runner_mod, "run_batch", fake_run_batch)
+
+        code = run_mod.main(["run", "--batch", str(tmp_path), "--allow-override"])
+
+        assert code == run_mod.EXIT_OK
+        assert captured["max_spend_usd"] == 120.0, (
+            "the waived cap is the caller's 120, not the file's frozen 5"
+        )
+        block = captured["config_block"]
+        assert block["config_override"] is True
+        assert block["config_overrides"] == ["VANTA_MAX_SPEND_USD=5!=120"]
+        assert block["config_hash"] == frozen_mod.load().sha256, (
+            "the frozen file is untouched: the override is operational, not a hash"
+        )
+
     def test_the_queue_uses_the_same_effective_environment(self, tmp_path, monkeypatch):
         """The ``queue`` half: the same preamble, so the same fix and the same test."""
         for name in frozen_mod.load().frozen():
@@ -32430,9 +42584,13 @@ class TestTheInvocationEnvironment:
             lambda path: SimpleNamespace(bugsinpy_root="runs/bugsinpy", seeds=[0]),
         )
         monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
-        batch = SimpleNamespace(preps=[], entries={}, n_ctx=262144, batch_dir=tmp_path)
+        batch = SimpleNamespace(
+            preps=[], entries={}, n_ctx=262144, batch_dir=tmp_path, config_block=None
+        )
         monkeypatch.setattr(runner_mod, "load_prepared", lambda **kwargs: batch)
-        monkeypatch.setattr(runner_mod, "context_window_warning", lambda b: None)
+        monkeypatch.setattr(
+            runner_mod, "context_window_warning", lambda b, *, environ=None: None
+        )
         monkeypatch.setattr(run_mod, "select_preps", lambda preps, **kwargs: [])
         monkeypatch.setattr(runner_mod, "require_vanta_bin", lambda path: path)
         monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: None)

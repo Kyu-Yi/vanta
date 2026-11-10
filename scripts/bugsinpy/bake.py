@@ -44,16 +44,19 @@ The disk requirement is a measured fact, not a tuning knob: the base image is
 from __future__ import annotations
 
 import ast
+import hashlib
 import io
 import json
 import re
 import shlex
+import string
 import tarfile
 import tomllib
 import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Container, Iterable, Mapping, Optional, Sequence
@@ -67,6 +70,7 @@ from packaging.version import InvalidVersion, Version
 from .bugsinpy_meta import read_metadata_text
 from . import redact as redact_mod
 from . import suite as suite_mod
+from . import suite_cache as suite_cache_mod
 from . import trees as tree_mod
 from .shuru import (
     BUILD_JOB_ENV,
@@ -81,6 +85,7 @@ from .shuru import (
     checkpoint_create,
     checkpoint_delete,
     checkpoint_exists,
+    run as shuru_run,
     startup_check_lines,
 )
 from .split import Split, SplitError
@@ -164,6 +169,15 @@ PLUGIN_SOURCES = {
 }
 """What is recorded as having asked for a plugin pin — nothing *declared* it."""
 
+PYTEST_PROTECTED_SOURCE = "the test runner itself (every bug)"
+"""Why §8.6's R2 safeguard never drops ``pytest``.
+
+``PLUGIN_SOURCES`` covers the two packages that ride *on* pytest; this covers pytest
+itself, which is not in that mapping because nothing about it is plugin-specific: a
+layer without it has no runner, and a bug whose ``requirements.txt`` pins a pytest
+release nothing can install here is a bug to fix, never one to run without pytest.
+"""
+
 DEPS_DIRNAME = "deps"
 """Where ``bake`` leaves each per-bug layer's dependency provenance.
 
@@ -234,6 +248,22 @@ setuptools API a today-release needs. Kept as its own phrase rather than reusing
 :data:`BUILD_PIN_RULE` because the reader has to be able to tell a pin the *tree* asked for
 from one a *dependency's* sdist asked for — ``setuptools_scm`` appearing in a luigi layer's
 pin list is otherwise unexplainable.
+"""
+
+BUILD_REQUIREMENT_FALLBACK_PIN_RULE = (
+    "build requirement, the declaring pin's own date"
+)
+"""The ``pin_rule`` of a build requirement placed by §3.2's widened window (§8.6 rule R3).
+
+[VANTA-WHY] :data:`BUILD_REQUIREMENT_PIN_RULE`'s date rule, read a second time and only when
+it found **nothing**: the window widens to the declaring pin's own release date
+(:func:`_declarer_pin_cutoff`), because a pin installed *as written* is not held to the bug's
+date (:func:`pin_cutoff`). It is a distinct phrase rather than the base one because the reader
+has to be able to tell a pin the bug's own date could reach from one it could not — the two
+carry the same ``declared_by``, and only ``pin_rule`` (and the ``widened_by`` key beside it)
+says the second rule was what placed it. Measured on ``fastapi/11``: ``ujson==3.0.0`` declares
+``setuptools_scm>=3.4``, nothing at the bug's date satisfies it, and the declarer's own date
+(2020-06-03) admits ``setuptools-scm==4.1.2``.
 """
 
 BUGSINPY_PIN_RULE = "BugsInPy's own exact pin, installed as written"
@@ -429,6 +459,68 @@ removed on lines nobody can grep, and the one thing a reader needs next to an em
 
 class BakeError(RuntimeError):
     """A layer could not be baked or did not verify."""
+
+
+class UndatableRef(BakeError):
+    """One declaration the date rule refuses: no release on or before its cutoff.
+
+    [VANTA-WHY] A distinct type, because two refusals a reader would otherwise read as
+    one are answered differently by §8.6's R2. "This constraint has no release the tree
+    could have been built with" (§3.2's date rule) is droppable when nothing the failing
+    tests' closure reaches imports the module it names and §8.6's R2's safeguard does not
+    protect it — the scope is the **module**, whatever file declared it; every *other* way
+    a ref is refused — a harness range the interpreter layer cannot accept, a reference
+    pin whose release does not exist, two of the layer's own pins that cannot both hold —
+    is not. Only the first is raised as this, so a caller that catches it is deciding
+    about one refusal and not the others.
+
+    Carries the refused :class:`DepRef` so the caller can ask the auditor about the
+    distribution it named and remove exactly it from the pass. It still *is* a
+    :class:`BakeError`, so every existing ``except BakeError`` reads it as before.
+    """
+
+    def __init__(self, message: str, *, ref: "DepRef") -> None:
+        super().__init__(message)
+        self.ref = ref
+
+
+class UnknownDeclarations(BakeError):
+    """One release whose declarations no reading reaches: a **known** unknown.
+
+    [VANTA-WHY] A distinct type, because "nobody could read this release's declarations"
+    and "reading them failed" are answered differently by §8.6 R2(ii)'s ``--no-deps``
+    closure (:func:`no_deps_dependents`). :func:`declared_requires` reads the version JSON,
+    the PEP 658 sidecar, the wheel and the sdist's own ``install_requires`` in turn, and a
+    release none of the four reaches is a fact about the release — PyPI carries no
+    ``requires_dist`` for it and nothing else to read it from (``httpcore==0.3.0`` is the
+    pin this is for) — which is :data:`CASE_UNKNOWN` and must be left in place rather than
+    guessed at, with the strict freeze gate as the backstop. A read that *errored* (a
+    network fault, a timeout, a body that is not the JSON it should be) is the other case
+    and fails the layer closed. It still *is* a :class:`BakeError`, so every existing
+    ``except BakeError`` reads it as before.
+    """
+
+
+class UnmovableDependent(BakeError):
+    """One pin §8.6 R2(ii)'s ``--no-deps`` closure has to move and may not.
+
+    [VANTA-WHY] A distinct type, because :func:`no_deps_dependents` has to answer two
+    questions the same way *within* a reading and differently *between* readings, and only
+    a type lets the caller tell which one it hit. Within a reading a release whose
+    declarations could not be **read** (a network fault, a timeout, a body that is not the
+    JSON it should be — the ``ERROR`` case, as against the known unknown
+    :class:`UnknownDeclarations`) means the closure cannot be closed against a picture it
+    only half holds, so the pin is named here rather than silently skipped: the first pass
+    flags the bug on it (D4) and the retry refuses to render a second attempt (D2). Carries
+    the ``spec`` it could not account for and the ``why``, which is the pair a refusal
+    record and the run's summary both need. It still *is* a :class:`BakeError`, so every
+    existing ``except BakeError`` reads it as before.
+    """
+
+    def __init__(self, spec: str, why: str) -> None:
+        super().__init__(f"{spec} cannot be moved out of the resolving pass: {why}")
+        self.spec = spec
+        self.why = why
 
 
 @dataclass(frozen=True)
@@ -934,7 +1026,7 @@ than measured, and the assumption is wrong on this toolchain. ``<stdint.h>`` is 
 standard header — glibc's, with no ``namespace std`` block and no ``__cplusplus``
 guarded one — and C++'s ``std::uint16_t`` comes from libstdc++'s ``<cstdint>``, which
 is where ``c_compatibility``'s ``stdint.h`` wrapper is *not*. Measured on ``pandas/1``'s
-own dependency layer (``runs/bugsinpy/bake-logs/vanta-bi-pandas-1.log``): the ``.cxx``
+own dependency layer (``runs/bugsinpy/bake-logs/*/vanta-bi-pandas-1.log``): the ``.cxx``
 compile line carried this flag — ``g++ -Wno-unused-result
 … -Wno-error=declaration-missing-parameter-type -D_GNU_SOURCE -include stdint.h -fPIC
 -DPOCKETFFT_PTHREADS … -c scipy/fft/_pocketfft/pypocketfft.cxx`` — and the compile died
@@ -1033,7 +1125,7 @@ numpy's own C sources (:data:`_ERA_GNU_SOURCE`). ``CXXFLAGS`` is not an answer e
 ``customize_compiler`` never reads it (:data:`_ERA_STDINT_INCLUDE`). What is left is
 the one position that is *only* ever a C++ compile: the driver word itself, which is
 the whole of the difference between the ``gcc`` line and the ``g++`` line in one log
-(``runs/bugsinpy/bake-logs/vanta-bi-pandas-1.log``). Every C++ compile in the layer
+(``runs/bugsinpy/bake-logs/*/vanta-bi-pandas-1.log``). Every C++ compile in the layer
 comes from there — ``numpy.distutils``' ``CXX``, plain ``distutils``' recorded value —
 and no C compile reads it at all, so a file named by ``CXX`` that prepends the flag is
 the scoped injection the flag needs.
@@ -1100,7 +1192,7 @@ unsigned type", commit ``2a7bb4596f566a34fd53932af0ef53b956459d25``) — while t
 source declares its own view of that struct's field as ``char *tags;``
 (``ft2font.cpp:208`` and ``:326``) and fills it from the outline
 (``tags = outline.tags + first;``, ``:230`` and ``:346``). Measured on the layer
-(``runs/bugsinpy/bake-logs/vanta-bi-pandas-1.log``), the compile ended
+(``runs/bugsinpy/bake-logs/*/vanta-bi-pandas-1.log``), the compile ended
 
 ``src/ft2font.cpp:230:29: error: invalid conversion from 'unsigned char*' to 'char*'
 [-fpermissive]`` (and ``:346:29``, the same two lines) … ``error: command 'gcc' failed
@@ -2109,6 +2201,167 @@ def _dict_literal_items(node: ast.expr) -> Optional[dict[str, ast.expr]]:
     return out
 
 
+def _module_string_constants(tree: ast.Module) -> dict[str, str]:
+    """Module-level ``NAME = "literal"`` bindings, for resolving f-strings.
+
+    [VANTA-WHY] ``pandas``' ``setup.py`` writes ``min_numpy_ver = "1.13.3"`` at module
+    level and spells the requirement ``f"numpy >= {min_numpy_ver}"``. The AST sees a
+    ``JoinedStr`` whose only literal part is ``"numpy >= "``, so the reader used to
+    hand ``"numpy >= "`` to :class:`Requirement` and fail the bug with a message about
+    a requirement nobody wrote (§8.6 row 1). Resolving the interpolation is what turns
+    the declaration back into the string it will be at runtime.
+
+    Only names bound at **module level** to a plain string constant are collected: a
+    name bound inside a function, or to anything computed, is not a fact this reader
+    can read without running the file, and the reader never runs it (design C3).
+    """
+
+    out: dict[str, str] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                out[target.id] = node.value.value
+    return out
+
+
+def _joined_str_value(node: ast.JoinedStr, constants: Mapping[str, str]) -> Optional[str]:
+    """The string an f-string builds, or ``None`` when it is not statically read.
+
+    Every part must be a literal, or an interpolation of a module-level string
+    constant with no conversion and no format spec (``f"{x!r}"`` and ``f"{x:>3}"``
+    build a string this reader would have to guess at, so it refuses).
+    """
+
+    parts: list[str] = []
+    for value in node.values:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            parts.append(value.value)
+            continue
+        if (
+            isinstance(value, ast.FormattedValue)
+            and value.conversion == -1
+            and value.format_spec is None
+            and isinstance(value.value, ast.Name)
+            and value.value.id in constants
+        ):
+            parts.append(constants[value.value.id])
+            continue
+        return None
+    return "".join(parts)
+
+
+FORMAT_METHOD = "format"
+"""The one method :func:`_format_call_value` folds — ``"…".format(…)``."""
+
+
+def _format_template(node: ast.expr, constants: Mapping[str, str]) -> Optional[str]:
+    """The string a ``str.format`` *receiver* holds, or ``None`` when it is not one.
+
+    Two spellings and no more, because both are facts the AST alone carries: a string
+    literal, and a module-level ``NAME = "…"`` binding (:func:`_module_string_constants`).
+    Anything else — a name bound in a function, a concatenation, an f-string — is a
+    string this reader would have to run the file to see, and it never runs it.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return constants.get(node.id)
+    return None
+
+
+def _format_call_value(node: ast.expr, constants: Mapping[str, str]) -> Optional[str]:
+    """The string ``"numpy >= {v}".format(v=…)`` builds, or ``None`` when not read.
+
+    [VANTA-WHY] The **third** spelling of a requirement this reader has to build before
+    it can read it, after the plain literal and the f-string: pandas' ``setup.py`` at
+    ``ad4c4d5`` writes ``min_numpy_ver = "1.13.3"`` at module level and then
+
+        "numpy >= {numpy_ver}".format(numpy_ver=min_numpy_ver)
+
+    inside ``install_requires`` (§8.6). The AST sees an :class:`ast.Call` on a string
+    constant, so without this the declaration was never a literal and pandas/121, 138
+    and 144 stayed flagged on ``'numpy >= {numpy_ver}'`` while 78, 85 and 104 — whose
+    ``setup.py`` uses the f-string spelling the f-string folder already handles —
+    resolved. Only the *argument* names change between the two spellings; both name the
+    same module constant.
+
+    ``None`` is both "not a ``.format`` call" and "a ``.format`` call this reader will
+    not guess at", and the caller treats the second as a shadow: the declaration is left
+    as it is and :func:`_refuse_unresolved_templates` flags it. Refused, one field at a
+    time, are a positional or auto-numbered field (``{0}``, ``{}``), a format spec
+    (``{v:>3}``), a conversion (``{v!r}``), a field whose name is not a keyword of the
+    call, and any keyword whose value is not a module-level string constant — each of
+    them a string this reader would have to compute to see.
+    """
+    if not isinstance(node, ast.Call):
+        return None
+    func = node.func
+    if not isinstance(func, ast.Attribute) or func.attr != FORMAT_METHOD:
+        return None
+    template = _format_template(func.value, constants)
+    if template is None or node.args:
+        return None
+    named: dict[str, str] = {}
+    for keyword in node.keywords:
+        if keyword.arg is None:
+            return None
+        value = _format_template(keyword.value, constants)
+        if value is None:
+            return None
+        named[keyword.arg] = value
+    try:
+        parsed = list(string.Formatter().parse(template))
+    except ValueError:
+        return None
+    parts: list[str] = []
+    for literal, field, spec, conversion in parsed:
+        parts.append(literal)
+        if field is None:
+            continue
+        if conversion is not None or spec or not field.isidentifier() or field not in named:
+            return None
+        parts.append(named[field])
+    return "".join(parts)
+
+
+def _fold_string_constants(node: ast.expr, constants: Mapping[str, str]) -> ast.expr:
+    """``node`` with every *resolvable* f-string or ``str.format`` replaced by the
+    string it builds.
+
+    A template whose interpolation cannot be resolved is left as it is — the
+    ``JoinedStr`` or the ``Call`` — so the readers that run after this see it for what
+    it is: a declaration whose only literal part would be a truncation of it.
+    :func:`_refuse_unresolved_templates` refuses one of those by name rather than
+    reading the truncation as a requirement (§8.6).
+    """
+
+    if isinstance(node, ast.JoinedStr):
+        resolved = _joined_str_value(node, constants)
+        if resolved is not None:
+            return ast.copy_location(ast.Constant(value=resolved), node)
+        return node
+    formatted = _format_call_value(node, constants)
+    if formatted is not None:
+        return ast.copy_location(ast.Constant(value=formatted), node)
+    for field, value in ast.iter_fields(node):
+        if isinstance(value, list):
+            setattr(
+                node,
+                field,
+                [
+                    _fold_string_constants(item, constants) if isinstance(item, ast.AST) else item
+                    for item in value
+                ],
+            )
+        elif isinstance(value, ast.AST):
+            setattr(node, field, _fold_string_constants(value, constants))
+    return node
+
+
 def _setup_kwargs(setup_py: str) -> dict[str, ast.expr]:
     """``setup(...)``'s keyword arguments, as AST nodes.
 
@@ -2181,7 +2434,10 @@ def _setup_kwargs(setup_py: str) -> dict[str, ast.expr]:
                     kwargs.update(splat_items(keyword.value.id))
                 continue
             kwargs[keyword.arg] = deref(keyword.value)
-    return kwargs
+    # Every declaration is folded once, here, so the literal readers below see the
+    # string the file would have built rather than an f-string's literal parts.
+    constants = _module_string_constants(tree)
+    return {key: _fold_string_constants(value, constants) for key, value in kwargs.items()}
 
 
 def _literal_nodes(node: ast.expr) -> list[ast.Constant]:
@@ -2243,6 +2499,49 @@ def _extras_tests_node(extras: Optional[ast.expr]) -> Optional[ast.expr]:
     return None
 
 
+def _is_format_call(node: ast.AST) -> bool:
+    """A ``<string>.format(…)`` call this reader did not fold (see the refusal)."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == FORMAT_METHOD
+    )
+
+
+def _refuse_unresolved_templates(node: ast.expr, *, source: str) -> None:
+    """Fail closed on a declaration carrying a template this reader could not fold.
+
+    [VANTA-WHY] §8.6: the pandas template is resolved statically, and a declaration
+    that does not resolve to a literal is **flagged**, never truncated. There are two
+    ways a declaration spells a string this reader has to build before it can be read —
+    an f-string (``JoinedStr``, :func:`_joined_str_value`) and a ``str.format`` call
+    (:func:`_format_call_value`) — and each, left alone, shows the literal readers only
+    its fixed parts: ``f"numpy >= {v}"`` reads as ``"numpy >= "`` and
+    ``"numpy >= {v}".format(v=…)`` reads as ``"numpy >= {v}"``. A requirement built from
+    either is a requirement nobody wrote, so refusing here turns it into a flag with the
+    line number — the honest answer — instead of a silently wrong pin.
+
+    Read on the **folded** node, which is why a ``.format`` call still standing is
+    exactly one :func:`_format_call_value` declined: everything it could resolve is a
+    ``Constant`` by the time this walks the tree.
+    """
+
+    for item in ast.walk(node):
+        if isinstance(item, ast.JoinedStr):
+            raise BakeError(
+                f"{source} line {item.lineno}: an f-string this harness cannot resolve "
+                "to a literal (its interpolation is not a module-level string constant), "
+                "so the requirement it spells cannot be read; flag this bug (design §3.2)"
+            )
+        if _is_format_call(item):
+            raise BakeError(
+                f"{source} line {item.lineno}: a str.format call this harness cannot "
+                "resolve to a literal (a positional or auto-numbered field, a format "
+                "spec, or an argument that is not a module-level string constant), so the "
+                "requirement it spells cannot be read; flag this bug (design §3.2)"
+            )
+
+
 def _entry_refs(
     node: Optional[ast.expr],
     *,
@@ -2256,6 +2555,7 @@ def _entry_refs(
     if node is None:
         notes.append(f"{source}: not declared in setup.py")
         return [], []
+    _refuse_unresolved_templates(node, source=source)
     refs: list[DepRef] = []
     skipped: list[SkippedLine] = []
     files = _file_literals(node)
@@ -3395,6 +3695,17 @@ def tree_provided_modules(repo: Path, commit: str) -> set[str]:
     return _tree_local_modules(tree_mod.list_files_at(repo, commit))
 
 
+CLOSURE_SOURCE_PREFIX = "import closure: "
+"""What :func:`test_import_closure` writes in front of the site a ref was read from.
+
+[VANTA-WHY] One literal rather than a second copy of it in §8.6's R2. The drop rule
+asks whether a refused ref came from *this* source and no other (§8.6's R2: a
+declaration a project's own file wrote is a different finding), and the answer is
+this prefix on :attr:`DepRef.source`; a reader that spelled it out again would be a
+second place the format could drift from.
+"""
+
+
 def test_import_closure(
     *,
     files: Sequence[str],
@@ -3460,12 +3771,12 @@ def test_import_closure(
                 continue
             if not _can_name_a_distribution(top):
                 notes.append(
-                    f"import closure: {path} line {site.line}: {top!r} cannot name a "
-                    "distribution, so it is the interpreter's own module and nothing "
+                    f"{CLOSURE_SOURCE_PREFIX}{path} line {site.line}: {top!r} cannot name "
+                    "a distribution, so it is the interpreter's own module and nothing "
                     "is installed for it"
                 )
                 continue
-            source = f"import closure: {path} line {site.line}"
+            source = f"{CLOSURE_SOURCE_PREFIX}{path} line {site.line}"
             # ``type-checking only`` and ``lazy: inside <qualname>`` are the audit's
             # reasons, not this walk's: §3.2 consults them to decide whether a pin
             # nothing here can install may be dropped (:func:`decide_unresolvable`), and
@@ -3495,6 +3806,8 @@ def requirements_recipe(
     no_deps_pins: Sequence[str] = (),
     orphans: Sequence[str] = (),
     minor: Optional[str] = None,
+    early_pins_first: bool = False,
+    hoist_pins: Sequence[str] = (),
 ) -> str:
     """Install one bug's *resolved* dependencies on top of the interpreter layer.
 
@@ -3604,8 +3917,23 @@ def requirements_recipe(
     ``cryptography 47.0.0`` for it; ``pandas/1``'s ``statsmodels==0.11.1`` declares
     ``pandas`` and the layer held ``pandas 2.0.3``. It runs **after** the main pass, so
     everything the pin declared is already installed (the closure walk pinned it) and
-    ``--no-deps`` costs nothing but the absent name, and **before** the orphan removal,
-    which is the last thing before the reading.
+    ``--no-deps`` costs nothing but the absent name, and **before** the orphan removal, which is the last thing before the reading.
+
+    ``early_pins_first`` and ``hoist_pins`` are the two things a **second** attempt may
+    change, and together §8.6 R1's whole content. With ``early_pins_first`` the
+    ``early_pins`` install above is emitted **before** the build requirements' instead of
+    after, so a *build requirement's* own ``setup.py`` finds the pins the layer already
+    holds rather than reaching ``easy_install`` for a release of the day. With
+    ``hoist_pins`` those pins get a finished install step of their own immediately before
+    the early block, which is the half the first one cannot do: ``luigi/30``'s fetch
+    happens **inside** the early block — its ``pytest-runner==2.5.1``'s ``egg_info``
+    loaded today's ``setuptools_scm`` from ``.eggs`` and died on ``setuptools.sic`` —
+    and the block is a single ``pip -r`` call, so its own
+    ``setuptools-scm==3.4.1`` is still uninstalled when that metadata is prepared
+    whichever line of the block it sits on. Both are ``False``/empty by default and
+    reach the recipe **only** from :func:`retry_plan`, after a first attempt has already
+    failed, so every first-pass recipe — and so every already-baked layer — is
+    byte-identical.
     """
     no_deps = [spec.strip() for spec in no_deps_pins if spec.strip()]
     no_deps_set = set(no_deps)
@@ -3658,6 +3986,56 @@ def requirements_recipe(
             # against the day's PyPI is the measured `fastapi/1` failure.
             f"python -m pip install --no-cache-dir {held}-r /tmp/build-tools.txt",
         ]
+    early = [spec.strip() for spec in early_pins if spec.strip()]
+    early_block = (
+        [
+            "cat > /tmp/early-req.txt <<'VANTA_EARLY_REQUIRES'",
+            "\n".join(early),
+            "VANTA_EARLY_REQUIRES",
+            # The dependency pins that another pin in this layer builds against,
+            # installed before the main list so the build finds them: with
+            # `--no-build-isolation` an unsatisfied setup_requires is fetched by
+            # easy_install at today's version rather than the pinned one (§3.2). It
+            # carries the flag for the same reason the main install does — it is a
+            # dependency install and a dependency can itself be a source build.
+            "python -m pip install --no-cache-dir "
+            f"{held}--no-build-isolation {LEGACY_RESOLVER_FLAG} -r /tmp/early-req.txt",
+            _no_isolated_build_env("the early build-requirement install"),
+        ]
+        if early
+        else []
+    )
+    hoist = [spec.strip() for spec in hoist_pins if spec.strip()]
+    if hoist:
+        # §8.6 R1's retry, and only ever on a *second* attempt: the failing pass's own log
+        # shows easy_install reaching for a distribution one of `early_pins` already
+        # satisfies (`luigi/30`: `setuptools_scm`, which the layer's own
+        # `setuptools-scm==3.4.1` answers). Installing that pin ahead of the block is not
+        # enough to put it there in time — the block is one `pip -r` call, and pip
+        # prepares every requirement's metadata before it installs any of them — so it
+        # gets a finished install step of its own, immediately before the block, and
+        # nothing is removed from the block it came from (pip reports the second mention
+        # as already satisfied). Nothing is added and no version changes: these specs are
+        # in `early_pins` already (:class:`HoistedPin`).
+        early_block = [
+            "cat > /tmp/hoist-req.txt <<'VANTA_HOIST_REQUIRES'",
+            "\n".join(hoist),
+            "VANTA_HOIST_REQUIRES",
+            # The same flags as the early block it precedes, and for the same reasons:
+            # it is a dependency install, it must run against what the layer already has
+            # rather than an isolated copy of the day's PyPI, and it must be held to the
+            # layer's whole pin list.
+            "python -m pip install --no-cache-dir "
+            f"{held}--no-build-isolation {LEGACY_RESOLVER_FLAG} -r /tmp/hoist-req.txt",
+            _no_isolated_build_env("the hoisted build-requirement install"),
+        ] + early_block
+    if early_pins_first:
+        # §8.6 R1's one retry, and only ever on a *second* attempt: a build
+        # requirement's own `setup.py` runs before the early pins when the first pass
+        # died in a build requirement's `egg_info` (luigi/30), so the second attempt
+        # installs them first. The first pass never passes this flag, so its recipe is
+        # byte-identical to what it was before the rule existed.
+        lines += early_block
     if build_requires:
         lines += [
             "cat > /tmp/build-req.txt <<'VANTA_BUILD_REQUIRES'",
@@ -3679,22 +4057,8 @@ def requirements_recipe(
         check = _build_pin_check(build_pins)
         if check:
             lines.append(check)
-    early = [spec.strip() for spec in early_pins if spec.strip()]
-    if early:
-        lines += [
-            "cat > /tmp/early-req.txt <<'VANTA_EARLY_REQUIRES'",
-            "\n".join(early),
-            "VANTA_EARLY_REQUIRES",
-            # The dependency pins that another pin in this layer builds against,
-            # installed before the main list so the build finds them: with
-            # `--no-build-isolation` an unsatisfied setup_requires is fetched by
-            # easy_install at today's version rather than the pinned one (§3.2). It
-            # carries the flag for the same reason the main install does — it is a
-            # dependency install and a dependency can itself be a source build.
-            "python -m pip install --no-cache-dir "
-            f"{held}--no-build-isolation {LEGACY_RESOLVER_FLAG} -r /tmp/early-req.txt",
-            _no_isolated_build_env("the early build-requirement install"),
-        ]
+    if not early_pins_first:
+        lines += early_block
     if body:
         lines += [
             "cat > /tmp/req.txt <<'VANTA_REQUIREMENTS'",
@@ -3940,6 +4304,30 @@ def setup_sh_for(bugsinpy_root: Path, project: str, bug_id: int) -> str:
     return read_metadata_text(path)
 
 
+def run_test_sh_for(bugsinpy_root: Path, project: str, bug_id: int) -> str:
+    path = bugsinpy_root / "projects" / project / "bugs" / str(bug_id) / "run_test.sh"
+    if not path.is_file():
+        return ""
+    return read_metadata_text(path)
+
+
+def test_command_of(run_test_sh: str) -> Optional[str]:
+    """The one command line ``run_test.sh`` invokes, or ``None`` when it carries none.
+
+    The same reading BugsInPy's own record gets
+    (:meth:`bugsinpy_meta.BugInfo.run_test_command`): the first line that is neither
+    blank nor a comment. It is read here rather than only there because §8.6's R2
+    safeguard needs it for a layer whose ``BugInfo`` was never loaded, and a second
+    spelling of "the command" would be a second answer to ``-p`` questions.
+    """
+    for raw in run_test_sh.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        return line
+    return None
+
+
 # ---------------------------------------------------------------------------
 # every dependency source, unioned, then pinned by date (§3.2, §3.3)
 # ---------------------------------------------------------------------------
@@ -3995,6 +4383,14 @@ class DepSources:
     tree's modules against PyPI, and §3.2's closure walk, which must not pin the tree's
     own distribution (:data:`TREE_SATISFIED_RULE`). Carrying it also means this record's
     consumers — the walk included — never touch the filesystem for it.
+    """
+
+    test_command: Optional[str] = None
+    """The command BugsInPy's own ``run_test.sh`` runs for this bug (:func:`test_command_of`).
+
+    Not an executor — the harness runs the suite itself — but §8.6's R2 safeguard reads
+    its ``-p`` options, because a plugin the bug's own command loads is imported by
+    pytest and by no line in the tree (:func:`plugin_options`).
     """
 
 
@@ -4801,11 +5197,17 @@ def _pin_each_ref(
             dated = [item for item in matching if item[1][:10] <= cutoff]
             if not dated:
                 newest = _newest_release(available)
-                raise BakeError(
+                # An ``UndatableRef`` and not a plain ``BakeError``: this is the one
+                # refusal §8.6's R2 may drop (when the ref came from the test side's own
+                # import closure and nothing the failing tests reach imports it), and the
+                # type is what tells the drop pass it is looking at that refusal rather
+                # than at the harness-range or reference-pin ones below and above.
+                raise UndatableRef(
                     f"{ref.source}: {ref.spec} has no release on or before {cutoff} "
                     f"(newest {ref.name} is {newest[0]}, released {newest[1][:10]}). "
                     "The tree this requirement was declared in could not have been "
-                    "built with it."
+                    "built with it.",
+                    ref=ref,
                 )
             if claims:
                 wanted = [
@@ -5734,6 +6136,12 @@ REQUIRES_DIST_HEADER = "requires-dist"
 WHEEL_METADATA_MEMBER = ".dist-info/METADATA"
 """Where a wheel keeps the document the sidecar would have published."""
 
+WHEEL_ENTRY_POINTS_MEMBER = ".dist-info/entry_points.txt"
+"""Where a wheel keeps the entry points the project declares (Core Metadata's sibling)."""
+
+PYTEST_ENTRY_POINT_GROUP = "pytest11"
+"""The entry-point group pytest loads plugins from."""
+
 
 def _requires_dist_fields(text: str) -> tuple[str, ...]:
     """The ``Requires-Dist`` fields of a Core Metadata document.
@@ -5759,19 +6167,42 @@ def _requires_dist_fields(text: str) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _metadata_member(data: bytes) -> Optional[str]:
-    """The ``METADATA`` document inside a wheel, or ``None`` when it holds none."""
+def _wheel_member(
+    data: bytes, suffix: str, *, missing: Optional[str] = None
+) -> Optional[str]:
+    """One member of a wheel in memory, found by the suffix that ends its name.
+
+    [VANTA-WHY] One reader for two members rather than two readers: ``METADATA`` and
+    ``entry_points.txt`` are both ``<distribution>.dist-info/<name>`` inside the same
+    zip, and the second is read by §8.6's R2 safeguard — "never drop a package that is
+    a pytest plugin" is a question only the wheel can answer, because PyPI's JSON
+    publishes no entry points (:func:`declares_pytest_plugin`).
+
+    ``missing`` is what a wheel that **opened** and simply does not carry the member
+    answers, and it exists for the safeguard: ``None`` would say "could not tell", but a
+    wheel whose zip lists no ``entry_points.txt`` has told us — the distribution
+    registers no entry point at all — and §8.6's R2 must not read that as a refusal to
+    drop. Measured on ``h5py==2.10.0``, whose 28 wheels carry no ``entry_points.txt``:
+    with ``None`` for both, its entry-point question was "unknown" and the pin the
+    retry was to drop was protected instead. ``None`` is still the answer — whatever
+    ``missing`` says — for a wheel that will not open, which is the one case that really
+    is unknown.
+    """
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             names = [
-                name for name in archive.namelist()
-                if name.endswith(WHEEL_METADATA_MEMBER)
+                name for name in archive.namelist() if name.endswith(suffix)
             ]
             if not names:
-                return None
+                return missing
             return archive.read(names[0]).decode("utf-8", errors="replace")
     except (zipfile.BadZipFile, OSError, KeyError):
         return None
+
+
+def _metadata_member(data: bytes) -> Optional[str]:
+    """The ``METADATA`` document inside a wheel, or ``None`` when it holds none."""
+    return _wheel_member(data, WHEEL_METADATA_MEMBER)
 
 
 @dataclass(frozen=True)
@@ -5888,22 +6319,51 @@ def pypi_sidecar_text(file: PyPIFile) -> Optional[str]:
         raise BakeError(f"cannot read the metadata beside {file.filename}: {exc}") from exc
 
 
-def wheel_metadata_text(file: PyPIFile) -> Optional[str]:
-    """The ``METADATA`` document inside one wheel, or ``None`` when it holds none.
+def wheel_member_text(
+    file: PyPIFile, member: str, *, missing: Optional[str] = None
+) -> Optional[str]:
+    """One member of one wheel, downloaded and read, or ``None`` when it holds none.
 
-    The last resort for a release whose declarations the JSON does not carry and whose
-    sidecar PyPI did not publish, and it downloads the wheel to read them — the same
-    document the sidecar would have served without the download, which is why it is
-    second and not first. A wheel past :data:`SDIST_MAX_BYTES` is not read: it is the
-    same fuse the sdist listing uses, and a release past it is reported as unknown
-    rather than guessed at.
+    The download both readers share: :func:`wheel_metadata_text` asks for the
+    declarations, :func:`declares_pytest_plugin` for the entry points, and a wheel past
+    :data:`SDIST_MAX_BYTES` is not read either way — it is the same fuse the sdist
+    listing uses, and a release past it is reported as unknown rather than guessed at.
+
+    ``missing`` is forwarded to the reader (:func:`_wheel_member`), and it is what lets
+    the entry-point question distinguish a wheel that registers nothing from one that
+    could not be read.
     """
     try:
         with urllib.request.urlopen(file.url, timeout=PYPI_TIMEOUT_SECS) as response:
             data, _ = _read_capped(response, SDIST_MAX_BYTES)
     except (urllib.error.URLError, OSError) as exc:
         raise BakeError(f"cannot download {file.filename}: {exc}") from exc
-    return _metadata_member(data)
+    return _wheel_member(data, member, missing=missing)
+
+
+def wheel_entry_points_text(file: PyPIFile) -> Optional[str]:
+    """One wheel's ``entry_points.txt``: ``""`` when it holds none, ``None`` unreadable.
+
+    §8.6's R2 safeguard's only witness for "is this release a pytest plugin", and the
+    whole reason it is a reader of its own rather than a call to
+    :func:`wheel_metadata_text`: the third answer is load-bearing. ``None`` means the
+    wheel could not be read, so the safeguard reads it as "cannot tell, do not drop";
+    ``""`` means the wheel **was** read and registers nothing, so the safeguard has
+    nothing to say and the drop may proceed. One answer for both would protect every pin
+    whose wheel simply has no entry points — measured on ``h5py==2.10.0``.
+    """
+    return wheel_member_text(file, WHEEL_ENTRY_POINTS_MEMBER, missing="")
+
+
+def wheel_metadata_text(file: PyPIFile) -> Optional[str]:
+    """The ``METADATA`` document inside one wheel, or ``None`` when it holds none.
+
+    The last resort for a release whose declarations the JSON does not carry and whose
+    sidecar PyPI did not publish, and it downloads the wheel to read them — the same
+    document the sidecar would have served without the download, which is why it is
+    second and not first.
+    """
+    return wheel_member_text(file, WHEEL_METADATA_MEMBER)
 
 
 def declared_requires(
@@ -5985,7 +6445,7 @@ def declared_requires(
         from_sdist = read_sdist(sdist)
         if from_sdist is not None:
             return tuple(from_sdist)
-    raise BakeError(
+    raise UnknownDeclarations(
         f"PyPI carries no 'requires_dist' for {name}=={version}, and neither a wheel "
         "nor a PEP 658 sidecar to read it from, and the sdist's setup.py does not "
         "declare install_requires as literals, so what it declares is unknown"
@@ -6361,6 +6821,153 @@ could make work on this image (:data:`UNBUILDABLE_ON_PLATFORM`).
 The pin *is* sdist-only, so its class letter stays (b) — that is what pip will try — and
 this is the separate word for the fact that the attempt cannot succeed. It is a recorded
 outcome like :data:`NO_DISTRIBUTION`, not a class of its own.
+"""
+
+DATE_RULE_REFUSAL = "no-release-before-date"
+"""A §3.2 finding that is not one of the three classes: a declaration the date rule refuses.
+
+[VANTA-WHY] The date rule's refusal has two readings and §8.6's R2 separates them. A
+requirement a project's own file declared and that has no release on or before that
+file's date is a bug the benchmark graded on an environment that never existed — that
+is a *flag*. A requirement that nothing the failing tests reach imports is the harness
+trying to install something the bug's own tests were never written against: the module
+is outside the failing tests' closure, and R2 drops it with this outcome instead of
+flagging the bug for it.
+
+The scope is the **module**, not the declaring file (§8.6's R2, batch 3): a refusal is
+dropped whenever the module it names is outside the failing tests' import closure,
+whatever file declared it, and the safeguard (:func:`pin_safeguard`) is asked first.
+
+It is a recorded outcome like :data:`NO_DISTRIBUTION`, not a class of its own: what it
+says is *why* nothing installs the pin, not what pip would have tried.
+"""
+
+UNBUILDABLE_AT_BAKE = "sdist-failed-to-build-at-bake"
+"""§8.6's R2's other half: a pin whose own sdist **failed to build in this image**.
+
+[VANTA-WHY] Not the same finding as :data:`UNBUILDABLE`, which is the *preflight's*
+prediction from the reviewed table: this one is observed, and it is only ever observed
+in the failing layer's own build log — ``pip`` writes ``Failed to build h5py scikit
+-learn`` and the trace above it names the library. Measured on ``pandas/7``: ``h5py``
+is a BugsInPy pin whose sdist dies on ``libhdf5.so`` and ``scikit-learn`` is a
+closure-sourced pick whose sdist dies on a missing ``scipy``, and neither is refused by
+any preflight, because both are installable in principle and only fail here. It is
+recorded like the others, and it reaches the rule from the **retry**
+(:func:`retry_drops`) rather than from resolution, because resolution never ran the
+build.
+"""
+
+STDLIB_BACKPORT = "stdlib-backport-shadow"
+"""§8.6's round-11 finding: a stdlib backport installed on an interpreter that ships it.
+
+[VANTA-WHY] Unlike the three findings above, this pin **is** installable here — the
+wheel exists and pip takes it — so no preflight could ever mark it and the date rule is
+right to pick it (``hypothesis`` declares ``enum34`` bare, with no marker, in every
+release of its era). It is dropped because installing the backport puts its top-level
+module *ahead of the stdlib one* on ``sys.path``: the layer's interpreter already ships
+the real module, so the backport does not add a capability, it shadows the one the
+interpreter has. Measured on ``luigi/7`` and ``luigi/5``, whose full prepare dies at
+pytest start-up with ``TypeError: an integer is required (got type bytes)`` — an old
+``enum`` backport reading bytes the 3.8 stdlib hands it. The two bugs that carry no
+``enum34`` (``luigi/9`` and ``luigi/12``, whose ``hypothesis`` pins are older still) are
+**not** the counterfactual an earlier reading of this took them for: both fail an earlier
+gate (``empty FAIL_TO_PASS``) and never run at all, so nothing here measures "without
+``enum34`` this suite runs". ``luigi/8`` carries ``enum34`` too and fails that same
+earlier gate, so it neither adds nor removes evidence for the crash.
+
+The list is closed and named (:data:`STDLIB_BACKPORTS`) rather than a rule over PYPI
+names: the drop happens by name, on evidence, and only for a distribution that is a
+backport of a module the layer's own interpreter already has. It is a recorded outcome
+like the others — what it says is *why* the layer does not install the pin, not what pip
+would have tried.
+"""
+
+FAILED_BUILD_PREFIX = "Failed to build "
+"""How the layer's ``pip`` opens the one line that names what it could not build.
+
+Measured on ``pandas/7``: the merged output of the failed layer holds ``Failed to build
+h5py scikit-learn`` — the distribution names, space-separated, on a line of their own
+and nothing else on it. It is R2(ii)'s trigger (:func:`failed_builds`) because it is the
+one line of a four-hundred-line log that says *which* pins failed rather than *why*, and
+it is the reason the rule is a retry and not a preflight: the failure it reports only
+exists once the build has been run.
+"""
+
+FAILED_WHEEL_PREFIX = "ERROR: Failed building wheel for "
+"""How the same ``pip`` opens its per-name line, ``ERROR: Failed building wheel for h5py``.
+
+Measured on the same log, twice (``h5py`` and ``scikit-learn``), and it is preferred as
+the *evidence* a drop records because it names exactly one distribution: the summary line
+is what says "the retry applies at all", this is what says which log line says why.
+"""
+
+EGG_INFO_FAILURE = "python setup.py egg_info"
+"""How pip names the command whose failure R1 answers, on the line that states it.
+
+Measured on ``luigi/30``: the build requirement's legacy ``setup.py`` died in
+``egg_info`` — pip reached PyPI's ``easy_install`` for a ``setup_requires`` the recipe
+had not installed yet — and pip's own summary line is ``ERROR: Command errored out with
+exit status 1: python setup.py egg_info Check the logs for full command output.`` The
+whole log holds **no** ``Failed to build …`` line, because nothing reached the wheel
+stage: that is exactly why :func:`failed_builds` answers ``()`` for it and
+:func:`retry_drops` leaves it alone. This is the reading that turns it into R1's retry
+(:func:`failed_build_requirement_metadata`).
+"""
+
+RETRY_KEY = "retry"
+"""The provenance key saying a layer's first build failed and its one retry what did.
+
+[VANTA-WHY] Written *after* the bake, like :data:`PIP_CHECK_KEY` and for a related
+reason: what the retry learned exists only once a build has been attempted, and a
+provenance that could not say "this layer needed its second attempt" would describe the
+first-pass resolution as though it had built.
+"""
+
+RETRY_RULE_DROP = "R2(ii)"
+"""§8.6 R2(ii)'s name, so the ``retry`` record says the second attempt was a *drop*."""
+
+RETRY_RULE_EARLY = "R1"
+"""§8.6 R1's name, so the ``retry`` record says the second attempt only *reordered*."""
+
+RETRY_RULE_TRANSIENT = "R4"
+"""§8.6 R4's name, so the ``retry`` record says the second attempt only *re-fetched*.
+
+[VANTA-WHY] A third failure shape reaches neither R1 nor R2(ii), and it is the one where
+the layer is not at fault at all: the bytes pip received were not the bytes the index
+advertised. Measured on ``pandas/66`` — ``matplotlib==3.1.3``'s sdist arrived with
+``a126ab08…`` where the index's link says ``db3121…``, one line under ``ProtocolError
+('Connection aborted.', RemoteDisconnected('Remote end closed connection without
+response'))``. There is no pin to drop (nothing built wrong) and no ordering to change
+(nothing ran out of order); the transfer was cut short. The first pass is untouched, the
+retry re-runs the layer's own recipe **unchanged** — every install carries
+``--no-cache-dir``, so the bytes are fetched again and checked against the same hash — and
+a **second** mismatch is reported as a possible integrity problem rather than a second
+transient failure, and the layer fails closed. Hash checking is never weakened: the retry
+is the *same* check run again.
+"""
+
+HASH_MISMATCH_MARKER = "THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE"
+"""How pip opens the line that says a received body is not the one the index's hash names.
+
+The marker pip writes for a download its hash comparison refused; the requirement and both
+hashes are on the indented lines beneath it (:func:`transient_download_failure`). It is
+R4's trigger, and it is deliberately **not** read as a drop: the pin the body belonged to is
+one the layer wants.
+"""
+
+HASH_EXPECTED_PREFIX = "Expected sha256 "
+"""How the block's second line names the hash the index advertised."""
+
+HASH_GOT_PREFIX = "Got"
+"""How the block's third line names the hash the received body produced."""
+
+TRANSIENT_ABORT_MARKERS = ("ProtocolError", "RemoteDisconnected", "Connection reset")
+"""A transfer that was cut short, named on the same log as pip's own ``Retrying`` warning.
+
+Corroborating evidence and not a gate: the mismatch is the fact this rule answers, and a
+*first* mismatch is retried whether or not a broken connection is named above it (§8.6 R4).
+The distinction that matters — an interrupted transfer versus a package whose bytes really
+changed — is drawn by the retry, never by this reading.
 """
 
 PREFLIGHT_CLASS_LETTERS: Mapping[str, str] = {
@@ -7077,6 +7684,78 @@ def easy_install_fetches(output: str) -> tuple[str, ...]:
     )
 
 
+EGG_BUILD_DIR_MARKER = "/.eggs/"
+"""The path segment ``easy_install`` installs a fetched build requirement into.
+
+[VANTA-WHY] The **second** reading of a fetch, and the one ``luigi/30`` needs: that
+layer's log holds no :data:`EASY_INSTALL_MARKERS` line at all — ``easy_install``'s own
+``Searching for …`` output never reached pip's stream — and the only evidence the fetch
+happened is the traceback frame that ran out of the fetched release,
+``File "/tmp/pip-install-jwj5ruzh/pytest-runner/.eggs/setuptools_scm-10.3.4-py3.8.egg/
+setuptools_scm/_integration/setuptools.py", line 25``. ``.eggs`` is setuptools' per-build
+scratch directory, created **inside** the build's own directory, so this reading is
+evidence of a fetch that failed the build rather than of an environment the layer kept:
+it is read by §8.6 R1's retry (:func:`hoisted_pins`) and deliberately not by the
+post-install gate (:func:`easy_install_fetches`).
+"""
+
+EGG_DIST_SUFFIX = ".egg"
+"""How the fetched distribution's own file ends there — ``setuptools_scm-10.3.4-py3.8.egg``."""
+
+SEARCHING_PREFIX = "Searching for "
+"""The marker half that names the distribution ``easy_install`` looked for."""
+
+BEST_MATCH_PREFIX = "Best match: "
+"""The marker half that names the release it settled on, ``Best match: cffi 2.1.1``."""
+
+
+def _marker_spelling(line: str) -> str:
+    """The distribution a ``Searching for …``/``Best match: …`` line names, or ``""``.
+
+    The first word after the marker, because both lines put it there: ``Searching for
+    cffi`` and ``Best match: cffi 2.1.1``. Nothing else on the line is read — the version
+    is not this rule's business, since §8.6 R1 only reorders pins the layer already has.
+    """
+    for prefix in EASY_INSTALL_MARKERS:
+        if line.startswith(prefix):
+            rest = line[len(prefix):].strip()
+            return rest.split()[0] if rest else ""
+    return ""
+
+
+def easy_install_fetch_evidence(output: str) -> tuple[tuple[str, str], ...]:
+    """``(the distribution a fetch named, the log line that named it)``, in log order.
+
+    Two readings of one event, because a failed build's log carries whichever one the
+    failing step produced: ``easy_install``'s own ``Searching for …``/``Best match: …``
+    line (:data:`EASY_INSTALL_MARKERS` — the shape ``fastapi/1``'s build produced) and the
+    ``.eggs/<name>-<version>…egg`` path of a traceback frame inside the fetched release
+    (:data:`EGG_BUILD_DIR_MARKER` — the shape ``luigi/30``'s produced). The evidence is the
+    numbered line, in the same ``build log line N: …`` spelling
+    :func:`failed_build_line` uses, so a reader can open the failing pass's own log and
+    find it.
+
+    Empty means the log names no fetch at all, and that is §8.6 R1's fail-closed answer:
+    no evidence, no hoist, no retry (:func:`hoisted_pins`).
+    """
+    out: list[tuple[str, str]] = []
+    for index, raw in enumerate(output.replace("\r", "\n").splitlines(), start=1):
+        line = raw.strip()
+        evidence = f"build log line {index}: {line}"
+        spelling = _marker_spelling(line)
+        if spelling:
+            out.append((spelling, evidence))
+            continue
+        for token in line.replace("\\", "/").split():
+            marker = token.find(EGG_BUILD_DIR_MARKER)
+            if marker < 0:
+                continue
+            egg = token[marker + len(EGG_BUILD_DIR_MARKER):].split("/", 1)[0]
+            if egg.endswith(EGG_DIST_SUFFIX) and egg[: -len(EGG_DIST_SUFFIX)]:
+                out.append((egg[: -len(EGG_DIST_SUFFIX)], evidence))
+    return tuple(out)
+
+
 def easy_install_failure(lines: Sequence[str]) -> ExecResult:
     """A failed build's result, synthesised from an ``easy_install`` fetch (§3.2).
 
@@ -7652,6 +8331,34 @@ def uncovered_build_requirements(
     return out
 
 
+def _declarer_pin_cutoff(
+    declarer: str, releases: Mapping[str, Mapping[str, str]]
+) -> Optional[str]:
+    """The date a build requirement's declaring pin is held to (§3.2).
+
+    [VANTA-WHY] :func:`pin_cutoff`'s reasoning, read on the **build** half: a pin's own
+    requirements cannot pre-date the release that declares them. ``ujson==3.0.0`` is a
+    BugsInPy reference pin installed *as written*, and it landed 2020-06-03 — after
+    every fastapi bug it appears in — so its ``setup_requires`` naming
+    ``setuptools_scm>=3.4`` asks for a release that did not exist at ``fastapi/11``'s
+    own date (2019-08-06). Held to the bug's date alone, that declaration is a refusal
+    for a pin the reference environment itself carried.
+
+    ``None`` when the declaring release's own date is not in ``releases`` — the answer
+    for a declarer nothing fetched, and the conservative one: the window then stays the
+    bug's own date, exactly as it was before this fallback existed.
+    """
+    parts = _pinned_parts(declarer)
+    if parts is None:
+        return None
+    name, version = parts
+    available = releases.get(canonicalize_name(name))
+    if not available:
+        return None
+    date = available.get(version)
+    return date[:10] if date else None
+
+
 def build_requirement_pins(
     requirements: Sequence[BuildRequirement],
     *,
@@ -7679,6 +8386,25 @@ def build_requirement_pins(
     before ``commit_date`` inside the declared range is a ``BakeError`` and flags the bug,
     like every other date-rule refusal: a declaration nothing at the bug's date satisfies
     is exactly the layer that would fall back on ``easy_install``.
+
+    The one thing that can rescue such a refusal is the declaring pin's **own** date
+    (:func:`_declarer_pin_cutoff`), and it is reached **only** when the bug's date finds
+    nothing — that is the whole point of reading it second. A layer the date rule already
+    resolves keeps the release it has, bit for bit, so no already-baked layer can be moved
+    by this rule; the fallback only ever turns a refusal into a resolution. Measured on
+    ``fastapi/11``: ``ujson==3.0.0`` (released 2020-06-03) declares
+    ``setuptools_scm>=3.4``, nothing at the bug's 2019-08-06 date satisfies it, and the
+    declaring release's window admits ``setuptools-scm==4.1.2`` (2020-05-31). The fastapi
+    layers with later commit dates never reach the fallback at all: ``fastapi/1``, ``/2``
+    and ``/3`` pick ``setuptools-scm==3.5.0`` and ``fastapi/5`` and ``/6`` pick ``==3.4.1``
+    from the bug's own date, which is what keeps them byte-identical.
+
+    A pin the widened window places records the fallback rather than leaving it to
+    ``declared_by``: its ``pin_rule`` names the widened window
+    (:data:`BUILD_REQUIREMENT_FALLBACK_PIN_RULE`) and ``widened_by`` names the declaring
+    release(s) whose own date became the cutoff — so the JSON says *why* the release is
+    newer than the bug's own date, which ``declared_by`` alone cannot (the same key is on
+    a pin the bug's date already reached).
 
     ``releases`` is the caller's — it has to include these names, which the caller learns
     from :func:`uncovered_build_requirements` — so the whole decision is exercised by a
@@ -7718,10 +8444,41 @@ def build_requirement_pins(
             and _date_rule_candidate(version, specifier)
             and _specifier_accepts(specifier, version)
         ]
+        cutoff = commit_date
+        widened_by: tuple[tuple[str, str], ...] = ()
+        if not matching:
+            # §3.2's fallback, reached **only** here: the bug's date found nothing, so
+            # the window widens to the declaring pin's own date and no further
+            # (:func:`_declarer_pin_cutoff`, :func:`pin_cutoff`). A layer that already
+            # resolves never gets here, which is what makes the rule byte-identical for
+            # every baked layer.
+            declarer_dates = {
+                claim.declarer: date
+                for claim in claims
+                if (date := _declarer_pin_cutoff(claim.declarer, releases)) is not None
+            }
+            cutoff = max([commit_date, *declarer_dates.values()])
+            matching = [
+                (version, date)
+                for version, date in available.items()
+                if _parseable(version)
+                and date[:10] <= cutoff
+                and _date_rule_candidate(version, specifier)
+                and _specifier_accepts(specifier, version)
+            ]
+            if matching:
+                # The pin is placed only because the window widened, so the declaring
+                # release(s) whose own date became the cutoff are what anchored it — the
+                # fallback is recorded, not left to ``declared_by`` alone (:data:`widened_by`).
+                widened_by = tuple(
+                    (declarer, date)
+                    for declarer, date in sorted(declarer_dates.items())
+                    if date == cutoff
+                )
         if not matching:
             newest = _newest_release(available)
             raise BakeError(
-                f"{claims[0].source}: {name!r} has no release on or before {commit_date} "
+                f"{claims[0].source}: {name!r} has no release on or before {cutoff} "
                 f"that satisfies {specifier or 'the declaration'}, and a layer cannot be "
                 f"built without it (newest is {newest[0]}, released {newest[1][:10]})"
             )
@@ -7733,6 +8490,7 @@ def build_requirement_pins(
                 source=claims[0].source,
                 released_at=released_at[:10],
                 build_requirement_of=claims[0].declarer,
+                widened_by=widened_by,
             )
         )
     return pins
@@ -8486,7 +9244,8 @@ class DroppedPin:
     version: Optional[str]
     """The version the pin names, when it names one."""
     outcome: str
-    """Which finding: :data:`NO_DISTRIBUTION` or :data:`UNBUILDABLE`."""
+    """Which finding: :data:`NO_DISTRIBUTION`, :data:`UNBUILDABLE`, or
+    :data:`DATE_RULE_REFUSAL`."""
     reason: str
     audit: Optional[ImportAudit] = None
     """What the bug's own trees say about the module this distribution provides.
@@ -8518,6 +9277,220 @@ class DroppedPin:
         return data
 
 
+PLUGIN_OPTION = "-p"
+"""The pytest option that loads a plugin by name — one of §8.6's R2 safeguard's arms."""
+
+PLUGIN_DISABLE_PREFIX = "no:"
+"""``-p no:name`` **disables** a plugin, so what follows it is not a plugin to protect."""
+
+
+def plugin_options(command: str) -> frozenset[str]:
+    """The plugin names a test command's ``-p`` options **load**, canonicalized.
+
+    [VANTA-WHY] ``-p no:cacheprovider`` is in the harness's own native test command and
+    means *off*, not *on*: reading every ``-p`` as "this plugin matters" would protect
+    the one name every layer is known not to need. Only a positive option counts, and
+    the name is canonicalized because that is the key the safeguard looks pins up by.
+    """
+    tokens = shlex.split(command) if command.strip() else []
+    names: set[str] = set()
+    for position, token in enumerate(tokens):
+        if token == PLUGIN_OPTION:
+            following = tokens[position + 1] if position + 1 < len(tokens) else ""
+        elif token.startswith(PLUGIN_OPTION) and len(token) > len(PLUGIN_OPTION):
+            # ``-pno:x`` and ``-pplugin`` are the joined spellings pytest accepts.
+            following = token[len(PLUGIN_OPTION):]
+        else:
+            continue
+        if following and not following.startswith(PLUGIN_DISABLE_PREFIX):
+            names.add(canonicalize_name(following))
+    return frozenset(names)
+
+
+def entry_point_group(text: str, group: str) -> tuple[str, ...]:
+    """The names one ``entry_points.txt`` registers under ``group``.
+
+    INI, which is what a wheel's ``.dist-info/entry_points.txt`` is: each group is a
+    ``[section]`` header and each entry point is one ``name = target`` line. Read as
+    text and never executed, like every other reading of a release (design C3).
+    """
+    names: list[str] = []
+    section = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            continue
+        if section == group and "=" in line:
+            names.append(line.partition("=")[0].strip())
+    return tuple(names)
+
+
+def declares_pytest_plugin(
+    name: str,
+    version: str,
+    *,
+    files_of: Callable[
+        [str, str], Optional[tuple[PyPIFile, ...]]
+    ] = pypi_release_files,
+    entry_points_of: Callable[[PyPIFile], Optional[str]] = wheel_entry_points_text,
+) -> Optional[bool]:
+    """Whether one release registers a ``pytest11`` entry point, or ``None`` for unknown.
+
+    [VANTA-WHY] ``None`` is a third answer and it is the **safe** one: a release that
+    publishes only an sdist is one whose entry points this reader cannot see — PyPI's
+    JSON carries none, and the sdist's ``setup.cfg``/``setup.py`` are not among the
+    readers — so §8.6's R2 safeguard reads "cannot tell" as "must not drop" rather than
+    as "not a plugin". A release whose wheel cannot be read is the same answer for the
+    same reason: a drop is a decision, and an unreadable release is not evidence for one.
+
+    Two answers are *not* "cannot tell", and both were measured rather than reasoned:
+
+    * PyPI lists **no such release** — ``files_of`` returns ``None`` for a 404, which is
+      an answer and not a failed fetch — so the release does not exist and cannot
+      register anything. ``False``. Reading it as unknown would make §3.2's rule refuse
+      to drop the very pins it exists for, since those are by definition releases nothing
+      can install (``luigi/1``'s ``requests-async==0.5.0``).
+    * a wheel that **opens and holds no** ``entry_points.txt`` registers no entry point
+      at all. ``False``, and :func:`wheel_entry_points_text` is what says ``""`` rather
+      than ``None`` for it. Measured: ``h5py==2.10.0``'s 28 wheels carry none, so with
+      one answer for both the pin §8.6's R2 retry was to drop was protected instead and
+      ``pandas/7`` flagged rather than retried.
+
+    The first wheel decides it: every wheel of one release carries the same
+    ``entry_points.txt``, and reading more than one would download the release twice to
+    answer the same question. It is called only for a pin about to be dropped, which is
+    the only moment the answer changes anything.
+    """
+    try:
+        files = files_of(name, version)
+    except BakeError:
+        return None
+    if files is None:
+        return False
+    for file in files:
+        if not file.is_wheel:
+            continue
+        text = entry_points_of(file)
+        if text is None:
+            return None
+        return bool(entry_point_group(text, PYTEST_ENTRY_POINT_GROUP))
+    return None
+
+
+# ``ImportAudit`` is declared further down with the rest of the audit machinery; the
+# forward reference is quoted because this alias is *evaluated* at import, unlike the
+# annotations elsewhere in this module (``from __future__ import annotations``).
+Safeguard = Callable[[str, Optional[str], "ImportAudit"], Optional[str]]
+"""``(distribution, the version it would be pinned to, its audit) -> why not to drop it``.
+
+``None`` from one means the drop rule may proceed; anything else is the reason §8.6's R2
+refuses, and it becomes the bug's flag (:func:`decide_unresolvable`).
+"""
+
+
+def pin_safeguard(
+    *,
+    protected_names: Mapping[str, str],
+    plugin_names: Container[str] = (),
+    plugin_of: Optional[Callable[[str, str], Optional[bool]]] = None,
+) -> Safeguard:
+    """§8.6's R2 safeguard: the pins the drop rule may **never** drop, and why.
+
+    [VANTA-WHY] The drop rule's evidence is a *static* import closure, and a closure
+    cannot see three things a pytest run can. A plugin loaded from an entry point is
+    imported by pytest and by nobody in the tree, so no site names it. A plugin the
+    bug's own test command asks for with ``-p`` is the command line's business, not the
+    tree's. And a ``conftest.py`` on the test path is loaded before any test runs, so a
+    module one of its *lazy or guarded* imports names still runs whenever that directory
+    is collected — the walk reads conftest files, but it reads them as ordinary files,
+    and their sites are exactly as optional-looking as any other. Two more are not
+    imports at all: pytest itself, and the project under test. Dropping any of the five
+    is a layer that looks right and cannot be measured, so the safeguard answers first
+    and the closure is consulted only after it.
+
+    The answers arrive as data rather than being recomputed here: ``protected_names`` is
+    the caller's own ``{canonical name: why}`` — the build toolchain, pytest, the report
+    plugin's packages, the distribution that provides the project under test — and
+    ``plugin_names`` is :func:`plugin_options` read from the bug's own test command.
+    ``plugin_of`` answers the entry-point question for one release, and it is asked only
+    when a version is known: a ref the **date rule** refused has no release to read, and
+    it needs none — that refusal only ever removes a module the closure does not reach,
+    and the native gate still measures the layer afterwards (§11 step 2).
+    """
+
+    def check(
+        distribution: str, version: Optional[str], audit: ImportAudit
+    ) -> Optional[str]:
+        canonical = canonicalize_name(distribution)
+        declared = protected_names.get(canonical)
+        if declared is not None:
+            return declared
+        if canonical in plugin_names:
+            return "the bug's own test command loads it with -p"
+        for site in audit.sites:
+            if site.path.rsplit("/", 1)[-1] == "conftest.py":
+                return (
+                    f"{site.path} line {site.line} names it, and a conftest.py on the "
+                    "test path is imported before any test runs"
+                )
+        if plugin_of is not None and version is not None:
+            plugin = plugin_of(distribution, version)
+            if plugin is None:
+                return (
+                    f"whether {distribution}=={version} registers a pytest11 entry "
+                    "point could not be read, so §8.6's R2 will not drop it on a guess"
+                )
+            if plugin:
+                return (
+                    f"{distribution}=={version} registers a pytest11 entry point, so "
+                    "pytest loads it and no site in the tree has to import it"
+                )
+        return None
+
+    return check
+
+
+def protected_pin_names(project: str, sources: DepSources) -> dict[str, str]:
+    """§8.6's R2 safeguard's ``{canonical distribution: why}`` for one bug.
+
+    Four answers, and each is a pin the layer cannot be *measured* without rather than
+    one the tree happens to import: the harness's build toolchain and the legacy
+    resolver's pip; pytest and the two report-plugin packages; the project's **own**
+    declared build requirements — fastapi's ``flit``, pandas' ``numpy``/``cython``,
+    read from ``[build-system] requires`` or ``setup_requires``, so "the build backend"
+    rather than a fixed name list; and the project under test itself, under both
+    spellings the harness knows it by, the BugsInPy project name and the import name the
+    project's own metadata gives.
+
+    [VANTA-WHY] The order is fixed and shadows are deliberate: a name two answers could
+    claim keeps the *harness's* reason, because that reason is the one that holds for
+    every bug and the more specific label would read as a finding about this tree.
+    Protecting a name can only ever turn a drop into a flag, never the reverse, so an
+    entry that does not match anything costs nothing.
+    """
+    protected: dict[str, str] = {
+        canonicalize_name(name): BUILD_TOOL_SOURCE for name in BUILD_TOOLS
+    }
+    protected[canonicalize_name(PIP_TOOL)] = PIP_TOOL_SOURCE
+    protected[canonicalize_name("pytest")] = PYTEST_PROTECTED_SOURCE
+    for name, source in PLUGIN_SOURCES.items():
+        protected[canonicalize_name(name)] = source
+    for ref in sources.build_refs:
+        protected.setdefault(
+            canonicalize_name(ref.name), "the project's own declared build requirement"
+        )
+    for name in (project, sources.import_name):
+        if name:
+            protected.setdefault(
+                canonicalize_name(name),
+                "the distribution that provides the project under test",
+            )
+    return protected
+
+
 def decide_unresolvable(
     name: str,
     *,
@@ -8527,22 +9500,33 @@ def decide_unresolvable(
     outcome: str,
     reason: str,
     audit: ImportAudit,
+    safeguard: Optional[Safeguard] = None,
 ) -> DroppedPin:
     """§3.2's one rule, for every pin nothing on this image can install.
 
-    Two findings reach here and they are one rule rather than two:
+    Four findings reach here and they are one rule rather than four:
 
     * a class (c) pin — ``luigi/1``'s ``requests-async==0.5.0``, a release PyPI never
       uploaded, and ``sanic/1``'s ``pywin32==227``, whose files are all foreign wheels
       and which ships no sdist;
     * a class (b) pin preflight marks :data:`UNBUILDABLE` — an sdist whose build no
       entry in the reviewed table could make work here (``pyarrow``'s Arrow C++,
-      ``llvmlite``'s LLVM).
+      ``llvmlite``'s LLVM);
+    * §8.6's R2 — a declaration the **date rule** refuses (:data:`DATE_RULE_REFUSAL`),
+      whatever file declared it, which :func:`resolve_deps` caught rather than letting it
+      flag the bug. ``luigi/7``'s ``mysql`` is the measured case: the closure reads
+      ``import mysql`` out of ``test/_mysqldb_test.py``, no release of
+      ``mysql-connector-python`` predates the buggy commit, and the failing tests never
+      reach the module — so the layer is built without it and the drop is recorded;
+    * §8.6's R2's other half — a pin whose sdist **failed to build in this image**
+      (:data:`UNBUILDABLE_AT_BAKE`), which is only ever known from the failing layer's
+      own build log, so it reaches here from the retry and not from a preflight
+      (:func:`retry_drops`).
 
-    Both are settled by the same question, asked of the bug itself: **does anything the
-    graded tests reach import the module this distribution provides?** ``audit`` is that
-    answer, and it is three answers rather than one, because "somewhere in the tree" is
-    not the same claim as "somewhere in this bug's tests":
+    All four are settled by the same question, asked of the bug itself: **does anything
+    the graded tests reach import the module this distribution provides?** ``audit`` is
+    that answer, and it is three answers rather than one, because "somewhere in the tree"
+    is not the same claim as "somewhere in this bug's tests":
 
     * nothing imports it at all → dropped;
     * every site is behind a guard (:data:`_OPTIONAL_CALLS`, an ``except ImportError``, a
@@ -8554,6 +9538,13 @@ def decide_unresolvable(
       import cannot run the suite, so baking it anyway would trade a named flag now for
       an unreadable failure later.
 
+    ``safeguard`` is asked **before** any of them, and it is §8.6's R2 safeguard: the
+    pins the closure is not allowed to be the only witness for — a pytest plugin, a
+    module a ``conftest.py`` on the test path names, the project under test, pytest and
+    the build backend (:func:`pin_safeguard`). It answers ``None`` for a pin the gate
+    has nothing to say about, and a reason for one it refuses; a refusal is a flag, not a
+    drop.
+
     [VANTA-WHY] The last answer is the whole point of the change from "does any file
     import it": measured on pandas/1, ``import pyarrow`` appears in 18 files, and every
     one of them is optional or lazy — pandas works without pyarrow, and the failing test
@@ -8562,6 +9553,13 @@ def decide_unresolvable(
     the *prepare* gate, which measures the buggy/fixed flip for real: if a dropped pin
     is what breaks the bug, the gate catches it and names the drops (§11 step 2).
     """
+    if safeguard is not None:
+        refusal = safeguard(name, version, audit)
+        if refusal is not None:
+            raise BakeError(
+                f"{name} cannot be installed on this image ({reason}), and §8.6's R2 "
+                f"safeguard will not drop it: {refusal}. Amend the split or flag the bug."
+            )
     if audit.required_by is not None:
         raise BakeError(
             f"{name} cannot be installed on this image ({reason}), and "
@@ -8579,6 +9577,595 @@ def decide_unresolvable(
         reason=reason,
         audit=audit,
     )
+
+
+def failed_builds(output: str) -> tuple[str, ...]:
+    """The canonical names ``pip`` says it failed to build, from its own summary line.
+
+    Empty when the failure is not that shape at all, and that is the load-bearing case:
+    ``luigi/30`` died at a build *requirement*'s ``setup.py egg_info`` and pip wrote no
+    such line, so a failure that names no distribution is not a list of pins to drop —
+    it is R1's case (:func:`requirements_recipe`), and the two rules must not read one
+    another's logs. Searched from the end, so a log that holds more than one attempt
+    answers with the last.
+    """
+    for raw in reversed(output.replace("\r", "\n").splitlines()):
+        line = raw.strip()
+        if line.startswith(FAILED_BUILD_PREFIX):
+            names = line[len(FAILED_BUILD_PREFIX) :].split()
+            return tuple(
+                dict.fromkeys(canonicalize_name(name) for name in names if name)
+            )
+    return ()
+
+
+def failed_build_requirement_metadata(output: str) -> bool:
+    """Whether the failing build's own last word is a package's ``setup.py egg_info``.
+
+    §8.6 R1's trigger, and the positive :func:`failed_builds` documents as its negative:
+    pip wrote no ``Failed to build …`` line, because nothing reached the wheel stage — the
+    failure happened while pip *read the metadata* of a build requirement, whose
+    ``setup.py`` reached PyPI's ``easy_install`` for a ``setup_requires`` the recipe had
+    not installed yet (``luigi/30``: ``pytest-runner==2.5.1``'s ``egg_info`` pulled
+    ``setuptools_scm``'s **today** release, which needs a ``setuptools`` newer than the
+    pinned one). The marker is pip's summary line, which opens with ``ERROR`` and names
+    the ``egg_info`` command (:data:`EGG_INFO_FAILURE`); searched from the end, like
+    :func:`failed_builds`, so a log holding more than one attempt answers with the last.
+    """
+    for raw in reversed(output.replace("\r", "\n").splitlines()):
+        line = raw.strip()
+        if line.startswith(ERROR_LINE_PREFIXES) and EGG_INFO_FAILURE in line:
+            return True
+    return False
+
+
+def failed_build_line(output: str, name: str) -> str:
+    """Where the failing layer's log names ``name`` as an unbuildable wheel, or ``""``.
+
+    The per-name line (:data:`FAILED_WHEEL_PREFIX`) is preferred over the summary line
+    because it names one distribution rather than a list, so the evidence a drop records
+    is a line a reader can open. Line numbers are 1-based over the same normalisation
+    :func:`last_error_line` uses — ``\\r`` as a break — so pip's in-place progress output
+    does not count as several lines.
+    """
+    summary = ""
+    for index, raw in enumerate(output.replace("\r", "\n").splitlines(), start=1):
+        line = raw.strip()
+        if line.startswith(FAILED_WHEEL_PREFIX):
+            spoken = line[len(FAILED_WHEEL_PREFIX) :].strip()
+            if canonicalize_name(spoken) == name:
+                return f"build log line {index}: {line}"
+        elif line.startswith(FAILED_BUILD_PREFIX) and not summary:
+            summary = f"build log line {index}: {line}"
+    return summary
+
+
+@dataclass(frozen=True)
+class TransientDownload:
+    """One download pip received that did not match the hash its index advertised (§8.6 R4).
+
+    ``spec`` is the requirement pip printed (``matplotlib==3.1.3``), ``expected`` the hash
+    the index's own link carries and ``got`` the one the received body produced, and
+    ``aborted`` whether a broken connection is named on the same log. The two hashes are
+    the whole *evidence*, and they are deliberately not the whole *verdict*: a body that
+    differs from its advertised hash is either a transfer that was cut short or a package
+    whose bytes changed, and only re-fetching the bytes tells the two apart — which is the
+    retry, and why a first mismatch retries while a second is an integrity problem.
+    """
+
+    spec: str
+    expected: str
+    got: str
+    aborted: bool
+    evidence: str
+
+    def describe(self) -> str:
+        """The one sentence the run's log and the layer's record both print."""
+        cause = (
+            "a connection break is named on the same log"
+            if self.aborted
+            else "nothing on the log explains a truncated body"
+        )
+        return (
+            f"pip received a body for {self.spec} that did not match the hash the index "
+            f"advertised (expected {self.expected or '?'}, got {self.got or '?'}; {cause}) "
+            "— a download to re-fetch, not a pin this layer can drop (§8.6 R4)"
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        """The record's own shape, so the metadata is a fact and not a sentence."""
+        return {
+            "spec": self.spec,
+            "expected_sha256": self.expected,
+            "got_sha256": self.got,
+            "connection_broken": self.aborted,
+            "evidence": self.evidence,
+        }
+
+
+def transient_download_failure(output: str) -> Optional[TransientDownload]:
+    """The last download pip refused for a mismatched hash, or ``None`` (§8.6 R4).
+
+    pip writes :data:`HASH_MISMATCH_MARKER`, then an indented block naming the requirement
+    and both hashes; this reads that block and takes the **last** one, like
+    :func:`failed_builds` and for the same reason — a log holding more than one attempt
+    answers with the last. The requirement line is the first non-empty line under the
+    marker and the text before its `` from `` is the spec; the two hashes are the lines
+    that start with :data:`HASH_EXPECTED_PREFIX` and :data:`HASH_GOT_PREFIX`.
+
+    A marker line with no requirement under it answers ``None`` rather than a guess: this
+    rule changes nothing and drops nothing, so a block it cannot read is a block a second
+    attempt could do nothing differently about, and the layer keeps its first-pass
+    classification. The one thing that is *not* required is the connection break
+    (:data:`TRANSIENT_ABORT_MARKERS`): it is recorded when present and never gates the
+    retry, because the mismatch itself is the case and the retry is what separates an
+    interrupted transfer from a changed package.
+    """
+    lines = [raw.strip() for raw in output.replace("\r", "\n").splitlines()]
+    aborted = any(marker in output for marker in TRANSIENT_ABORT_MARKERS)
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index]
+        if not line.startswith(ERROR_LINE_PREFIXES) or HASH_MISMATCH_MARKER not in line:
+            continue
+        spec = expected = got = ""
+        for rest in lines[index + 1 :]:
+            if not rest:
+                if spec:
+                    break
+                continue
+            if not spec:
+                spec = rest.split(" from ", 1)[0].strip()
+            elif rest.startswith(HASH_EXPECTED_PREFIX):
+                expected = rest[len(HASH_EXPECTED_PREFIX) :].strip()
+            elif rest.startswith(HASH_GOT_PREFIX):
+                got = rest[len(HASH_GOT_PREFIX) :].strip()
+        if not spec:
+            return None
+        return TransientDownload(
+            spec=spec,
+            expected=expected,
+            got=got,
+            aborted=aborted,
+            evidence=f"build log line {index + 1}: {line}",
+        )
+    return None
+
+
+def retry_drops(
+    output: str,
+    *,
+    installs: Sequence[str],
+    declared: Optional[Mapping[str, Sequence[str]]] = None,
+    audit: Callable[[str], ImportAudit],
+    safeguard: Optional[Safeguard] = None,
+) -> Optional[tuple[DroppedPin, ...]]:
+    """§8.6 R2(ii)'s one answer, from the failing layer's own log.
+
+    ``Some pins`` when the log names pins the rule may drop, ``None`` when the retry must
+    not run at all — and ``None`` is the answer for four different situations, all of
+    them "this is not the case this rule covers":
+
+    * the failure names no distribution (:func:`failed_builds` is empty): ``luigi/30``'s
+      build *requirement* died in its own ``setup.py egg_info``, which is R1's case;
+    * a name pip failed on is not a pin of this layer, so the log and the pin list
+      disagree and nothing here is safe to conclude;
+    * a pin is one §8.6's R2 safeguard refuses (:func:`pin_safeguard`): a pytest plugin,
+      a module a ``conftest.py`` on the test path names, the project under test, pytest
+      or the build backend. The safeguard is asked first, so a protected pin is never
+      dropped by this half either;
+    * a pin is one the failing tests *do* reach (:attr:`ImportAudit.required_by`): a
+      layer missing it cannot run the suite, so it is a flag and not a drop — exactly
+      the answer :func:`decide_unresolvable` gives the preflight halves.
+
+    Every drop records what a reader needs and nothing they have to go and find: the pin
+    and its version, the sources its *declaration* came from, the line of the failing
+    layer's own log that names it (:func:`failed_build_line`), and the closure evidence
+    the audit returned. ``installs`` is the layer's own pin list, which is what makes
+    "every name is a pin of this layer" checkable rather than assumed.
+    """
+    names = failed_builds(output)
+    if not names:
+        return None
+    specs: dict[str, str] = {}
+    for spec in installs:
+        parts = _pinned_parts(spec)
+        if parts is not None:
+            specs.setdefault(canonicalize_name(parts[0]), spec)
+    sources_of = declared or {}
+    records: list[DroppedPin] = []
+    for name in names:
+        spec = specs.get(name)
+        if spec is None:
+            return None
+        version = _pinned_parts(spec)[1]
+        finding = audit(name)
+        if safeguard is not None and safeguard(name, version, finding) is not None:
+            return None
+        if finding.required_by is not None:
+            return None
+        evidence = failed_build_line(output, name)
+        records.append(
+            DroppedPin(
+                name=name,
+                spec=spec,
+                sources=(
+                    *sources_of.get(name, ()),
+                    *((evidence,) if evidence else ()),
+                ),
+                version=version,
+                outcome=UNBUILDABLE_AT_BAKE,
+                reason=(
+                    "its sdist failed to build in this image during the first pass"
+                    + (f" ({evidence})" if evidence else "")
+                ),
+                audit=finding,
+            )
+        )
+    return tuple(records)
+
+
+@dataclass(frozen=True)
+class RetryMaterial:
+    """Everything one per-bug layer's retry needs, kept beside the layer (§8.6 R2(ii)).
+
+    Carried rather than recomputed when the build fails, because the two things that
+    decide the drop are per-bug and expensive: the import auditor reads both trees, and
+    the safeguard is bound to this bug's own test command and declared build
+    requirements. A retry that rebuilt them would be a second answer to a question
+    resolution had already answered, which is the one thing the layer's record exists to
+    prevent.
+
+    ``metadata_of`` is the reader the first pass's ``--no-deps`` closure was answered
+    with (:func:`no_deps_dependents`), carried for the same reason: the retry has to
+    re-close the set over the pins that survive the drop, and reading the releases'
+    declarations a second way would be the second reading this record exists to avoid.
+    """
+
+    audit: Callable[[str], ImportAudit]
+    safeguard: Safeguard
+    metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]]
+    minor: str
+
+
+@dataclass(frozen=True)
+class HoistedPin:
+    """An early pin §8.6 R1's retry installs ahead of the early block's other pins.
+
+    [VANTA-WHY] What R1 used to do — move the whole early block before the build
+    requirements — was measured against ``luigi/30``'s second attempt and does **not**
+    answer its failure: the fetch happens *inside* the early block, because that block is
+    one ``pip -r`` call and pip prepares every requirement's metadata before it installs
+    any of them (measured in the same log, where the toolchain block reads ``Collecting
+    pip``/``Collecting setuptools``/… and only then ``Installing collected packages``).
+    So the pin that satisfies the fetched distribution has to be installed by a step of
+    its own that has already finished, which is what the hoist is. Nothing is added and
+    no version changes: ``pin`` is a spec the early list already holds, ``fetched`` is the
+    distribution the log shows ``easy_install`` reaching for, and ``evidence`` is the
+    numbered line that shows it (:func:`easy_install_fetch_evidence`).
+    """
+
+    name: str
+    pin: str
+    fetched: str
+    evidence: str
+
+    def as_dict(self) -> dict[str, str]:
+        """The record the layer's own provenance keeps, in :func:`record_retry`'s shape."""
+        return {
+            "name": self.name,
+            "pin": self.pin,
+            "fetched": self.fetched,
+            "evidence": self.evidence,
+        }
+
+
+def _egg_name_candidates(stem: str) -> tuple[str, ...]:
+    """The spellings a ``<name>-<version>[-<build tag>]`` egg stem could be naming.
+
+    Longest first, and never the empty string: the split is ambiguous from the right —
+    ``setuptools_scm-10.3.4-py3.8`` could name ``setuptools_scm`` or
+    ``setuptools_scm-10.3.4-py3.8`` — and only the caller knows which of them this layer
+    holds. Handing every spelling back and letting the match against the layer's own pins
+    decide is what keeps the reading honest: nothing is guessed from the stem alone.
+    """
+    candidates: list[str] = []
+    head = stem
+    while head:
+        candidates.append(head)
+        head, sep, _ = head.rpartition("-")
+        if not sep:
+            break
+    return tuple(candidates)
+
+
+def hoisted_pins(output: str, *, early_pins: Sequence[str]) -> tuple[HoistedPin, ...]:
+    """The early pins §8.6 R1's retry installs first, from the failed pass's own log.
+
+    Only pins **already in** ``early_pins`` are ever returned, at the exact spec that list
+    already holds and in the order it already had, so the rule can neither add a pin nor
+    change one (:class:`HoistedPin`). A fetch whose distribution no early pin satisfies
+    returns nothing, which leaves the layer with no retry at all — R1's fail-closed
+    answer, and the same answer a log that names no fetch gives.
+    """
+    pins: dict[str, str] = {}
+    order: dict[str, int] = {}
+    for index, spec in enumerate(early_pins):
+        parts = _pinned_parts(spec)
+        if parts is None:
+            continue
+        name = canonicalize_name(parts[0])
+        if name not in pins:
+            pins[name] = spec
+            order[name] = index
+    if not pins:
+        return ()
+    found: dict[str, HoistedPin] = {}
+    for spelling, evidence in easy_install_fetch_evidence(output):
+        for candidate in _egg_name_candidates(spelling):
+            name = canonicalize_name(candidate)
+            if name in pins and name not in found:
+                found[name] = HoistedPin(
+                    name=name, pin=pins[name], fetched=spelling, evidence=evidence
+                )
+                break
+    return tuple(found[name] for name in sorted(found, key=lambda name: order[name]))
+
+
+@dataclass(frozen=True)
+class RetryPlan:
+    """One per-bug layer's single second attempt (§8.6 R1, R2(ii) and R4).
+
+    ``script`` is the recipe the second attempt runs, and only a build that has already
+    failed reaches here: the first pass is byte-identical to what it was before any rule
+    existed. Under **R2(ii)** it is the first-pass recipe with the pins the retry dropped
+    removed — from the main pass, from the early pass or from the ``--no-deps`` pass,
+    whichever held them — and ``drops`` is what it removed and why. Under **R1** nothing is
+    dropped (``drops`` is empty) and the two changes are the ordering ones: the early pins
+    installed before the build requirements, and, ahead of the early block, its own install
+    of the pins ``hoist`` names. Under **R4** nothing is dropped and nothing is reordered
+    (``drops`` and ``hoist`` are both empty): the script is the first pass **unchanged**,
+    re-run, and ``transient`` is the mismatch that made it worth re-fetching. In every case
+    ``drops``, ``hoist``, ``transient`` and ``why`` reach the layer's provenance and the
+    run's summary.
+
+    ``refused`` is the one shape that is not a retry at all: §8.6 R2(ii) can be asked to
+    re-render a layer whose ``--no-deps`` set it *cannot* close, and the honest answer is
+    that no second attempt may be rendered. ``None`` is the ordinary answer; a non-empty
+    tuple is the refusal itself, one ``(spec, why)`` pair per dependent that caused it,
+    because the two causes name different things and both have to reach the record:
+    a dependent whose own declarations could not be **read** (:class:`UnmovableDependent`,
+    a network fault — the closure would be drawn against a half-read picture), and a
+    dependent the safeguard **protects** (:func:`pin_safeguard` — moving it out of the
+    resolving pass is not the closure's to decide). Then ``script`` is empty and is never
+    run (:func:`run_bake_actions` logs ``describe`` and leaves the layer with its
+    first-pass classification), and each pair is the fact a reader needs to tell this
+    layer apart from one no rule reached.
+    """
+
+    script: str
+    drops: tuple[DroppedPin, ...]
+    hoist: tuple[HoistedPin, ...] = ()
+    rule: str = RETRY_RULE_DROP
+    why: str = ""
+    transient: Optional[TransientDownload] = None
+    refused: Optional[tuple[tuple[str, str], ...]] = None
+
+    def describe(self) -> list[str]:
+        """One line per hoist, per drop and per re-fetch, in the shape the log prints."""
+        lines = (
+            [f"re-fetching — {self.transient.describe()}"]
+            if self.transient is not None
+            else []
+        )
+        lines += [
+            f"hoisting {item.pin} ahead of the early block — the log shows easy_install "
+            f"reaching for {item.fetched} ({item.evidence})"
+            for item in self.hoist
+        ]
+        lines += [
+            f"dropping {drop.pin} — {drop.reason}; "
+            + (drop.import_note or "nothing in either tree imports it")
+            for drop in self.drops
+        ]
+        lines += [
+            f"refusing to retry — {spec} cannot be moved out of the resolving pass: {why}"
+            for spec, why in (self.refused or ())
+        ]
+        if self.why:
+            lines.append(self.why)
+        return lines
+
+
+def _declared_sources(deps: "BugDeps") -> dict[str, tuple[str, ...]]:
+    """``{canonical name: the sources its declaration came from}`` from a layer's record."""
+    out: dict[str, tuple[str, ...]] = {}
+    records = deps.provenance.get("dependencies")
+    if not isinstance(records, list):
+        return out
+    for record in records:
+        if not isinstance(record, Mapping) or not record.get("name"):
+            continue
+        out[canonicalize_name(str(record["name"]))] = tuple(record.get("sources") or ())
+    return out
+
+
+def retry_plan(deps: "BugDeps", output: str) -> Optional[RetryPlan]:
+    """The one retry a per-bug layer whose build *failed* is allowed (§8.6 R1, R2(ii), R4).
+
+    ``None`` for every layer none of the rules reaches: one with no material (an interpreter
+    layer, or a caller that did not attach it), and every log that is not one of the three
+    rules' cases. The order is the rules' own, and it matters:
+
+    * **a distribution named** (:func:`failed_builds` is non-empty) — §8.6 R2(ii). The
+      recipe is re-rendered from the layer's own pin lists with the dropped pins removed
+      (the same ``BugDeps`` fields :func:`layer_recipes` renders from, and not a
+      re-resolution). ``None`` when the answer is not a drop: a name that is not a pin of
+      this layer, one the safeguard protects, or one the graded tests reach — each a
+      flag, not a drop (:func:`retry_drops`).
+    * **nothing named, an ``egg_info`` crash** — §8.6 R1, and only when the log's last word
+      is a build requirement's own ``setup.py egg_info``
+      (:func:`failed_build_requirement_metadata`) *and* the log names a fetch one of this
+      layer's own early pins satisfies (:func:`hoisted_pins`). Nothing is dropped and
+      nothing is added; the recipe is the first pass with ``early_pins_first`` set and with
+      the fetched distribution's pin installed ahead of the early block by a step of its
+      own (:class:`HoistedPin`). A log that names **no** fetch — or names one no early pin
+      satisfies — answers ``None`` here and falls through to R4, which will also answer
+      ``None`` unless the log *also* carries a hash mismatch: with nothing to hoist and
+      nothing mismatched there is nothing a second attempt could do differently, and the
+      layer keeps its first-pass classification.
+    * **a hash mismatch** (:func:`transient_download_failure` is not ``None``) — §8.6 R4,
+      and the **fallback of last resort**. Nothing is dropped and nothing is reordered:
+      the recipe is the **first pass unchanged**, re-run, so ``--no-cache-dir`` fetches the
+      bytes again and the same hash check runs on them. It is asked last because the other
+      two rules' retries re-run the recipe too and so re-fetch as well — a pass that both
+      dropped an unbuildable pin and met a corrupted download is answered by the one retry
+      that does both — while this rule is the one that changes nothing, and belongs where
+      changing nothing is the only thing left to try.
+    """
+    material = deps.retry
+    if material is None:
+        return None
+    if failed_builds(output):
+        drops = retry_drops(
+            output,
+            installs=deps.installs,
+            declared=_declared_sources(deps),
+            audit=material.audit,
+            safeguard=material.safeguard,
+        )
+        if not drops:
+            return None
+        gone = {canonicalize_name(drop.name) for drop in drops}
+
+        def surviving(specs: Sequence[str]) -> tuple[str, ...]:
+            """The layer's pins with the retry's dropped ones removed."""
+            out = []
+            for spec in specs:
+                parts = _pinned_parts(spec)
+                if parts is None or canonicalize_name(parts[0]) not in gone:
+                    out.append(spec)
+            return tuple(out)
+
+        installs = surviving(deps.installs)
+        build_pins = surviving(deps.build_pins)
+        early_pins = surviving(deps.early_pins)
+        kept_no_deps = surviving(deps.no_deps_pins)
+        # D3: the retry **moves**, it does not merely drop. A pin the main pass keeps but
+        # whose own release declares a name that pass installs **nothing for** makes pip
+        # resolve that name itself, at the newest release of the day — exactly what the
+        # failing first pass did, and the whole reason §3.2's absent-name rule exists — so
+        # it would fail again. ``absent`` is therefore the names the retry's main pass
+        # installs nothing for, and that is the pins this retry just **dropped** and
+        # nothing else. A ``--no-deps`` pin's name is **not** such a name: it *is* in
+        # ``/tmp/constraints.txt`` (:func:`constraint_lines` holds every ``install_specs``
+        # entry, the ``--no-deps`` ones included), so a main-pass pin that merely declares
+        # one gives pip no version to choose and leaks nothing — ``pytest`` declares
+        # ``hypothesis`` behind an ``extra``, ``hypothesis`` is one of the layer's eight
+        # ``--no-deps`` pins, and pytest stays in the resolving pass. Nor do the names the
+        # first pass itself found absent need re-seeding here: the first pass seeded on
+        # exactly those (its dropped and tree-satisfied names) and its answer is
+        # ``kept_no_deps``, which the retry keeps and starts from, so seeding on the
+        # retry's own drops reaches the same fixpoint on fewer moves. The closure is
+        # transitive, so ``clifford`` (which declares the dropped ``h5py``) moves, and
+        # ``mpl-toolkits-clifford`` (which declares ``clifford``) moves with it, and it is
+        # the *same* reader the first pass used, so the two passes cannot answer
+        # differently.
+        absent = [canonicalize_name(drop.name) for drop in drops]
+        try:
+            moved = no_deps_dependents(
+                installs, absent, metadata_of=material.metadata_of
+            )
+        except UnmovableDependent as exc:
+            # D2/D4: a read that errored means the closure would be drawn against a
+            # picture it only half holds, so no second attempt may be rendered at all.
+            return RetryPlan(script="", drops=drops, refused=((exc.spec, exc.why),))
+        # D2/D5(b): a dependent the safeguard protects may not leave the resolving pass on
+        # the closure's word alone, so a move it refuses is not a move — the layer fails
+        # closed, and the refusal names the dependent and the reason.
+        refused: list[tuple[str, str]] = []
+        for spec in moved:
+            name, version = _pinned_parts(spec)
+            canonical = canonicalize_name(name)
+            why = material.safeguard(canonical, version, material.audit(canonical))
+            if why is not None:
+                refused.append((spec, why))
+        if refused:
+            return RetryPlan(script="", drops=drops, refused=tuple(refused))
+        no_deps_pins = list(kept_no_deps)
+        moved_names = {
+            canonicalize_name(_pinned_parts(spec)[0])
+            for spec in kept_no_deps
+            if _pinned_parts(spec) is not None
+        }
+        for spec in moved:
+            canonical = canonicalize_name(_pinned_parts(spec)[0])
+            if canonical not in moved_names:
+                moved_names.add(canonical)
+                no_deps_pins.append(spec)
+        return RetryPlan(
+            script=requirements_recipe(
+                installs,
+                build_pins=build_pins,
+                early_pins=early_pins,
+                no_deps_pins=tuple(no_deps_pins),
+                orphans=deps.orphans,
+                minor=material.minor,
+            ),
+            drops=drops,
+        )
+    if deps.early_pins and failed_build_requirement_metadata(output):
+        hoist = hoisted_pins(output, early_pins=deps.early_pins)
+        if hoist:
+            return RetryPlan(
+                script=requirements_recipe(
+                    deps.installs,
+                    build_pins=deps.build_pins,
+                    early_pins=deps.early_pins,
+                    no_deps_pins=deps.no_deps_pins,
+                    orphans=deps.orphans,
+                    minor=material.minor,
+                    early_pins_first=True,
+                    hoist_pins=tuple(item.pin for item in hoist),
+                ),
+                drops=(),
+                hoist=hoist,
+                rule=RETRY_RULE_EARLY,
+                why=(
+                    "the first pass died in a build requirement's setup.py egg_info "
+                    "(§8.6 R1), where setuptools' easy_install reached for "
+                    + ", ".join(item.fetched for item in hoist)
+                    + " because nothing installed yet satisfied it; the layer was rebuilt "
+                    "once with the early block's own "
+                    + ", ".join(item.pin for item in hoist)
+                    + " installed ahead of the block, and before the build requirements"
+                ),
+            )
+    transient = transient_download_failure(output)
+    if transient is not None:
+        # §8.6 R4: the same recipe, re-run. Not a single byte changes — which is the point,
+        # because nothing about the layer was wrong; the bytes that arrived were. Every
+        # install carries --no-cache-dir, so running it again fetches them afresh and checks
+        # them against the same advertised sha256 (hash checking is never weakened).
+        return RetryPlan(
+            script=requirements_recipe(
+                deps.installs,
+                build_pins=deps.build_pins,
+                early_pins=deps.early_pins,
+                no_deps_pins=deps.no_deps_pins,
+                orphans=deps.orphans,
+                minor=material.minor,
+            ),
+            drops=(),
+            rule=RETRY_RULE_TRANSIENT,
+            why=(
+                "the first pass received a body that did not match the hash its index "
+                "advertised, so the layer was re-fetched once with its own recipe "
+                "unchanged (§8.6 R4); "
+                + transient.describe()
+            ),
+            transient=transient,
+        )
+    return None
 
 
 def exact_version(spec: str, source: str) -> Optional[str]:
@@ -8881,6 +10468,13 @@ def import_auditor(
     importer (a fix that removed an import), and a test file only the fix carries can
     be too, so either side alone would drop a pin the tree needs. The site keeps the
     commit it was read at, so the claim is checkable rather than a summary.
+
+    [VANTA-WHY] The closure's roots are the failing test files, and only a commit that
+    carries one has roots to give. A commit without it is skipped for the closure, not
+    stood in for by its whole tree: ``pandas/66``'s buggy commit lacks the file the fix
+    carries, and reading its whole tree as reachable made a pin its own tests never
+    reach look required (§8.6 row 14). The whole-tree fallback is kept for the one case
+    *neither* commit carries the failing test file, where there are no roots at all.
     """
     walk = list_files or (lambda commit: tree_mod.list_files_at(repo, commit))
     read = read_file or (lambda commit, path: tree_mod.read_file_at(repo, commit, path))
@@ -8890,6 +10484,7 @@ def import_auditor(
         sites: dict[str, tuple[ImportSite, ...]] = {}
         seen: dict[str, list[ImportSite]] = {}
         closure: set[str] = set()
+        trees: list[tuple[Mapping[str, Sequence[str]], list[str]]] = []
         for commit in dict.fromkeys(commits):
             if not commit:
                 continue
@@ -8901,16 +10496,20 @@ def import_auditor(
                     replace(record, commit=commit) for record in records
                 )
             graph = module_import_graph(files, read_file=partial(read, commit))
-            roots = [path for path in test_files if path in graph]
-            if roots:
-                closure.update(import_closure(roots, graph))
-            else:
-                # Neither tree carries the failing test file, so the closure question
-                # has no roots to answer from. An empty closure would drop every pin
-                # nothing can install, so the whole tree counts as reachable instead:
-                # the conservative direction, and the one that cannot bake a bug
-                # without a module its own tests reach.
+            trees.append((graph, [path for path in test_files if path in graph]))
+        # A commit without the failing test file contributes no roots, and must not
+        # stand in for the commit that has them: ``pandas/66``'s buggy commit lacks the
+        # file the fix carries, and counting its whole tree as reachable made a pin its
+        # own tests never reach look required (§8.6 row 14). The whole-tree fallback is
+        # for the one case the closure question has no roots at all — *neither* commit
+        # carries the failing test file — where an empty closure would drop every pin
+        # nothing can install, and the conservative direction is the safe one.
+        whole = not any(roots for _, roots in trees)
+        for graph, roots in trees:
+            if whole:
                 closure.update(graph)
+            elif roots:
+                closure.update(import_closure(roots, graph))
         sites = {module: tuple(records) for module, records in seen.items()}
         return sites, frozenset(closure)
 
@@ -9000,6 +10599,7 @@ def _unresolvable_pin(
     sources: Sequence[str],
     reason_of: Callable[[str, str], Optional[tuple[str, str]]],
     audit: Callable[[str], ImportAudit],
+    safeguard: Optional[Safeguard] = None,
 ) -> Optional[DroppedPin]:
     """The record for one pin, or ``None`` when it is ordinary.
 
@@ -9021,6 +10621,7 @@ def _unresolvable_pin(
         outcome=outcome,
         reason=reason,
         audit=audit(name),
+        safeguard=safeguard,
     )
 
 
@@ -9029,6 +10630,7 @@ def drop_unresolvable_refs(
     *,
     reason_of: Callable[[str, str], Optional[tuple[str, str]]],
     audit: Callable[[str], ImportAudit],
+    safeguard: Optional[Safeguard] = None,
 ) -> tuple[tuple[DepRef, ...], list[DroppedPin]]:
     """Drop every declared pin whose own version nothing can install here.
 
@@ -9053,6 +10655,7 @@ def drop_unresolvable_refs(
                 sources=(ref.source,),
                 reason_of=reason_of,
                 audit=audit,
+                safeguard=safeguard,
             )
         )
         if record is not None:
@@ -9062,11 +10665,165 @@ def drop_unresolvable_refs(
     return tuple(kept), dropped
 
 
+@dataclass(frozen=True)
+class StdlibBackport:
+    """One entry of §8.6's closed stdlib-shadow list (:data:`STDLIB_BACKPORTS`)."""
+
+    distribution: str
+    """The distribution's canonical name, e.g. ``enum34``."""
+    module: str
+    """The stdlib module it backports, e.g. ``enum``."""
+    since: str
+    """The first minor Python whose stdlib carries ``module``, e.g. ``"3.4"``."""
+    evidence: str
+    """Where the finding is recorded (§8.6) and what the bug measured."""
+
+
+STDLIB_BACKPORTS: Mapping[str, StdlibBackport] = {
+    "enum34": StdlibBackport(
+        distribution="enum34",
+        module="enum",
+        since="3.4",
+        evidence=(
+            "§8.6 round 11: the date rule pins enum34==1.1.6 transitively for luigi/7, "
+            "luigi/8 and luigi/5 (hypothesis==3.17.0/3.11.6/3.42.2 each declare it bare), "
+            "and luigi/7's and luigi/5's full prepare dies at pytest start-up with "
+            "'TypeError: an integer is required (got type bytes)'. luigi/9 and luigi/12 "
+            "carry no enum34 (their hypotheses are older still, 3.6.1 and 3.4.0) but fail "
+            "an earlier gate (empty FAIL_TO_PASS) and never run, so they are not evidence "
+            "that the suite runs without it; luigi/8 carries enum34 and fails that same "
+            "earlier gate. The frozen issue's own text opens '# no mo enum 34'"
+        ),
+    ),
+}
+"""The closed list of stdlib backports §8.6 refuses on this image (:data:`STDLIB_BACKPORT`).
+
+An entry belongs here only when it is a backport of a module **the layer's own
+interpreter already ships** — the ``since`` field is that debut — and the evidence names
+the measurement. It is a mapping, not a rule: a dependency that merely *looks* like a
+stdlib shadow (``argparse==1.3.0``, which 15 layers carry and which does no harm here) is
+not on it, so it is installed exactly as written.
+"""
+
+
+def _stdlib_present(since: str, python_minor: str) -> bool:
+    """Whether ``python_minor`` already ships the stdlib module that debuted in ``since``.
+
+    Both arguments are ``"3.8"``-shaped. A malformed one is refused rather than guessed,
+    the same way :func:`minor_version` refuses it.
+    """
+
+    def key(value: str) -> tuple[int, int]:
+        parts = str(value).split(".")
+        if len(parts) < 2 or not all(part.isdigit() for part in parts[:2]):
+            raise BakeError(f"cannot read a minor version out of {value!r}")
+        return int(parts[0]), int(parts[1])
+
+    return key(python_minor) >= key(since)
+
+
+def drop_stdlib_backports(
+    deps: Sequence[ResolvedDep],
+    *,
+    python_minor: str,
+    dropped: Optional[list[DroppedPin]] = None,
+    audit: Optional[Callable[[str], ImportAudit]] = None,
+) -> list[ResolvedDep]:
+    """Drop every §8.6-listed stdlib backport the layer's interpreter already carries.
+
+    [VANTA-WHY] This is the one drop that is *by name* rather than by installability: the
+    pin installs fine here, so neither :func:`drop_unresolvable_refs` nor
+    :func:`drop_unresolvable_deps` can reach it — :func:`uninstallable_reason` answers
+    ``None`` and the pin is kept. The fix is not to weaken the date rule, which is right
+    to pick what the release declared, but to refuse a pin the interpreter makes
+    redundant; and it is not :func:`decide_unresolvable`, whose whole question is "does
+    the module the graded tests reach disappear", because here the module does **not**
+    disappear — the stdlib provides it, and only the backport's copy is removed. The
+    refusal is conditional on the layer's own Python: on an interpreter older than the
+    module's debut the backport *is* the module and must stay (:data:`STDLIB_BACKPORTS`
+    carries the debut), so the rule asks before it drops. A caller that passes no
+    ``dropped`` list — every caller that wants the raw resolution — gets nothing dropped,
+    exactly as the other two passes do.
+    """
+    if dropped is None or not python_minor:
+        return list(deps)
+    kept: list[ResolvedDep] = []
+    for dep in deps:
+        entry = STDLIB_BACKPORTS.get(canonicalize_name(dep.name))
+        if entry is None or not _stdlib_present(entry.since, python_minor):
+            kept.append(dep)
+            continue
+        dropped.append(
+            DroppedPin(
+                name=dep.name,
+                spec=dep.spec,
+                sources=tuple(dep.sources or dep.required_by),
+                version=_pin_version(dep.pin),
+                outcome=STDLIB_BACKPORT,
+                reason=(
+                    f"{entry.distribution} backports the stdlib module {entry.module!r}, "
+                    f"which this layer's Python {python_minor} already ships (since "
+                    f"{entry.since}); installing it shadows the stdlib and breaks pytest "
+                    f"at collection. {entry.evidence}"
+                ),
+                audit=audit(dep.name) if audit is not None else None,
+            )
+        )
+    return kept
+
+
+def drop_self_pin(
+    deps: Sequence[ResolvedDep],
+    *,
+    tree_names: Container[str],
+    classify: Callable[[str, str, str], PreflightPin],
+    python_minor: str,
+) -> list[ResolvedDep]:
+    """Drop a pin for the project under test that this layer would build from its sdist.
+
+    [VANTA-WHY] :data:`TREE_SATISFIED_RULE` already says a requirement that names the
+    tree's own distribution is the tree's and the layer installs nothing for it — but it
+    is a rule about the closure walk, and the walk only reaches a name a *release*
+    declares. A bug whose own ``requirements.txt`` pins the project it grades
+    (``pandas==1.0.4``) has that name in ``installs`` before the walk runs, so the walk
+    sees it *pinned* and never asks the tree question at all: measured, ``pandas/154``
+    and ``pandas/160`` each declared ``pandas==1.0.4`` as an ordinary layer pin, the walk
+    therefore recorded no ``tree_satisfied`` entry, and ``statsmodels==0.10.1`` — which
+    declares ``pandas`` — stayed in the *resolving* pass beside ``scipy==1.4.1`` and died
+    at ``setup.py egg_info`` because its ``kalman_loglike.pyx`` cimports a ``scipy``
+    header ``scipy``'s own build had not installed yet. ``pandas/120`` declares no such
+    pin, so its ``statsmodels`` declares a name the layer installs nothing for and is
+    moved into the ``--no-deps`` pass *after* ``scipy`` — and builds.
+
+    So a declared self-pin is read the way the walk reads a declared name: a pin whose
+    name the tree provides is left to the tree. Removing it here, before the walk, is what
+    lets the walk record it (:class:`TreeSatisfied`) and what routes the pins that declare
+    it into the ``--no-deps`` pass (:func:`no_deps_dependents`) — the two effects the
+    tree's own name is supposed to have.
+
+    The condition is deliberately narrow. A pin is dropped only when it names the tree
+    **and** this image would build it from an **unreviewed sdist** (:attr:`PreflightPin.gap`).
+    A wheel self-pin needs no exemption — ``fastapi`` and ``scrapy`` each install their own
+    project from a wheel, which is harmless — and a reviewed sdist has a table entry saying
+    what its build needs. The gap qualifier keeps the rule a no-op for every layer measured
+    but these two, which is what makes "only these two resolve differently" checkable rather
+    than asserted.
+    """
+    kept: list[ResolvedDep] = []
+    for dep in deps:
+        if not dep.harness and canonicalize_name(dep.name) in tree_names:
+            if classify(dep.name, _pin_version(dep.pin), python_minor).gap is not None:
+                continue
+        kept.append(dep)
+    return kept
+
+
 def drop_unresolvable_deps(
     resolved: Sequence[ResolvedDep],
     *,
     reason_of: Callable[[str, str], Optional[tuple[str, str]]],
     audit: Callable[[str], ImportAudit],
+    safeguard: Optional[Safeguard] = None,
 ) -> tuple[list[ResolvedDep], list[DroppedPin]]:
     """The same rule over what the date rule picked.
 
@@ -9108,6 +10865,7 @@ def drop_unresolvable_deps(
                 sources=dep.sources or dep.required_by,
                 reason_of=reason_of,
                 audit=audit,
+                safeguard=safeguard,
             )
         )
         if record is not None:
@@ -9135,6 +10893,38 @@ def _declared_requirement(
         if canonicalize_name(requirement.name) == canonicalize_name(name):
             return requirement.specifier
     return None
+
+
+def _declares_absent(
+    requires: Sequence[str], names: Container[str]
+) -> tuple[bool, bool]:
+    """``(mentions, real)`` for one release's declarations against a set of names.
+
+    Two readings of the same document, because :func:`no_deps_dependents` needs both.
+    ``mentions`` is the marker-blind one (:func:`_declared_requirement`): the release
+    names one of ``names`` at all, whatever marker guards it. ``real`` is the stricter
+    one: it names one of them **outside** an ``extra`` marker, so a declaration like
+    ``pytest>=5; extra == 'test'`` mentions pytest without being a requirement of the
+    release as this layer installs it. A declaration that merely *mentions* a name is why
+    the pin moves out of the resolving pass — pip would still try to resolve what it names
+    — while only a declaration that *really* needs one means the pin's own name has to be
+    honoured by everything else, and so only a real one is added to the propagating set.
+    Platform and version markers (``uvloop; sys_platform != 'win32'``) are real: they
+    guard *when* a requirement applies, not whether it is one at all.
+    """
+    mentions = real = False
+    for raw in requires:
+        try:
+            requirement = Requirement(raw)
+        except InvalidRequirement:
+            continue
+        if canonicalize_name(requirement.name) not in names:
+            continue
+        mentions = True
+        marker = requirement.marker
+        if marker is None or "extra" not in str(marker):
+            real = True
+    return mentions, real
 
 
 def newest_accepting_pytest(
@@ -9326,6 +11116,7 @@ def resolve_deps(
     reason_of: Optional[Callable[[str, str], Optional[tuple[str, str]]]] = None,
     audit: Optional[Callable[[str], ImportAudit]] = None,
     dropped: Optional[list[DroppedPin]] = None,
+    safeguard: Optional[Safeguard] = None,
 ) -> list[ResolvedDep]:
     """Union → conflict check → date pin → the report plugin, for one bug.
 
@@ -9347,6 +11138,16 @@ def resolve_deps(
     the pins the declarations and the dates decide, with nothing dropped and nothing
     raised.
 
+    §8.6's R2 adds a third answer to the same rule, and it is the reason the date pass
+    here is a loop: a ref the date rule refuses, that nothing the failing tests reach
+    imports, and that §8.6's R2 safeguard does not protect, is dropped with a
+    :data:`DATE_RULE_REFUSAL` record rather than flagging the bug. The scope is the
+    **module**, not the declaring file — a project's own file and the test side's import
+    closure are the same finding once the question is "do the graded tests reach it" —
+    and that is what ``safeguard`` is for (:func:`pin_safeguard`). It is *not* a third
+    pass alongside the other two: it runs where the date rule runs, because the refusal
+    is the date rule's own and there is no way to ask the question before it.
+
     ``metadata_of`` does double duty: it is the plugin step's "what does this release
     declare about pytest", and it is the *date rule's* case-(a) narrowing — what this
     layer's exact pins declare about each other (:func:`_narrowing_requirements`). One
@@ -9363,18 +11164,45 @@ def resolve_deps(
         )
     if dropped is not None:
         merged, dropped_refs = drop_unresolvable_refs(
-            merged, reason_of=reason_of, audit=audit
+            merged, reason_of=reason_of, audit=audit, safeguard=safeguard
         )
         dropped.extend(dropped_refs)
-    resolved = resolve_pins(
-        merged,
-        releases=releases,
-        commit_date=sources.commit_date,
-        harness_pins=harness_pins,
-        python_minor=python_minor or "",
-        buggy_commit=sources.buggy_commit,
-        metadata_of=metadata_of,
-    )
+    # §8.6's R2, the date-rule half, and the reason it is a *loop* rather than one
+    # retry: :func:`resolve_pins` refuses the whole bug at the first undatable ref, so
+    # the pass has to be re-run after each one is removed. What decides a refusal is the
+    # *module*, not the file that declared it: a ref nothing the failing tests reach
+    # imports is dropped, whatever source wrote it, and a ref the closure does reach —
+    # or one §8.6's R2 safeguard protects — is re-raised and flags the bug exactly as
+    # before (:func:`decide_unresolvable` is what asks both questions).
+    pool = merged
+    while True:
+        try:
+            resolved = resolve_pins(
+                pool,
+                releases=releases,
+                commit_date=sources.commit_date,
+                harness_pins=harness_pins,
+                python_minor=python_minor or "",
+                buggy_commit=sources.buggy_commit,
+                metadata_of=metadata_of,
+            )
+            break
+        except UndatableRef as exc:
+            if dropped is None or audit is None:
+                raise
+            dropped.append(
+                decide_unresolvable(
+                    exc.ref.name,
+                    version=None,
+                    spec=exc.ref.spec,
+                    sources=(exc.ref.source,),
+                    outcome=DATE_RULE_REFUSAL,
+                    reason=str(exc),
+                    audit=audit(exc.ref.name),
+                    safeguard=safeguard,
+                )
+            )
+            pool = [ref for ref in pool if ref.name != exc.ref.name]
     own = own_pytest_pin(sources.refs, harness_pytest=harness_pins.get("pytest"))
     if own is not None:
         resolved = resolved + plugin_pins(
@@ -9386,9 +11214,15 @@ def resolve_deps(
         )
     if dropped is not None:
         resolved, dropped_deps = drop_unresolvable_deps(
-            resolved, reason_of=reason_of, audit=audit
+            resolved, reason_of=reason_of, audit=audit, safeguard=safeguard
         )
         dropped.extend(dropped_deps)
+        # §8.6's round-11 stdlib-shadow rule, over the same pins. A backport the
+        # interpreter already ships installs fine, so it is not one of the drops above;
+        # this is where the recorded name list refuses it.
+        resolved = drop_stdlib_backports(
+            resolved, python_minor=python_minor or "", dropped=dropped, audit=audit
+        )
     return resolved
 
 
@@ -9463,6 +11297,18 @@ class BuildPin:
     ``setuptools_scm`` into this layer" is a question a reader asks of the JSON, and
     ``source`` is where it is answered rather than a key they can query.
     """
+    widened_by: tuple[tuple[str, str], ...] = ()
+    """The declaring pins whose own release date widened the window (§3.2, §8.6 rule R3).
+
+    [VANTA-WHY] ``build_requirement_of`` alone cannot say *which* rule placed the pin: a
+    build requirement the bug's own date reaches and one only the declaring pin's own date
+    reaches carry the same ``declared_by``, and the second is a different fact — the pin
+    installed is newer than the bug. So each ``(declarer, released_at)`` pair here is a
+    declaring pin whose own release landed at the widened cutoff, recorded so the JSON says
+    the fallback was used *and* what anchored it. Empty for every pin the bug's own date
+    already reached, which is what keeps an already-baked layer's record byte-identical.
+    Measured on ``fastapi/11``: one pair, ``("ujson==3.0.0", "2020-06-03")``.
+    """
 
     @property
     def pin_rule(self) -> str:
@@ -9475,6 +11321,8 @@ class BuildPin:
             return "the oldest release that satisfies " + "; ".join(
                 f"{pin} declares {specifier}" for pin, specifier in self.narrowed_by
             )
+        if self.widened_by:
+            return BUILD_REQUIREMENT_FALLBACK_PIN_RULE
         if self.build_requirement_of is not None:
             return BUILD_REQUIREMENT_PIN_RULE
         return BUILD_PIN_RULE
@@ -9495,6 +11343,11 @@ class BuildPin:
             data["narrowed_by"] = [
                 {"pin": pin, "requires": specifier}
                 for pin, specifier in self.narrowed_by
+            ]
+        if self.widened_by:
+            data["widened_by"] = [
+                {"pin": pin, "released_at": released_at}
+                for pin, released_at in self.widened_by
             ]
         return data
 
@@ -9898,6 +11751,11 @@ def bug_sources(
     if not setup_sh.strip():
         notes.append("setup.sh (BugsInPy): empty for this bug")
 
+    # BugsInPy's own runner, read for one field of its own: the ``-p`` options §8.6's R2
+    # safeguard protects. Nothing here installs from it and it is not a source of
+    # declarations — the line is evidence about the *suite*, not about the environment.
+    test_command = test_command_of(run_test_sh_for(bugsinpy_root, project, bug_id))
+
     # The import name comes from the *buggy* commit's own metadata — ``setup.py``
     # or ``pyproject.toml``, whichever it carries: that is the package under test,
     # and the closure needs it to exclude the project's own modules. A commit with
@@ -10017,6 +11875,7 @@ def bug_sources(
         notes=tuple(notes),
         build_refs=tuple(build_declared),
         tree_modules=tuple(tree_modules),
+        test_command=test_command,
     )
 
 
@@ -10069,30 +11928,63 @@ def no_deps_dependents(
     than the result of two calls — belongs in the pass once.
 
     A pin is a dependent when its **own** release's ``requires_dist`` names one of the
-    names (:func:`_declared_requirement`), read at the version ``installs`` carries. A
-    release whose metadata cannot be read is skipped rather than guessed at: the walk
-    already recorded that release's declarations, and inventing a dependency here would
-    be the second reader the rest of this module exists to avoid.
+    names (:func:`_declares_absent`), read at the version ``installs`` carries — and the
+    set is **closed transitively**, because moving a dependent out of the main pass makes
+    *its* name a name the main pass installs nothing for. Measured on ``pandas/7``'s
+    retry: dropping the unbuildable ``h5py==2.10.0`` leaves ``clifford==1.3.1``
+    (which declares it) in the moved set, and ``mpl-toolkits-clifford==0.0.3``
+    (which declares ``clifford``) has to move with it, or pip resolves the whole chain
+    itself when the main pass reaches it — the unpinned ``h5py 3.11.0`` the retry log
+    shows. So each moved pin whose declaration is a *real* requirement, and not one gated
+    behind an ``extra`` marker, joins the names and the walk runs to a fixpoint.
+
+    A release whose metadata is a **known** unknown — :class:`UnknownDeclarations`, the
+    release PyPI carries no readable declarations for — is left where it is: moving it
+    would be guessing, and the strict freeze gate (:func:`unpinned_freeze`) is the
+    backstop that fails the layer if that release turns out to declare an absent name. A
+    read that *errored* is the other case and is not answered here at all: it raises
+    :class:`UnmovableDependent`, naming the pin it could not read and why, so the caller
+    fails the layer closed (the first pass's flag, the retry's refusal) rather than
+    resolving against a half-read picture.
     """
     names = {canonicalize_name(name) for name in absent}
     if not names:
         return ()
-    out: list[str] = []
+    specs: dict[str, str] = {}
+    order: list[str] = []
     for spec in installs:
         parts = _pinned_parts(spec)
         if parts is None:
             continue
-        name, version = parts
-        try:
-            requires, _requires_python = metadata_of(name, version)
-        except BakeError:
-            continue
-        if any(
-            _declared_requirement(requires, absent_name) is not None
-            for absent_name in names
-        ):
-            out.append(spec)
-    return tuple(out)
+        name = canonicalize_name(parts[0])
+        if name not in specs:
+            specs[name] = spec
+            order.append(name)
+    moved: dict[str, str] = {}
+    changed = True
+    while changed:
+        changed = False
+        for name in order:
+            if name in moved:
+                continue
+            spec = specs[name]
+            package, version = _pinned_parts(spec)
+            try:
+                requires, _requires_python = metadata_of(package, version)
+            except UnknownDeclarations:
+                continue
+            except BakeError as exc:
+                raise UnmovableDependent(
+                    spec, f"what it declares could not be read ({exc})"
+                ) from exc
+            mentions, real = _declares_absent(requires, names)
+            if not mentions:
+                continue
+            moved[name] = spec
+            if real:
+                names.add(name)
+            changed = True
+    return tuple(moved[name] for name in order if name in moved)
 
 
 def deps_provenance(
@@ -10317,6 +12209,16 @@ class BugDeps:
     check``, and the freeze gate exempts none of them. Empty for every layer that does not
     re-pin a harness package, which is most of them.
     """
+    retry: Optional[RetryMaterial] = None
+    """What §8.6 R2(ii)'s one retry needs, or ``None`` for a layer the rule cannot reach.
+
+    ``None`` for every layer that is not a per-bug layer built from resolved pins — the
+    interpreter layers are built by :func:`python_recipe` and have no pins of their own to
+    drop — and for a caller that resolved dependencies without an audit to consult.
+    Attached by :func:`resolve_bug_deps` from the two callables it bound for this bug, so
+    the retry reads the *same* closure and the *same* safeguard both halves of the layer
+    were resolved with (:func:`retry_plan`).
+    """
 
 
 @dataclass(frozen=True)
@@ -10351,6 +12253,7 @@ def resolve_bug_deps(
         [str, str], Sequence[DepRef]
     ] = pypi_build_requirements,
     classify: Optional[Callable[[str, str, str], PreflightPin]] = None,
+    plugin_of: Optional[Callable[[str, str], Optional[bool]]] = None,
     build_vm: Optional[Mapping[str, int]] = None,
 ) -> tuple[list[BugDeps], list[FlaggedBug]]:
     """Resolve every selected bug's layer, pinning by date from PyPI.
@@ -10386,6 +12289,13 @@ def resolve_bug_deps(
     (:func:`early_install_pins`), so the layer's ``early_pins`` can say so. It is read
     from the release's sdist and never executed; ``bake`` passes the run's
     :func:`cached_build_requirements`, so a pin two bugs hold is downloaded once.
+
+    ``plugin_of`` answers §8.6's R2's last question — "does this release register a
+    ``pytest11`` entry point" (:func:`declares_pytest_plugin`) — and it is injected for
+    the same reason as the rest: it downloads a wheel, and a test that exercises a drop
+    must not. The safeguard it feeds is built here, per bug, from the harness's own
+    names, this bug's declared build requirements and the ``-p`` options its own
+    ``run_test.sh`` carries (:func:`pin_safeguard`, :func:`protected_pin_names`).
 
     ``build_vm`` is the VM every layer of this call is baked in, written into each
     provenance (:data:`BUILD_VM_KEY`). It is a property of the *run* and not of a bug, so
@@ -10489,6 +12399,15 @@ def resolve_bug_deps(
                 distributions=distributions,
                 test_files=test_files,
             )
+            # §8.6's R2 safeguard, built once for this bug and handed to both halves of
+            # the layer — the declared pins inside ``resolve_deps`` and the closure
+            # walk's picks below — for the same reason ``reason_of`` and ``audit`` are:
+            # a pin the safeguard protects must be a flag whichever pass reaches it.
+            safeguard = pin_safeguard(
+                protected_names=protected_pin_names(str(entry["project"]), sources),
+                plugin_names=plugin_options(sources.test_command or ""),
+                plugin_of=plugin_of or declares_pytest_plugin,
+            )
             resolved = resolve_deps(
                 sources,
                 releases=releases,
@@ -10498,6 +12417,23 @@ def resolve_bug_deps(
                 reason_of=reason_of,
                 audit=audit,
                 dropped=dropped,
+                safeguard=safeguard,
+            )
+            # §8.6's round-11 self-pin rule, and it has to run here — before ``own_pins``
+            # is built and before the closure walk — because the walk reads the pin list
+            # and a name still in it is *pinned*, so the tree question is never asked of
+            # it (:func:`drop_self_pin`). A declared pin that names the project under test
+            # and that this image would build from an unreviewed sdist is the tree's, so it
+            # leaves the list and the walk records it (:class:`TreeSatisfied`), exactly as
+            # it does for a name a *release* declares.
+            resolved = drop_self_pin(
+                resolved,
+                tree_names={
+                    canonicalize_name(name)
+                    for name in (sources.import_name, *sources.tree_modules)
+                },
+                classify=classifier,
+                python_minor=minor,
             )
             built = resolve_build_pins(
                 sources.build_refs,
@@ -10597,9 +12533,17 @@ def resolve_bug_deps(
             # ``dropped`` list, so the provenance and the preflight's drop report read
             # the two halves as one answer.
             transitive, dropped_transitive = drop_unresolvable_deps(
-                transitive, reason_of=reason_of, audit=audit
+                transitive, reason_of=reason_of, audit=audit, safeguard=safeguard
             )
             dropped.extend(dropped_transitive)
+            # §8.6's round-11 stdlib-shadow rule reaches the walk's picks too, and it is
+            # the one that matters here: enum34 is a *transitive* pick the date rule took
+            # from each hypothesis in the layer, so the closure walk is where it arrives
+            # (:func:`drop_stdlib_backports`). This is before ``deps`` and ``installs``
+            # below, which is what keeps it out of the pin list and the recipe.
+            transitive = drop_stdlib_backports(
+                transitive, python_minor=minor, dropped=dropped, audit=audit
+            )
             # The transitive picks are installed, recorded and gated exactly as the
             # declared ones are: they are the same kind of pin, chosen by the same rule,
             # and the only thing that distinguishes them is that no file in the bug's tree
@@ -10644,14 +12588,23 @@ def resolve_bug_deps(
         # (:func:`requirements_recipe`), which is what stops pip resolving it at all;
         # ``pip check`` then reports that name and nothing else, which is what the gate
         # tolerates by name (:data:`CASE_DROPPED_DEPENDENCY`, :data:`CASE_TREE_PROVIDED`).
-        no_deps = no_deps_dependents(
-            installs,
-            (
-                *(record.name for record in dropped),
-                *(record.name for record in tree_satisfied_pins),
-            ),
-            metadata_of=metadata_of,
-        )
+        try:
+            no_deps = no_deps_dependents(
+                installs,
+                (
+                    *(record.name for record in dropped),
+                    *(record.name for record in tree_satisfied_pins),
+                ),
+                metadata_of=metadata_of,
+            )
+        except BakeError as exc:
+            # D4: a read that *errored* is not answered by skipping the pin — the pass
+            # would then be built from a half-read picture — so the bug is flagged closed
+            # here, exactly as any other layer this run could not resolve. A release that
+            # is a *known* unknown is not this case: :func:`no_deps_dependents` leaves it
+            # where it is and the strict freeze gate is the backstop.
+            flagged.append(FlaggedBug(key=key, reason=f"{type(exc).__name__}: {exc}"))
+            continue
         # §3.2's marker rule over the pinned releases' own build declarations, which is
         # this rule's early-pass half: a ``[build-system].requires`` entry that does not
         # hold on this image is not something the build orders anything for. The dropped
@@ -10697,6 +12650,16 @@ def resolve_bug_deps(
                 early_pins=tuple(dict.fromkeys(item.satisfied_by for item in early)),
                 no_deps_pins=no_deps,
                 orphans=tuple(pin.name for pin in orphaned),
+                # §8.6 R2(ii)'s retry reads the *same* closure and the *same* safeguard
+                # this layer was resolved with, carried rather than rebuilt when a build
+                # fails: the auditor reads both trees, and a second one built at retry
+                # time would be a second answer to a question already answered here.
+                retry=RetryMaterial(
+                    audit=audit,
+                    safeguard=safeguard,
+                    metadata_of=metadata_of,
+                    minor=minor,
+                ),
             )
         )
     return out, flagged
@@ -10706,11 +12669,115 @@ def deps_path(deps_dir: Path, checkpoint: str) -> Path:
     return deps_dir / f"{checkpoint}.json"
 
 
+CHECKPOINT_ID_KEY = suite_cache_mod.CHECKPOINT_ID_KEY
+BAKED_AT_KEY = suite_cache_mod.BAKED_AT_KEY
+"""The two stamp keys of a layer's identity (M3 item U3).
+
+[VANTA-WHY] Named once, in :mod:`suite_cache`, and bound here rather than spelled
+again: the writer (:func:`stamp_provenance`) and the readers (``suite_cache``, and
+through ``VANTA_SHURU_CHECKPOINT_ID`` the Rust half of the cache) must not be able
+to disagree about the key they mean.
+"""
+
+
+def provenance_digest(provenance: Mapping[str, Any]) -> str:
+    """A sha256 over the DECISIVE fields of one layer's provenance.
+
+    [VANTA-WHY] M3 item U3. This is what makes a checkpoint's identity a fact
+    about the layer rather than about its name: two bakes that resolved the same
+    pins produce the same digest, and a re-bake that resolved different ones
+    produces a different one — which is exactly the question the suite cache has
+    to answer before it serves a measurement.
+
+    Three keys are excluded, and each for its own reason:
+
+    * the two stamp keys themselves, or the digest would depend on itself;
+    * :data:`PIP_CHECK_KEY`, because it is the layer's verdict on itself written
+      back AFTER the bake (:func:`record_pip_check`) and not an input to it. A
+      digest that covered it would change the identity of a layer whenever its
+      own ``pip check`` output was recorded — turning every re-bake of an already
+      recorded layer into a "different" layer and emptying the suite cache.
+
+    Everything else is decisive, including the ``notes`` and ``skipped`` lists: a
+    field that moved is a resolution that changed, and the honest answer for the
+    cache is a miss.
+    """
+
+    material = {
+        key: value
+        for key, value in provenance.items()
+        if key not in (CHECKPOINT_ID_KEY, BAKED_AT_KEY, PIP_CHECK_KEY)
+    }
+    blob = json.dumps(
+        material, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def stamp_provenance(
+    provenance: Mapping[str, Any], previous: Optional[Mapping[str, Any]] = None
+) -> dict[str, Any]:
+    """``provenance`` with its layer identity stamped in (M3 item U3).
+
+    ``previous`` is the provenance already on disk for this checkpoint, when there
+    is one. A re-bake that resolved the SAME layer keeps the ``baked_at`` it had,
+    so an unchanged layer keeps its identity: a fresh timestamp on every ``bake``
+    invocation would change ``checkpoint_id`` for a layer nothing about which
+    changed, and take the whole suite cache down with it every time the bake was
+    re-run. A layer the re-bake resolved differently gets a new stamp, which is
+    the point — the entry the old identity's key found describes a layer that no
+    longer exists.
+
+    ``checkpoint_id`` is the digest of the stamped material, so it moves when
+    either the layer or the moment it was first baked moves.
+    """
+
+    digest = provenance_digest(provenance)
+    baked_at = ""
+    if isinstance(previous, Mapping) and provenance_digest(previous) == digest:
+        remembered = previous.get(BAKED_AT_KEY)
+        if isinstance(remembered, str):
+            baked_at = remembered
+    if not baked_at:
+        baked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    identity = hashlib.sha256(f"{baked_at}\x00{digest}".encode("utf-8")).hexdigest()
+    stamped = dict(provenance)
+    stamped[BAKED_AT_KEY] = baked_at
+    stamped[CHECKPOINT_ID_KEY] = identity
+    return stamped
+
+
+def _read_provenance(path: Path) -> Optional[dict[str, Any]]:
+    """The provenance already at ``path``, or ``None`` — never raises.
+
+    [VANTA-WHY] :func:`stamp_provenance`'s ``previous`` is an optimisation and a
+    consistency check, not a dependency: a first bake, an unreadable file and a
+    file from a build that did not stamp at all all mean the same thing here —
+    there is nothing to preserve, so the layer gets a fresh stamp.
+    """
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def write_deps(deps_dir: Path, deps: BugDeps) -> Path:
+    """Write one layer's provenance, stamped with its identity (M3 item U3).
+
+    [VANTA-WHY] The stamp is computed HERE rather than in :func:`deps_provenance`
+    because only this function can see the file the layer may already have — and
+    preserving ``baked_at`` across a re-bake is what keeps an unchanged layer's
+    identity (and so the suite cache's entries for it) stable. See
+    :func:`stamp_provenance`.
+    """
+
     deps_dir.mkdir(parents=True, exist_ok=True)
     path = deps_path(deps_dir, deps.checkpoint)
+    provenance = stamp_provenance(deps.provenance, previous=_read_provenance(path))
     path.write_text(
-        json.dumps(deps.provenance, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        json.dumps(provenance, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     return path
 
@@ -10761,6 +12828,588 @@ def record_pip_check(
         json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     return path
+
+
+def record_retry(deps_dir: Path, checkpoint: str, plan: RetryPlan) -> Path:
+    """Write a retried layer's drops and the fact of the retry into its provenance.
+
+    [VANTA-WHY] Back into the file, like :func:`record_pip_check`, and for a related
+    reason: what the retry learned exists only once a build has been attempted, and
+    ``prepare`` reads one provenance per bug. Under **R2(ii)** the drops go into
+    ``dropped`` — the key the rest of the harness already reads — so their second reader
+    is automatic: ``prepare`` names every dropped pin in a gate failure's reason
+    (``prepare.dropped_pin_note``), and the gate is the measurement that refutes a drop
+    that was wrong. ``retry`` is written beside them as the record of the *path*: that
+    this layer's first build failed, which rule answered it (``rule``), on what (``why``)
+    and what the second attempt left out. Under **R1** nothing is dropped, so ``dropped``
+    is untouched and ``retry`` alone carries the fact that the second attempt only
+    reordered the installs — ``hoisted`` names each pin it installed ahead of the early
+    block, with the log line that named the fetch it answers (:func:`hoisted_pins`), and
+    is the empty list for an R2(ii) retry, symmetrically with ``dropped``. Under **R4**
+    nothing is dropped or reordered either and ``dropped``/``hoisted`` are both empty; the
+    fact the record adds is ``transient`` — the requirement, the two hashes and the log
+    line — which is the failure *class* the run's summary names and the metadata keeps.
+    Every key together are "every drop, with its source, its failure reason and its closure
+    evidence, in the layer metadata", and ``hoisted`` and ``transient`` are the same
+    account of the two changes that are not drops.
+
+    [VANTA-WHY] A **refused** plan is the one case that is not a retry at all (§8.6 R2(ii),
+    D2): the ``--no-deps`` set could not be closed, so no second attempt was rendered and
+    nothing was dropped. The record is still written, because the layer must be
+    distinguishable from one no rule reached: ``used`` is ``False``, ``refused`` names each
+    dependent and the reason it could not leave the resolving pass, and
+    ``dropped``/``hoisted``/``transient`` keep their empty shapes so a reader sees the same
+    record with the same meaning.
+
+    The identity is **re-stamped**, unlike :func:`record_pip_check`, and the difference is
+    the point: ``pip_check`` is a verdict *about* a layer and :func:`provenance_digest`
+    excludes it, whereas these drops change which pins the layer holds — ``dropped`` is
+    decisive material. Leaving the first pass's ``checkpoint_id`` in place would be a file
+    whose identity does not describe it, and two layers that resolved the same first-pass
+    pins would share a key while holding different environments. R1 re-stamps for the same
+    reason: ``retry`` is decisive too, and the second attempt's ordering is not the
+    first's. R4 re-stamps for the third: ``retry`` is decisive there too, and two layers
+    whose first pass resolved the same pins can differ in whether the bytes had to be
+    fetched twice.
+    """
+
+    data = load_deps(deps_dir, checkpoint)
+    if plan.refused is not None:
+        # D2/D5: a refusal is not a retry. Nothing was dropped and no second attempt ran,
+        # so ``dropped`` at the top level is untouched; what this failed layer's record
+        # gains is that the retry the rule offered was refused, and on what.
+        data[RETRY_KEY] = {
+            "used": False,
+            "rule": plan.rule,
+            "reason": "the retry was refused — "
+            + "; ".join(
+                f"{spec} cannot be moved out of the resolving pass: {why}"
+                for spec, why in plan.refused
+            ),
+            "dropped": [],
+            "hoisted": [],
+            "transient": None,
+            "refused": [{"spec": spec, "why": why} for spec, why in plan.refused],
+        }
+        path = deps_path(deps_dir, checkpoint)
+        path.write_text(
+            json.dumps(stamp_provenance(data), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        return path
+    records = data.get("dropped")
+    dropped = list(records) if isinstance(records, list) else []
+    dropped.extend(drop.as_dict() for drop in plan.drops)
+    data["dropped"] = dropped
+    data[RETRY_KEY] = {
+        "used": True,
+        "rule": plan.rule,
+        "reason": plan.why
+        or (
+            "the first-pass build failed on "
+            + ", ".join(drop.pin for drop in plan.drops)
+            + " (§8.6 R2(ii)); the layer was rebuilt once without them"
+        ),
+        "dropped": [drop.as_dict() for drop in plan.drops],
+        "hoisted": [item.as_dict() for item in plan.hoist],
+        "transient": plan.transient.as_dict() if plan.transient is not None else None,
+    }
+    path = deps_path(deps_dir, checkpoint)
+    path.write_text(
+        json.dumps(stamp_provenance(data), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+# ---------------------------------------------------------------------------
+# giving the layers baked before U3 an identity (M3 item U3, `stamp-existing`)
+# ---------------------------------------------------------------------------
+STAMPED_EXISTING_KEY = "stamped_existing"
+"""The provenance key saying an identity came from ``stamp-existing``, not from a bake.
+
+[VANTA-WHY] M3 item U3 gave every layer baked *after* it an identity and left every layer
+baked before it with none, so ``suite._measure_suite`` answered ``off:unknown_checkpoint``
+for all of them and the whole suite cache was inert: every suite with a checkpoint was
+measured again, in every batch, forever. Re-baking was the only way to give those layers a
+stamp, and a re-bake re-derives an environment that is already correct, minutes at a time.
+
+The key is deliberately **inside** the digested material — :func:`provenance_digest`
+excludes only the two stamp keys themselves and :data:`PIP_CHECK_KEY` — and that is what
+keeps the two ways of getting an identity from colliding: :func:`write_deps` never writes
+this key, so a bake of a stamped layer digests different material, cannot preserve
+``baked_at``, and gives the layer a fresh identity. A stamped identity therefore describes
+only the layer that was stamped, which is the whole of "any future rebake still gets a new
+one".
+"""
+
+PREFLIGHT_SUFFIX = ".preflight.json"
+"""The bake's pin-classification files, which sit in ``deps/`` and are not layers.
+
+Skipped by name when the directory is walked, and never the target of a stamp: a
+``.preflight.json`` is what the *bake* predicted before a layer existed, it holds no
+``installs``, and it has no identity to fix.
+"""
+
+LAYER_VERIFY_TIMEOUT_SECS = 300
+"""One boot-verify's budget. The marker probe uses the same 300 s (§3.2)."""
+
+VERIFY_MARKER_OK = "VANTA-VERIFY-MARKER-OK"
+"""Printed by :func:`boot_layer_probe` when the layer carries its ``touch`` marker."""
+
+VERIFY_MARKER_MISSING = "VANTA-VERIFY-MARKER-MISSING"
+"""Printed when it does not — the layer would have been deleted by its own bake."""
+
+VERIFY_NO_PYTHON = "VANTA-VERIFY-NO-PYTHON"
+"""Printed when the layer has no ``python`` on ``PATH``, so there is nothing to query."""
+
+VERIFY_INTERPRETER = "VANTA-VERIFY-INTERPRETER"
+VERIFY_VERSION = "VANTA-VERIFY-VERSION"
+"""The boot's own reading of the interpreter it queried: its path, then its version.
+
+Recorded rather than assumed because the table has to show which interpreter a layer was
+verified through, and "``python`` is the 3.8 venv wrapper in every layer" is exactly the
+assumption this step exists not to make (the base image's ``python3`` is a different
+Python entirely).
+"""
+
+VERIFY_LISTING_BEGIN = "VANTA-VERIFY-LISTING-BEGIN"
+VERIFY_LISTING_END = "VANTA-VERIFY-LISTING-END"
+VERIFY_LISTING_FAILED = "VANTA-VERIFY-LISTING-FAILED"
+"""The envelope around the distributions the layer's interpreter can see.
+
+[VANTA-WHY] M3 item U3 — an envelope rather than a bare listing, because the ways of
+failing to *read* an environment (no interpreter, a listing that exits non-zero, a listing
+that prints nothing) have to stay distinguishable from an environment that really is
+missing a pin. Without the sentinels each of them reads as "every recorded package is not
+installed", which is the one verdict this step must not reach: it refuses a layer that is
+fine, and it reports drift about an environment nothing managed to look at.
+"""
+
+LAYER_INTERPRETER = "python"
+"""The interpreter the verify queries — the one every split's ``test_cmd[0]`` names.
+
+[VANTA-WHY] A suite runs ``python -m pytest`` with the tree as the guest's working
+directory (``suite.run_suite_twice`` over ``split.test_cmd``), so the environment a
+measurement happens in is the one bare ``python`` resolves to. Querying any other
+interpreter would verify an environment the suite is never run in — and ``python3`` in
+particular is the *base image's*, not the layer's venv wrapper.
+"""
+
+ENV_UNREADABLE = "verify could not read the environment"
+"""The one reason a boot that could not be read refuses with.
+
+Deliberately not a mismatch sentence: a reader has to be able to tell "the layer drifted"
+from "the verify did not manage to look", because the two want different responses — a
+re-bake, versus a look at the probe.
+"""
+
+LIST_ENV_CODE = (
+    "import importlib.metadata as m; "
+    "[print(f\"{d.metadata.get('Name')}=={d.version}\") "
+    "for d in m.distributions() if d.metadata.get('Name')]"
+)
+"""The listing the layer's own interpreter is asked for: what it can see installed.
+
+[VANTA-WHY] ``importlib.metadata`` and not ``pip freeze``, measured on the layers
+themselves. pip's listing commands skip any distribution whose name is a standard-library
+module — ``pip._internal.commands.list`` does ``skip = set(stdlib_pkgs)`` — so
+``argparse==1.3.0``, which ``luigi/1`` and ``luigi/2`` really carry (``pip show argparse``
+reports 1.3.0 and ``importlib.metadata`` reports ``('argparse', '1.3.0')``), is absent
+from ``pip freeze``, from ``pip freeze --all`` *and* from ``pip list --format=freeze``.
+Plain ``pip freeze`` additionally hides ``pip``/``setuptools``/``distribute``/``wheel``
+unless ``--all`` is given, which is how ``pandas/1``'s recorded ``setuptools==46.4.0``
+came back as "not installed". Both are pip's own filters and not facts about the layer,
+and comparing recorded pins against a listing that cannot show them refuses healthy
+layers. ``importlib.metadata`` is the interpreter's own answer, with no pip in the way.
+"""
+
+
+def was_stamped_existing(provenance: Mapping[str, Any]) -> bool:
+    """Whether a layer's identity came from ``stamp-existing`` rather than from a bake."""
+    return bool(provenance.get(STAMPED_EXISTING_KEY))
+
+
+def layer_deps_files(deps_dir: Path) -> list[Path]:
+    """The deps files that describe a baked layer, in name order.
+
+    ``*.preflight.json`` is skipped (:data:`PREFLIGHT_SUFFIX`): it is the bake's own
+    record of what it predicted, written before a layer existed and holding no
+    ``installs``, so it is not a layer and has no identity. What is left is one
+    provenance file per layer.
+    """
+    return sorted(
+        path
+        for path in deps_dir.glob("*.json")
+        if not path.name.endswith(PREFLIGHT_SUFFIX)
+    )
+
+
+def boot_layer_probe(checkpoint: str, *, disk_mb: int = BAKE_DISK_MB) -> ExecResult:
+    """Boot ``checkpoint`` once, read-only, and report its marker and its environment.
+
+    [VANTA-WHY] The layer's own truth — ``/opt/vanta-deps-ok`` and what its ``python``
+    can see installed — lives *inside* the checkpoint and cannot be read without booting
+    it, so a stamp that refuses to describe a layer that changed has to boot it. One
+    boot, three readings: the marker, the interpreter it queried, and that interpreter's
+    own listing, each echoed between sentinels so a single VM start answers all of them
+    and a layer that lost any one still says which.
+
+    [VANTA-WHY] **One** ``sh -c`` string, not an argv of several commands. The probe used
+    to pass ``["sh", "-c", A, "sh", "-c", B]``, which :func:`shuru.run` quotes with
+    ``shlex.join`` into ``sh -c A sh -c B`` — and POSIX ``sh -c`` takes ``$0,$1,$2`` from
+    the words after the script, so ``B`` was never executed at all. The marker printed and
+    the listing did not, which read downstream as an environment missing every recorded
+    pin (a *mismatch*) rather than as a probe that never looked. A single script removes
+    the failure mode instead of documenting it.
+
+    ``--disk-size`` is the disk the layer was *built* at (:data:`BAKE_DISK_MB`), so the
+    boot cannot be the thing that truncates it, and the mount is read-only with no host
+    writes: verifying a layer must not be able to change it. No ``--memory`` — reading an
+    environment needs no more than shuru's own default. The boot's start-up guard prints
+    on stderr (``DEV_SHM_GUARD``), so ``stdout`` carries only these readings.
+    """
+    interpreter = shlex.quote(LAYER_INTERPRETER)
+    script = "\n".join(
+        [
+            f"if test -f {MARKER}; then echo {VERIFY_MARKER_OK}; "
+            f"else echo {VERIFY_MARKER_MISSING}; fi",
+            f"if command -v {interpreter} >/dev/null 2>&1; then",
+            f"  echo {VERIFY_INTERPRETER} \"$(command -v {interpreter})\"",
+            f"  echo {VERIFY_VERSION} \"$({interpreter} -V 2>&1)\"",
+            f"  echo {VERIFY_LISTING_BEGIN}",
+            f"  if {interpreter} -c {shlex.quote(LIST_ENV_CODE)}; then "
+            f"echo {VERIFY_LISTING_END}; else echo {VERIFY_LISTING_FAILED}; fi",
+            "else",
+            f"  echo {VERIFY_NO_PYTHON}",
+            "fi",
+        ]
+    )
+    return shuru_run(
+        checkpoint=checkpoint,
+        host_root=Path.cwd(),
+        command=["sh", "-c", script],
+        disk_mb=disk_mb,
+        timeout_secs=LAYER_VERIFY_TIMEOUT_SECS,
+        allow_host_writes=False,
+    )
+
+
+def freeze_versions(lines: Iterable[str]) -> dict[str, str]:
+    """``{canonical name: version}`` for the distributions a listing names.
+
+    Compared by canonical name because a listing spells a project per PEP 503 while a
+    pin keeps the spelling its own file used (:func:`unpinned_freeze`), so
+    ``PySnooper`` and ``pysnooper`` are the same distribution and
+    :func:`canonicalize_name` is what makes them so.
+    """
+    out: dict[str, str] = {}
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith(("-", "#")):
+            continue
+        name = line.partition("==")[0].partition(" @ ")[0].strip()
+        if not name:
+            continue
+        out[canonicalize_name(name)] = line.partition("==")[2].strip()
+    return out
+
+
+@dataclass(frozen=True)
+class LayerVerify:
+    """What one boot-verify read from a layer, and whether it matches its record.
+
+    ``ok`` is whether the layer's environment matches the pins its provenance records;
+    ``detail`` is the sentence a refusal prints. ``interpreter`` and ``version`` are what
+    the boot reported querying — recorded even on a refusal, so the table shows what was
+    looked at rather than leaving the reader to guess which ``python`` answered.
+    """
+
+    ok: bool
+    detail: str
+    interpreter: str = ""
+    version: str = ""
+
+
+def _sentinel_value(lines: Sequence[str], prefix: str) -> str:
+    """The value after ``prefix`` on the first line that carries it, else ``""``."""
+    for line in lines:
+        if line.startswith(prefix + " "):
+            return line[len(prefix) + 1:].strip()
+    return ""
+
+
+def compare_layer(result: ExecResult, *, installs: Sequence[str]) -> LayerVerify:
+    """Whether a boot-verify's readings match the layer's recorded installs.
+
+    [VANTA-WHY] M3 item U3 — a failure to *read* the environment and a layer that is
+    genuinely missing a pin are different verdicts, and this function is where they are
+    kept apart. Every reading comes from a sentinel the probe printed (:data:`VERIFY_NO_PYTHON`,
+    :data:`VERIFY_LISTING_FAILED`, an empty listing) precisely so that "could not look"
+    returns :data:`ENV_UNREADABLE` rather than the "the layer no longer matches its
+    recorded provenance" sentence, which is a claim about the layer. A reader has to be
+    able to tell a re-bake from a look at the probe, and only the reason distinguishes
+    them. Names are compared per :func:`canonicalize_name`, so a PEP 503 spelling in the
+    listing matches the pin's own spelling (:func:`freeze_versions`).
+    """
+    if not result.ok:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the boot failed: exit={result.exit_code}"
+            + (" (timeout)" if result.timed_out else "")
+            + f"; stderr: {result.stderr.strip()[-400:] or '(empty)'}",
+        )
+    lines = [line.strip() for line in result.stdout.splitlines()]
+    if VERIFY_MARKER_MISSING in lines:
+        return LayerVerify(False, f"the layer has no marker {MARKER}")
+    if VERIFY_MARKER_OK not in lines:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the boot reported neither the marker nor its absence; "
+            f"stdout: {result.stdout.strip()[-400:] or '(empty)'}",
+        )
+    interpreter = _sentinel_value(lines, VERIFY_INTERPRETER)
+    version = _sentinel_value(lines, VERIFY_VERSION)
+    if VERIFY_NO_PYTHON in lines or not interpreter:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the layer has no {LAYER_INTERPRETER} on PATH",
+            interpreter,
+            version,
+        )
+    if VERIFY_LISTING_FAILED in lines:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the listing exited non-zero",
+            interpreter,
+            version,
+        )
+    try:
+        begin = lines.index(VERIFY_LISTING_BEGIN)
+        end = lines.index(VERIFY_LISTING_END)
+    except ValueError:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the listing did not complete",
+            interpreter,
+            version,
+        )
+    listing = [line for line in lines[begin + 1:end] if line]
+    if not listing:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the listing was empty",
+            interpreter,
+            version,
+        )
+    malformed = [line for line in listing if "==" not in line]
+    if malformed:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the listing could not be parsed: "
+            f"{malformed[0][:80]}",
+            interpreter,
+            version,
+        )
+    frozen = freeze_versions(listing)
+    differed: list[str] = []
+    for pin in installs:
+        name, _, pin_version = pin.partition("==")
+        held = frozen.get(canonicalize_name(name.strip()))
+        if held is None:
+            differed.append(f"{pin} is not installed")
+        elif pin_version and held != pin_version:
+            differed.append(f"{pin} is installed at {name.strip()}=={held}")
+    if differed:
+        return LayerVerify(
+            False,
+            "the layer no longer matches its recorded provenance: "
+            + "; ".join(differed),
+            interpreter,
+            version,
+        )
+    return LayerVerify(
+        True,
+        f"{interpreter} ({version}); marker present; "
+        f"{len(installs)} recorded pin(s) at their recorded version",
+        interpreter,
+        version,
+    )
+
+
+@dataclass(frozen=True)
+class StampOutcome:
+    """What ``stamp-existing`` did to one deps file, and why.
+
+    One record per file in the directory, in walk order, so the command's table is the
+    whole story and a reader can see a layer that was skipped or refused rather than
+    finding it simply absent.
+    """
+
+    checkpoint: str
+    project: str
+    action: str
+    """``stamped``, ``already``, ``missing``, ``not a layer's provenance`` or ``refused``.
+
+    ``missing`` is separate from ``refused`` deliberately: a deps file whose checkpoint no
+    longer exists is not a *failure* of this step — there is no layer to mismatch — and
+    treating it as one would make the command exit non-zero over nothing it can act on.
+    """
+
+    origin: str
+    """``baked`` or ``stamped`` for a layer that has an identity, else ``—``."""
+
+    checkpoint_id: str
+    digest: str
+    verify: str
+    interpreter: str = ""
+    python_version: str = ""
+    """The interpreter the verify queried and the version it reported, when it booted one.
+
+    Empty for a layer this run did not boot (``already``, ``missing``), because the table
+    must show what was actually read and not imply a check that never ran.
+    """
+
+
+def unstamped_deps(deps_dir: Path, checkpoints: Sequence[str]) -> list[str]:
+    """The named layers whose provenance carries no identity, sorted.
+
+    [VANTA-WHY] ``prepare`` reports this rather than fixing it. A layer with a
+    provenance file and no ``checkpoint_id`` is a layer the suite cache cannot key on, so
+    every run of it measures instead of reusing — and the fix (a boot-verify and a stamp)
+    is deliberately *not* something ``prepare`` may do for itself, because a stamp applied
+    to a layer that changed would hand it an identity it no longer deserves. Naming the
+    layers and the command that fixes them is what keeps this from being silent.
+
+    A layer with no provenance at all is not listed: it has no record to stamp, and
+    ``prepare`` refuses it separately through :func:`missing_deps`.
+    """
+    out: list[str] = []
+    for name in checkpoints:
+        try:
+            data = json.loads(
+                deps_path(deps_dir, name).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict) or "installs" not in data:
+            continue
+        identity = data.get(CHECKPOINT_ID_KEY)
+        if not (isinstance(identity, str) and identity):
+            out.append(name)
+    return sorted(out)
+
+
+def stamp_existing(
+    deps_dir: Path,
+    *,
+    disk_mb: int = BAKE_DISK_MB,
+    interpreters: Optional[Mapping[str, str]] = None,
+) -> list[StampOutcome]:
+    """Give every unstamped layer an identity, without re-baking it (M3 item U3).
+
+    [VANTA-WHY] The layers this fixes were baked before the identity existed, so their
+    provenance has no ``checkpoint_id`` and the suite cache reads ``off:unknown_checkpoint``
+    for each of them. A re-bake would fix that and also re-derive the layer, which is
+    minutes per layer and changes nothing about the environment. This writes the identity
+    where :func:`write_deps` writes it, in the same shape, so from here on a layer's
+    identity is fixed — and a *later* re-bake of it still gets a fresh one, because this
+    run records :data:`STAMPED_EXISTING_KEY` and a bake never does.
+
+    The stamp is computed over the layer's provenance with that marker in it, through the
+    same :func:`stamp_provenance`, so ``checkpoint_id`` is
+    ``sha256("<baked_at>\\x00<digest>")`` exactly as a bake's is — and ``digest`` is the
+    digest of what the file now holds.
+
+    Refuses a layer whose boot-verify (:func:`compare_layer`) disagrees with its recorded
+    installs, and keeps going: one layer that changed is that layer's problem, and the
+    others still deserve an identity. A refused layer is left byte-for-byte as it was, so
+    ``prepare`` keeps warning about it and its cache stays off.
+
+    ``interpreters`` maps a project to the interpreter its suite runs
+    (``test_cmd[0]``). When given, a layer whose project's interpreter is not
+    :data:`LAYER_INTERPRETER` — or whose project is absent from the map — is refused
+    rather than verified through an interpreter the suite may never use. ``None`` skips
+    the guard, which is how the tests exercise the boot-verify in isolation.
+    """
+    outcomes: list[StampOutcome] = []
+    for path in layer_deps_files(deps_dir):
+        checkpoint = path.stem
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            outcomes.append(
+                StampOutcome(
+                    checkpoint, "", "not a layer's provenance", "—", "", "",
+                    f"unreadable: {exc}",
+                )
+            )
+            continue
+        if not isinstance(data, dict) or "installs" not in data:
+            outcomes.append(
+                StampOutcome(
+                    checkpoint, "", "not a layer's provenance", "—", "", "",
+                    "no installs key: this is not dependency provenance",
+                )
+            )
+            continue
+        project = str(data.get("project") or "")
+        existing = data.get(CHECKPOINT_ID_KEY)
+        if isinstance(existing, str) and existing:
+            outcomes.append(
+                StampOutcome(
+                    checkpoint, project, "already",
+                    "stamped" if was_stamped_existing(data) else "baked",
+                    existing, provenance_digest(data),
+                    "identity already recorded; left untouched",
+                )
+            )
+            continue
+        if not layer_exists(checkpoint):
+            outcomes.append(
+                StampOutcome(
+                    checkpoint, project, "missing", "—", "", "",
+                    f"no checkpoint named {checkpoint}",
+                )
+            )
+            continue
+        if interpreters is not None:
+            expected = interpreters.get(project)
+            if expected != LAYER_INTERPRETER:
+                recorded = f"``{expected}``" if expected else "nothing"
+                outcomes.append(
+                    StampOutcome(
+                        checkpoint, project, "refused", "—", "", "",
+                        "cannot verify through the interpreter the suite runs: the split "
+                        f"records {recorded} for {project or '(no project)'}, and this "
+                        f"step queries only ``{LAYER_INTERPRETER}`` rather than guessing",
+                    )
+                )
+                continue
+        result = boot_layer_probe(checkpoint, disk_mb=disk_mb)
+        verify = compare_layer(result, installs=tuple(data.get("installs") or ()))
+        if not verify.ok:
+            outcomes.append(
+                StampOutcome(
+                    checkpoint, project, "refused", "—", "", "", verify.detail,
+                    verify.interpreter, verify.version,
+                )
+            )
+            continue
+        stamped = dict(data)
+        stamped[STAMPED_EXISTING_KEY] = True
+        stamped = stamp_provenance(stamped, previous=None)
+        path.write_text(
+            json.dumps(stamped, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        outcomes.append(
+            StampOutcome(
+                checkpoint, project, "stamped", "stamped",
+                stamped[CHECKPOINT_ID_KEY], provenance_digest(stamped), verify.detail,
+                verify.interpreter, verify.version,
+            )
+        )
+    return outcomes
 
 
 def layer_pin(deps: Mapping[str, Any], name: str) -> Optional[str]:
@@ -11157,6 +13806,18 @@ def summarise(
     have been attempted and to have returned, ``not started`` is its own label, and a
     delete-only action says ``deleted`` instead of hiding behind ``skipped``.
 
+    [VANTA-WHY] The second half of that fix is the wording *after* the colon. It used
+    to be :meth:`LayerAction.describe`, which is the **plan's** sentence: a finished
+    build read ``[done] … — not baked yet`` and a rebuild read ``… — --force: replaced
+    (an existing layer is deleted first)``, each of them a statement about a plan the
+    line's own ``[done]`` had already contradicted. So the summary says the outcome
+    instead of repeating the plan's reason — ``built``/``rebuilt``, ``already baked``,
+    ``deleted``, ``not started``, ``build failed`` — and the plan's own wording stays
+    where it belongs, in the ``bake plan`` block :func:`plan_layers`' callers print.
+    The delete-only action is the one the state word does not explain on its own, and
+    its *why* (a stale child of a rebuilt base) is the one thing the summary no longer
+    repeats; it is in the plan block, and in the action's own ``reason`` field.
+
     ``attempted`` is *which* build actions were reached, in order. ``None`` means
     "not recorded — treat every planned build as attempted", which is what a caller
     summarising a plan rather than a run is asking for.
@@ -11166,14 +13827,16 @@ def summarise(
     lines = ["bake summary:"]
     for action in actions:
         if action.name in failed_set:
-            state = "FAILED"
-        elif action.build:
-            state = "done" if reached is None or action.name in reached else "not started"
-        elif action.delete:
-            state = "deleted"
+            state, outcome = "FAILED", "build failed"
+        elif not action.build:
+            state, outcome = (
+                ("deleted", "deleted") if action.delete else ("skipped", "already baked")
+            )
+        elif reached is None or action.name in reached:
+            state, outcome = "done", "rebuilt" if action.delete else "built"
         else:
-            state = "skipped"
-        lines.append(f"  [{state}] {action.describe()}")
+            state, outcome = "not started", "not started"
+        lines.append(f"  [{state}] {action.name}: {outcome}")
     if failed:
         lines.append(_failed_footer(failed, survived))
     return "\n".join(lines)
@@ -11277,28 +13940,38 @@ def last_error_line(output: str) -> str:
     return "(no output)"
 
 
+def bake_logs_dir(root: Path, *, when: Optional[datetime] = None) -> Path:
+    """This bake's own log folder: ``<root>/bake-logs/<UTC stamp>`` (§8.6's log rule).
+
+    [VANTA-WHY] A folder per run rather than one shared folder emptied each time: the
+    run that just failed is the one whose log is worth reading, and a later bake must
+    not be able to delete it. The stamp is UTC seconds (``20261106T041530Z``) — sortable
+    and filesystem-safe, no ``:`` — so the folder a bake wrote to is also its position in
+    the sequence. ``when`` is the run's start; two runs started in the same second share
+    a folder, so the stamp names the run's start and is not the folder's identity.
+    """
+    moment = when if when is not None else datetime.now(timezone.utc)
+    return root / "bake-logs" / moment.strftime("%Y%m%dT%H%M%SZ")
+
+
 def bake_log_path(logs_dir: Path, name: str) -> Path:
     """Where one layer's full build log goes: ``<logs_dir>/<layer>.log``."""
     return logs_dir / f"{name}.log"
 
 
-def clear_bake_logs(logs_dir: Path) -> int:
-    """Empty the bake-logs directory, returning how many files it held.
+def retry_log_path(logs_dir: Path, name: str) -> Path:
+    """Where a **failed** retry's own output goes: ``<logs_dir>/<layer>.retry.log``.
 
-    [VANTA-WHY] Emptied rather than accumulated: the summary prints this directory as
-    *this* bake's logs, and a layer that is not in this run's plan must not be able to
-    leave a file there that reads as though this run wrote it. The directory is the
-    harness's own scratch output (``runs/bugsinpy/bake-logs``) and never a source of
-    truth — the layer's checkpoint and its deps JSON are — so nothing is lost by
-    replacing it per bake.
+    [VANTA-WHY] A layer whose first pass failed and whose one retry also failed used to
+    write the first pass's log and nothing else: the retry's own output — the second
+    install pass, with the pins it dropped or hoisted — was discarded, so the failure
+    report cited the first pass's error and the retry's was unrecoverable (measured on
+    ``pandas/7``, ``luigi/30``, ``luigi/19``). Kept **beside** the first pass's file
+    rather than over it, because both are the layer's evidence and they are different
+    attempts (§8.6 R2(ii), R1). Named through :func:`bake_log_path` so there is one
+    naming rule and one writer for both files.
     """
-    if not logs_dir.is_dir():
-        return 0
-    removed = 0
-    for path in logs_dir.glob("*.log"):
-        path.unlink()
-        removed += 1
-    return removed
+    return bake_log_path(logs_dir, f"{name}.retry")
 
 
 def write_bake_log(logs_dir: Path, name: str, result: ExecResult) -> Path:
@@ -11374,6 +14047,8 @@ def run_bake_actions(
     provided: Optional[Mapping[str, Container[str]]] = None,
     dropped: Optional[Mapping[str, Container[str]]] = None,
     tree_provided: Optional[Mapping[str, Container[str]]] = None,
+    retry: Optional[Callable[[str, ExecResult], Optional[RetryPlan]]] = None,
+    record_drops: Optional[Callable[[str, RetryPlan], None]] = None,
 ) -> str:
     """Delete, then build every layer the plan asks for, and report what happened.
 
@@ -11407,13 +14082,15 @@ def run_bake_actions(
     run, and what is being reported is this run.
 
     ``logs_dir`` is where each attempted layer's **whole** output is kept while the run
-    happens (:func:`write_bake_log`), emptied first (:func:`clear_bake_logs`) and
-    reported line by line through ``log``. It is what makes the one-line error in the
-    failure report enough: the line says what happened, the file holds the two hundred
-    lines above it. ``None`` writes nothing, which is what a structural test wants. A
-    layer the gate refused keeps that same file, with the verdict appended to the
-    output the install produced (:func:`_with_gate_verdict`) — the log of a refused
-    layer is the only place its ``pip check`` reading and its install are recorded.
+    happens (:func:`write_bake_log`) and reported line by line through ``log``. Nothing
+    in it is deleted: :func:`cmd_bake` hands each run its own folder
+    (:func:`bake_logs_dir`), so a log left by an earlier bake — or by a layer this run
+    does not build — stays readable. It is what makes the one-line error in the failure
+    report enough: the line says what happened, the file holds the two hundred lines
+    above it. ``None`` writes nothing, which is what a structural test wants. A layer the
+    gate refused keeps that same file, with the verdict appended to the output the
+    install produced (:func:`_with_gate_verdict`) — the log of a refused layer is the
+    only place its ``pip check`` reading and its install are recorded.
 
     ``own_pins`` and ``record`` are §3.2's own-pin gate. ``own_pins`` maps a layer's name
     to the canonical names it installs as **BugsInPy's own** pins
@@ -11470,15 +14147,41 @@ def run_bake_actions(
     still case (a) and still fails the layer. The freeze gate needs no such parameter — a
     name from either rule is in neither the pin list nor the provision, so a release of it
     that pip did resolve is failed there already.
+
+    ``retry`` and ``record_drops`` are §8.6 R2(ii), and they are the only thing in this
+    function that runs *after* a failure rather than instead of one. ``retry`` is asked
+    once about a per-bug layer whose build failed, with that layer's own merged output; it
+    answers ``None`` for every failure the rule does not cover — the interpreter layers
+    are not asked at all — and a :class:`RetryPlan` for the one case it does. The plan's
+    ``script`` is built with the failed pins removed and **nothing else changed**, so the
+    first pass is byte-identical to what it was before the rule existed and a layer that
+    builds the first time never reaches any of this. Only when the plan's own second build
+    *succeeds* does the run carry on: a layer whose retry also fails takes the same failure
+    path it would have taken without the rule, so it fails **closed** and is classified as
+    before — but its **retry's own output is written beside the first pass's log**
+    (:func:`retry_log_path`) and the failure report cites the retry's error, not the first
+    pass's. Both files are the layer's evidence and the two attempts differ; keeping only
+    the first pass's log made the retry's failure unrecoverable.
+
+    The dropped names join this layer's :data:`CASE_DROPPED_DEPENDENCY` and
+    :data:`CASE_TREE_PROVIDED` set before the gates run, because the layer that will now
+    be judged is the one *without* them: the own-pin gate has to tolerate the ``pip check``
+    reading they cause, and the freeze gate has to fail on a release of one that pip
+    resolved anyway exactly as it would for a preflight drop. ``record_drops`` is handed
+    the plan it may write into the layer's provenance (:func:`record_retry`), and each
+    drop is logged line by line, which is the run's own record of what the retry did.
     """
     own = own_pins or {}
     pin_lists = pins or {}
     supplied = provided or {}
-    dropped_names = dropped or {}
+    dropped_names = dict(dropped or {})
     tree_names = tree_provided or {}
     logs: dict[str, Path] = {}
+    retry_results: dict[str, ExecResult] = {}
+    retry_logs: dict[str, Path] = {}
+    retry_integrity: dict[str, TransientDownload] = {}
+    refusals: dict[str, RetryPlan] = {}
     if logs_dir is not None:
-        clear_bake_logs(logs_dir)
         log(f"[logs] this bake's build logs: {logs_dir}")
 
     for action in delete_order(actions, children):
@@ -11493,6 +14196,75 @@ def run_bake_actions(
         log(f"[{action.name}] building from {action.base} — {action.reason}")
         attempted.append(action.name)
         built = build(action.name, action.script, action.base)
+        if not built.ok and action.base != DEFAULT_BASE and retry is not None:
+            # §8.6 R2(ii): the one second attempt, and only for a per-bug layer whose
+            # first build failed. ``retry`` is authoritative about whether this failure
+            # is the rule's case at all — a log that names no unbuildable pin (R1's
+            # ``egg_info`` crash), a pin the safeguard protects and a pin the graded
+            # tests reach all answer ``None`` and leave the ordinary failure path below
+            # untouched.
+            plan = retry(action.name, built)
+            if plan is not None:
+                for line in plan.describe():
+                    log(f"[{action.name}] retry: {line}")
+                if plan.refused is not None:
+                    # D2: a dependent the closure cannot move is **not** a retry. No
+                    # second attempt is rendered — ``script`` is empty and is never run
+                    # — the layer keeps its first-pass classification on the ordinary
+                    # failure path below, and the refusal, each dependent and its
+                    # reason, is what the layer's provenance and the run's report carry
+                    # instead. The line above already named it through ``describe``.
+                    refusals[action.name] = plan
+                    if record_drops is not None:
+                        record_drops(action.name, plan)
+                else:
+                    retried = build(action.name, plan.script, action.base)
+                    if retried.ok:
+                        dropped_names[action.name] = (
+                            *dropped_names.get(action.name, ()),
+                            *(drop.name for drop in plan.drops),
+                        )
+                        if record_drops is not None:
+                            record_drops(action.name, plan)
+                        built = retried
+                    else:
+                        # Fail closed: the layer is classified exactly as a first-pass
+                        # failure is. The retry's own output is the diagnosis — it is the
+                        # attempt that decided this layer's fate, and the first pass's log
+                        # usually ends in the failure the retry was answering — so it is
+                        # written *beside* the first pass's file and reported in place of
+                        # it, while the first pass's file is kept and named too
+                        # (:func:`retry_log_path`, :func:`_failure_report`).
+                        retry_results[action.name] = retried
+                        log(
+                            f"[{action.name}] retry failed — the layer fails closed and is "
+                            "classified exactly as a first-pass failure is"
+                        )
+                        # §8.6 R4: if the *retry* also received a body that did not match
+                        # its advertised hash, this is no longer a transient download —
+                        # the bytes disagreed with the index twice, and the second reading
+                        # is an integrity problem rather than another interrupted
+                        # transfer. Named here rather than left to the reader to notice,
+                        # because it is the one failure of these rules that asks a
+                        # *person* to look at the index.
+                        again = transient_download_failure(
+                            retried.stdout + retried.stderr
+                        )
+                        if again is not None:
+                            retry_integrity[action.name] = again
+                            log(
+                                f"[{action.name}] the retry also failed its hash check on "
+                                f"{again.spec} — recorded as a possible integrity problem, "
+                                "not a transient download (§8.6 R4)"
+                            )
+                        if logs_dir is not None:
+                            retry_logs[action.name] = write_bake_log(
+                                logs_dir, f"{action.name}.retry", retried
+                            )
+                            log(
+                                f"[{action.name}] retry build log: "
+                                f"{retry_logs[action.name]}"
+                            )
         result = built
         verdict: Optional[ExecResult] = None
         if built.ok:
@@ -11570,7 +14342,13 @@ def run_bake_actions(
         actions, failed=failed, attempted=attempted, survived=survived
     )
     if failed:
-        raise BakeError(_failure_report(failed, results, summary, logs))
+        raise BakeError(
+            _failure_report(
+                failed, results, summary, logs,
+                retries=retry_results, retry_logs=retry_logs,
+                integrity=retry_integrity, refusals=refusals,
+            )
+        )
     return summary
 
 
@@ -11579,6 +14357,10 @@ def _failure_report(
     results: Mapping[str, ExecResult],
     summary: str,
     logs: Optional[Mapping[str, Path]] = None,
+    retries: Optional[Mapping[str, ExecResult]] = None,
+    retry_logs: Optional[Mapping[str, Path]] = None,
+    integrity: Optional[Mapping[str, TransientDownload]] = None,
+    refusals: Optional[Mapping[str, RetryPlan]] = None,
 ) -> str:
     """Every failed layer's own error line, where its log is, then the summary.
 
@@ -11589,10 +14371,34 @@ def _failure_report(
     tail ended in was shuru's ``checkpoint … saved``. Each layer's whole log is on disk
     (:func:`write_bake_log`) and pointed at here, which is what makes the one-line form
     enough.
+
+    [VANTA-WHY] For a layer whose **retry** also failed, the cited line is the *retry's*
+    own error and not the first pass's (:func:`run_bake_actions`), and *both* files are
+    named — the first pass's ``.log`` and the retry's ``.retry.log``. The first pass's
+    error is the one the retry was answering (its wheels that would not build, its
+    ``egg_info`` crash), so citing it says nothing about why the retry failed; a reader
+    who saw only it would read the same diagnosis twice for two different attempts, which
+    is exactly what ``pandas/7`` and ``luigi/30`` looked like. ``retries`` and
+    ``retry_logs`` are the run's record of which layers were retried and where each
+    attempt's output went; a layer absent from them behaves exactly as before.
+
+    ``integrity`` is §8.6 R4's second half: a layer whose retry received a body that
+    disagreed with its index's hash *again*. That is not another transient download — the
+    same bytes failed the same check twice — so it is named as a possible integrity
+    problem, which is a statement a person has to act on and the one outcome of these
+    rules that is not resolved by the harness.
+
+    ``refusals`` is §8.6 R2(ii)'s other outcome: a layer whose ``--no-deps`` set the rule
+    *could not* close, so no second attempt was rendered at all (:class:`RetryPlan`'s
+    ``refused``, D2). The layer is reported with its ordinary first-pass error like any
+    other failure, and the refusal is named under it — each dependent and the reason it
+    could not be moved — because that is the fact that tells this layer apart from one no
+    rule reached. A layer absent from it behaves exactly as before.
     """
     lines = [f"{len(failed)} layer(s) failed to bake:"]
     for name in failed:
-        result = results[name]
+        retried = (retries or {}).get(name)
+        result = retried if retried is not None else results[name]
         state = (
             "timed out" if result.timed_out else f"exit {result.exit_code}"
         )
@@ -11601,7 +14407,25 @@ def _failure_report(
         )
         path = (logs or {}).get(name)
         if path is not None:
-            lines.append(f"    full build log: {path}")
+            label = "first-pass build log" if retried is not None else "full build log"
+            lines.append(f"    {label}: {path}")
+        retry_path = (retry_logs or {}).get(name)
+        if retry_path is not None:
+            lines.append(f"    retry build log: {retry_path}")
+        again = (integrity or {}).get(name)
+        if again is not None:
+            lines.append(
+                f"    the retry also failed its hash check on {again.spec} "
+                f"({again.evidence}) — a possible integrity problem, not a transient "
+                "download (§8.6 R4)"
+            )
+        refusal = (refusals or {}).get(name)
+        if refusal is not None:
+            for spec, why in refusal.refused or ():
+                lines.append(
+                    f"    refused a retry — {spec} cannot be moved out of the "
+                    f"resolving pass: {why} (§8.6 R2(ii))"
+                )
     lines.append("")
     lines.append(summary)
     return "\n".join(lines)

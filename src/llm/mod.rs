@@ -286,6 +286,19 @@ pub struct CallUsage {
     /// reader looks up what priced it and `cost_basis` is read from the same
     /// place.
     pub service_tier: String,
+    /// The model the SERVER reported for THIS call (the response's top-level
+    /// `model`), `None` when it published none.
+    ///
+    /// [VANTA-WHY] M3 item B — recorded per call, not per run, because a run's
+    /// calls can be served by different snapshots (a provider rolling an alias
+    /// mid-run, or a fallback): a run-level value would have to be the union, and
+    /// a union cannot answer "did THIS call reach the pinned snapshot?".
+    /// `run.summary` collapses the rows to one `model_version` when they agree,
+    /// so the per-call fact is never lost and the run-level one is derivable.
+    /// `None`, never the requested id: "the server named no model" and "the server
+    /// named a different one" are different findings, and only the first is
+    /// silent.
+    pub served_model: Option<String>,
 }
 
 static CALL_USAGES: Mutex<Vec<CallUsage>> = Mutex::new(Vec::new());
@@ -1446,6 +1459,19 @@ struct StreamedCompletion {
     /// prompt tokens it processed and `predicted_n` the number it generated.
     timings_prompt_tokens: Option<u64>,
     timings_completion_tokens: Option<u64>,
+    /// The model the SERVER says it served this call with — the top-level `model`
+    /// field of the response, verbatim, `None` when it published none.
+    ///
+    /// [VANTA-WHY] M3 item B — this is the one fact that pins WHICH weights
+    /// answered, and a run that records only the requested model id cannot tell a
+    /// pinned snapshot from a silently-updated alias. The gate for real use
+    /// requires the served model version to be a measured, per-run fact rather
+    /// than an env-var guess: `VANTA_MODEL_VERSION` is set by nobody, so every
+    /// pre-B run's `model_version` read `unknown`. Read from the response rather
+    /// than from config because the config states the REQUEST, and a hosted
+    /// provider is free to resolve an alias to a dated snapshot the request never
+    /// named.
+    published_model: Option<String>,
     /// The server's own `finish_reason`, when it published one. Only `length`
     /// changes what Vanta does with the reply: it means the answer was CUT OFF at
     /// `max_tokens`, which is a different fact from "the answer was malformed"
@@ -1488,6 +1514,16 @@ fn consume_sse_event(event: &str, out: &mut StreamedCompletion) -> Result<bool, 
                 .map(str::to_string)
                 .unwrap_or_else(|| error.to_string());
             return Err(format!("LLM server reported an error mid-stream: {message}"));
+        }
+        // [VANTA-WHY] M3 item B — the response's own top-level `model`, read on
+        // every frame that carries it (OpenAI puts it on each chunk; llama-server
+        // sends it on the first). Kept verbatim, last-seen wins: it is the
+        // server's statement, and a frame that stops repeating it must not erase
+        // what an earlier frame said. Absent stays absent, so a server that
+        // publishes none is recorded as publishing none, never as the requested
+        // id.
+        if let Some(model) = value["model"].as_str() {
+            out.published_model = Some(model.to_string());
         }
         if let Some(choice) = value["choices"].as_array().and_then(|c| c.first()) {
             let delta = &choice["delta"];
@@ -2116,6 +2152,12 @@ async fn post_chat_meta(
         // backend it is exactly `cfg.service_tier`, i.e. the value that put the
         // `service_tier` key into the body this call sent.
         service_tier: cfg.service_tier_text().to_string(),
+        // [VANTA-WHY] M3 item B — what the SERVER said it served, verbatim, from
+        // the response frames this call read. `None` when it named none; never
+        // substituted with the requested id, which would record a fact the
+        // server did not state and hide exactly the alias-to-snapshot drift this
+        // field exists to catch.
+        served_model: streamed.published_model.clone(),
     };
     debug!(
         site,
@@ -2145,6 +2187,11 @@ async fn post_chat_meta(
         // a `flex` run that came out priced at `.../standard/...` is a mistake
         // worth seeing in the live log, not one to discover in a manifest.
         service_tier = %usage.service_tier,
+        // [VANTA-WHY] M3 item B — the served model, logged beside the tier and
+        // cost basis it was served under: a run pointed at one snapshot and
+        // served by another should say so while it happens, not only in a
+        // session log read afterwards.
+        served_model = ?usage.served_model,
         // [VANTA-WHY] §14.26 — logged as well as recorded, so a hosted run that
         // is silently missing a field says so while it happens rather than only
         // in the session log afterwards.
@@ -3145,6 +3192,45 @@ mod _streaming_tests {
         assert_eq!(out.content, "hi");
         assert_eq!(out.prompt_tokens, Some(11));
         assert_eq!(out.total_tokens, Some(22));
+    }
+
+    /// [VANTA-WHY] M3 item B — the served model is the response's own top-level
+    /// `model`, read verbatim, last-seen wins, and absent stays absent. A test
+    /// that only proved "a model is read when present" would let a later frame
+    /// that repeats nothing erase it, and would record the requested id for a
+    /// server that named none.
+    #[test]
+    fn the_served_model_is_read_from_the_response_verbatim_and_never_invented() {
+        // A stream that names the model on the first frame and on every frame
+        // after it, as OpenAI does.
+        let mut out = StreamedCompletion::default();
+        consume_sse_event(
+            "data: {\"model\":\"gpt-5-pro-2025-10-06\",\"choices\":[{\"delta\":{\"content\":\"a\"}}]}",
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            out.published_model.as_deref(),
+            Some("gpt-5-pro-2025-10-06"),
+            "the server's own model id must be recorded verbatim"
+        );
+        // A frame that carries no `model` must not erase what the first said.
+        consume_sse_event("data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}", &mut out).unwrap();
+        assert_eq!(out.published_model.as_deref(), Some("gpt-5-pro-2025-10-06"));
+        // A later frame that names a DIFFERENT model is the last word, because it
+        // is the server's most recent statement about this call.
+        consume_sse_event("data: {\"model\":\"gpt-5-pro-2025-11-01\",\"choices\":[]}", &mut out)
+            .unwrap();
+        assert_eq!(out.published_model.as_deref(), Some("gpt-5-pro-2025-11-01"));
+
+        // A server that publishes no model at all: absent, never the request's id.
+        let mut silent = StreamedCompletion::default();
+        consume_sse_event("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}", &mut silent)
+            .unwrap();
+        assert_eq!(
+            silent.published_model, None,
+            "a server that names no model must record none, not a guessed id"
+        );
     }
 }
 

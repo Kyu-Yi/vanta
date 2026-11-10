@@ -292,7 +292,8 @@ VM_SIZING_PREFIX = "vanta bake VM:"
 """What :func:`vm_sizing_guard` prints, which is what makes the sizing a *record*.
 
 The boot prelude's output is the layer's own captured output, so the line reaches
-``runs/bugsinpy/bake-logs/<layer>.log`` without any recipe having to know the VM's size.
+``runs/bugsinpy/bake-logs/<stamp>/<layer>.log`` without any recipe having to know the
+VM's size.
 """
 
 
@@ -527,7 +528,20 @@ def run(
         args += ["--memory", str(memory_mb)]
     args += [
         "--mount",
-        f"{host_root}:/workspace:rw",
+        # [VANTA-WHY] M3 item P2 — the mount's mode and ``--allow-host-writes`` are
+        # one fact, and shuru enforces it: ``--mount`` *defaults* to ``:ro`` and a
+        # ``:rw`` mount is refused unless the flag is present ("Error: read-write
+        # mount '...:/workspace:rw' requires --allow-host-writes flag"). This line
+        # used to spell ``:rw`` unconditionally while the flag was added only when
+        # writes were allowed, so the one caller that mounts read-only — the version
+        # probe (B7), whose whole point is that the guest cannot touch the tree —
+        # produced an argv shuru rejected *before booting anything*: exit code 1,
+        # empty stdout, no VM. The probe could not tell that from a project that
+        # would not import, so it reported "could not be measured" and left the
+        # version unfrozen, which on pandas/1 collapsed ``__version__`` to
+        # ``0+unknown`` and aborted collection. The mode is derived from the same
+        # boolean as the flag so the two cannot drift apart again.
+        f"{host_root}:/workspace:{'rw' if allow_host_writes else 'ro'}",
     ]
     if allow_host_writes:
         args += ["--allow-host-writes"]

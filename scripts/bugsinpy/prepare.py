@@ -20,12 +20,18 @@ Every suite run happens inside Shuru — ``prepare`` is not exempt from C3.
 from __future__ import annotations
 
 import json
+import os
+import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 from . import bake as bake_mod
+from . import budget as budget_mod
+from . import compact as compact_mod
 from . import context as ctx
 from . import issue as issue_mod
 from . import issue_source
@@ -61,9 +67,7 @@ UNDECLARED_F2P_REASON = (
     "named by run_test.sh — so BugsInPy never meant to run it and it is not part of the "
     "oracle. It is removed from FAIL_TO_PASS and from the PASS_TO_PASS suite, and it is "
     "hidden from vanta_tree so that the Creator cannot chase a test the benchmark does "
-    "not ask for. Measured cause on PySnooper/2: the fix adds the test file for a new "
-    "helper, so the test flips because the helper does not exist on the buggy source "
-    "rather than because of the bug."
+    "not ask for."
 )
 """[VANTA-WHY] A flipping test is not automatically an oracle. PySnooper/2's fix adds
 ``tests/test_utils/test_ensure_tuple.py`` for a helper the fix also adds, so the test
@@ -81,10 +85,7 @@ DEV_FIX_SELFCHECK_REASON = (
     "perfect patch would at best tie the developer fix, and every verdict, ECR and EIR on "
     "this bug would be measuring the oracle rather than Vanta. Refusing the bug here is the "
     "point — an oracle nothing can pass produces a plausible wrong label instead of an "
-    "error, which is the failure mode this gate exists for. Measured cause on PySnooper/2: "
-    "bug_patch.txt touches only pysnooper/tracer.py while the fix commit also adds "
-    "pycompat.PY2 and utils.get_shortish_repr(..., custom_repr=), so the patched tree cannot "
-    "import pysnooper and all three FAIL_TO_PASS nodeids read 'absent'."
+    "error, which is the failure mode this gate exists for."
 )
 """[VANTA-WHY] The developer fix is the harness's own ground truth for "a patch that
 fixes the bug", so it is the one candidate whose grading cannot be attributed to a model.
@@ -123,6 +124,20 @@ traversal, or a symlink the checkout planted. That refusal used to escape
 ``strip_and_baseline`` as an uncaught ``VersionPinError`` and kill prepare with no gate
 failure recorded; it is one more refusal of this step, recorded under this name like
 every other one."""
+
+
+VERSION_PIN_UNMEASURED_REASON = "version_pin_unmeasured"
+"""[VANTA-WHY] M3 item P3. The project's version machinery was reached and could not
+produce a version to freeze (``PinOutcome.measurement_failed``). Preparing on regardless
+was the pandas/1 failure: the bug was measured, run, and killed two stages later as
+``native_vacuous`` — because the tree the session seeded from reported the ``0+unknown``
+placeholder, which makes xarray's ``LooseVersion`` comparison raise and aborts collection
+on both sides — while the gate that would have named the cause had already been read as
+"pin recorded, nothing to see". The refusal belongs here, where the measurement failed and
+where the reason is in front of the reader, and not at the end of a suite run. It is
+recorded like the escape above it; the one outcome with a ``reason`` that is *not* a failed
+measurement — setuptools_scm configured without a ``write_to``, so the project keeps no
+version file at all — keeps preparing exactly as before."""
 
 
 NO_ISSUE_SOURCE_REASON = "issue_source=none"
@@ -369,6 +384,22 @@ class BugPrep:
     re-derived because re-deriving needs two suite runs inside a VM — grading must
     not have to re-measure what prepare already measured.
     """
+    collect_excluded: dict[str, str] = field(default_factory=dict)
+    """§3.4 — test files the collect gate sets aside because they are not the bug's tests.
+
+    Keys are the files, values are the reason: the file's own buggy-tree collection
+    error, and the declared test files whose import closure does not reach it.
+
+    [VANTA-WHY] The gate collects the *whole* suite, but grading only ever runs the
+    tests the bug declares. A side module the bug's own tests never import — luigi's
+    ``test/_mysqldb_test.py``, which needs the mysql driver the bug's layer does not
+    carry — errored during collection, so the gate refused a bug whose own tests
+    collect perfectly. That is a property of the suite's *edges*, not of the bug, so
+    the file is set aside with the reason recorded rather than the bug replaced (§8
+    rule 6: a harness limitation is never grounds to replace a bug). A file inside
+    the failing tests' closure, or a ``conftest.py``, is never set aside: an error
+    there is a real environment gap and keeps the refusal.
+    """
     gate_failures: list[str] = field(default_factory=list)
     context: Optional[ctx.ContextVerdict] = None
     issue: Optional[issue_mod.IssueText] = None
@@ -438,6 +469,20 @@ class BugPrep:
     (``not built: setup.py declares no ext_modules…``), so a tree with no entry would
     mean the stage was skipped rather than that the tree needed nothing.
     """
+    tree_hashes: dict[str, str] = field(default_factory=dict)
+    """M3 item V8 — the fingerprint of each tree the host ADOPTED from a VM.
+
+    [VANTA-WHY] The in-place build and the patch apply run in a VM of their own and
+    the host adopts the tree that VM produced (``suite.VmRoot.adopt``), so the bytes
+    every later step reads are the bytes that VM wrote — validated (no symlink out of
+    the tree, no device, no setuid bit, within a size limit) and swapped in
+    atomically. The adopted tree's ``suite_cache.tree_fingerprint`` is recorded here,
+    per tree, so a reader can line a later cache key up with the exact bytes that
+    produced it. Empty for a bug whose trees were never mutated by a VM.
+
+    A tree that fails validation is a prepare gate failure with the reason on
+    ``gate_failures`` — never a silent fallback to the tree the VM did not touch.
+    """
     version_pin: dict[str, Any] = field(default_factory=dict)
     """§1.2 — the project version frozen into the sandbox tree, and how.
 
@@ -474,6 +519,22 @@ class BugPrep:
     ``prepare.json`` written before this key existed is refused by ``from_dict``
     like any other missing field, whose error says to re-run the stage.
     """
+    scheduler: dict[str, Any] = field(default_factory=dict)
+    """M3 items S5/S6 — the host-capacity budget this bug's own suite runs were made
+    under, and how long each of them took.
+
+    [VANTA-WHY] Items S5 and S6 let independent suite runs overlap, which means a run's
+    *result* is now a function of what else was running beside it — so "concurrent yes
+    or no", the jobs the operator asked for, the budget the host actually allowed
+    (cores and memory), the host load at the start and the peak the scheduler reached
+    all have to be on the record, or a flaky nodeid introduced by contention is
+    indistinguishable from one the project has. The value is :meth:`budget.Budget.record`
+    plus ``runs``: one entry per tree this bug ran, ``run1_secs``/``run2_secs`` — the
+    in-VM wall time of each of a pair's two runs (``suite.SuiteRun.secs``), the number
+    the D1 cap is derived from. Empty on a bug prepare refused before any suite ran, and
+    written on every row so a reader can tell a serial measurement from a concurrent one
+    without reading the batch's invocation-level record.
+    """
 
     @property
     def key(self) -> str:
@@ -496,6 +557,25 @@ class BugPrep:
         :func:`check_gate_drift` must keep reading only the declared set.
         """
         return sorted(set(self.fail_to_pass) | set(self.collect_flip_nodeids))
+
+    @property
+    def collect_set_aside(self) -> list[str]:
+        """The files the collect gate set aside — the ONE ignore list every suite run uses.
+
+        [VANTA-WHY] M3 §8.6 round 12, item 1. :func:`_collect_flip_or_raise` proved
+        these files are the suite's *edges* rather than the bug's tests (the
+        collect-flip files, whose buggy-tree import error *is* the oracle, and the
+        outside-closure files :attr:`collect_excluded` records) and re-ran its own
+        collection with ``--ignore`` over them. Every other run of the same trees — the
+        three graded derivations, the stripped ``vanta_tree`` baseline, the oracle's
+        hidden and patched pairs, and Vanta's own in-session suites — would otherwise
+        die on the very collection error the gate had set aside, which is the
+        asymmetry the item removes. One property, so the oracle, the derivations and
+        the record cannot disagree about which files the gate excluded; empty on every
+        bug whose strict gate passed (measured: all 13 runnable rows of the round-11
+        held-out split), so those runs keep the command they always had.
+        """
+        return sorted(set(self.hidden_by_collect_flip) | set(self.collect_excluded))
 
     @property
     def runnable(self) -> bool:
@@ -572,6 +652,7 @@ class BugPrep:
             "partially_hidden_functions": self.partially_hidden_functions,
             "hidden_by_collect_flip": self.hidden_by_collect_flip,
             "collect_flip_nodeids": sorted(self.collect_flip_nodeids),
+            "collect_excluded": self.collect_excluded,
             "gate_failures": self.gate_failures,
             "context": self.context.to_dict() if self.context else None,
             "issue": self.issue.to_dict() if self.issue else None,
@@ -581,7 +662,9 @@ class BugPrep:
             "issue_text_names_symbols": sorted(self.issue_text_names_symbols),
             "deps": self.deps,
             "builds": self.builds,
+            "tree_hashes": self.tree_hashes,
             "version_pin": self.version_pin,
+            "scheduler": self.scheduler,
         }
 
     @classmethod
@@ -658,6 +741,9 @@ class BugPrep:
             collect_flip_nodeids=strings_of(
                 payload, "collect_flip_nodeids", owner=owner, where=where
             ),
+            collect_excluded=map_of(
+                payload, "collect_excluded", owner=owner, where=where
+            ),
             gate_failures=strings_of(payload, "gate_failures", owner=owner, where=where),
             context=None
             if context_payload is None
@@ -677,7 +763,9 @@ class BugPrep:
             ),
             deps=field_of(payload, "deps", owner=owner, where=where),
             builds=map_of(payload, "builds", owner=owner, where=where),
+            tree_hashes=map_of(payload, "tree_hashes", owner=owner, where=where),
             version_pin=record_of(payload, "version_pin", owner=owner, where=where),
+            scheduler=record_of(payload, "scheduler", owner=owner, where=where),
         )
 
 
@@ -764,6 +852,7 @@ def check_deps(
     checkpoint: str,
     batch_dir: Path,
     deps: dict[str, Any],
+    budget: Optional[budget_mod.Budget] = None,
 ) -> set[str]:
     """Prove the bug's layer can run its suite *before* the derivation spends it.
 
@@ -781,8 +870,11 @@ def check_deps(
 
     (a) the oracle tree's tests collect, with no collection error — except that a
         collection error which is a recorded *collect-flip* is set aside and the
-        gate is re-run with ``--ignore`` over it (:func:`detect_collect_flip`), so
-        the pass is still a clean exit and not a filtered error list;
+        gate is re-run with ``--ignore`` over it (:func:`detect_collect_flip`), and
+        an error in a test file *outside* the failing tests' import closure — a side
+        module the bug's own tests never import (:func:`_failing_tests_closure`) —
+        is set aside the same way — so the pass is still a clean exit and not a
+        filtered error list;
     (b) the project's own package imports **from the tree under test**, not from
         site-packages, where a ``setup.py install`` would have left a frozen copy
         that makes every patch grade the same.
@@ -795,6 +887,7 @@ def check_deps(
     tree_rel = _rel(prep, "oracle_tree")
     env = prep.sandbox_env or None
 
+    progress(prep.key, "deps gate: collect oracle_tree")
     try:
         nodeids = suite_mod.collect_only(
             checkpoint=checkpoint,
@@ -805,12 +898,14 @@ def check_deps(
             extra_env=env,
             memory_mb=prep.vm_memory_mb,
             precompile=prep.precompile,
+            budget=budget,
         )
     except suite_mod.SuiteError as exc:
         nodeids = _collect_flip_or_raise(
-            prep, exc, checkpoint=checkpoint, batch_dir=batch_dir, env=env
+            prep, exc, checkpoint=checkpoint, batch_dir=batch_dir, env=env, budget=budget
         )
 
+    progress(prep.key, f"deps gate: import probe {module}")
     try:
         where = suite_mod.import_probe(
             checkpoint=checkpoint,
@@ -822,6 +917,7 @@ def check_deps(
             extra_env=env,
             memory_mb=prep.vm_memory_mb,
             precompile=prep.precompile,
+            budget=budget,
         )
     except suite_mod.SuiteError as exc:
         raise suite_mod.SuiteError(
@@ -844,30 +940,54 @@ def _collect_flip_or_raise(
     checkpoint: str,
     batch_dir: Path,
     env: Optional[dict[str, str]],
+    budget: Optional[budget_mod.Budget] = None,
 ) -> set[str]:
     """The collect gate's second reading: the error is a collect-flip, so re-run.
 
     [VANTA-WHY] Only when the strict gate has *already* refused does this run, and
     its answer is only accepted when it explains the whole refusal: every file that
-    errored on the buggy tree must be a file that collects cleanly on the fixed one,
-    and there must be at least one. Anything else — an error on both trees, an error
-    on a tree the fix does not touch enough to clear, a collection that errors with
-    no file named — keeps the refusal, because those are the shapes of a genuinely
-    broken environment and hiding one would grade a bug against tests it does not
-    have.
+    errored on the buggy tree must be either a file that collects cleanly on the fixed
+    one (a collect-flip, :func:`detect_collect_flip`) — there must be at least one of
+    these or an exclusion below — or a test file *outside* the failing tests' import
+    closure (:func:`_failing_tests_closure`). Anything else — an error on both trees,
+    an error on a tree the fix does not touch enough to clear, an error inside the
+    failing tests' own closure, an error with no file named — keeps the refusal,
+    because those are the shapes of a genuinely broken environment and hiding one
+    would grade a bug against tests it does not have.
 
-    The gate is then re-run for real, with ``--ignore`` over the flipped files, so
-    what passes is a clean collection rather than a filtered error list.
+    [VANTA-WHY] The second admission, and why it is a harness rule (M3-plan §4). The
+    gate collects the *whole* suite, but grading only ever runs the tests the bug
+    declares. Measured on ``luigi/33``: the bug's own tests collect perfectly, and the
+    only failing files are side modules its tests never import — ``test/_esindex_test.py``
+    (elasticsearch), ``test/_mysqldb_test.py`` (mysql), ``s3``/``redshift`` (cryptography)
+    — which need drivers a layer baked for this bug does not carry. The suite-total
+    collection error is a property of the suite's *edges*, not of the bug, so the
+    outside-closure files are set aside with the reason recorded (:attr:`collect_excluded`)
+    and the bug is retried rather than replaced (§8 rule 6). The closure is computed over
+    the same ``oracle_tree`` the gate collects, from the tree's own module-scope imports
+    (the :func:`bake.module_import_graph` / :func:`bake.import_closure` pair the pin audit
+    already uses), so "the tests the bug declares need to collect" is answered by the code
+    rather than by a list. An empty root set excludes nothing: with no declared file in
+    the tree there is no closure to be outside of, and the refusal is kept.
+
+    The gate is then re-run for real, with ``--ignore`` over the flipped and set-aside
+    files, so what passes is a clean collection rather than a filtered error list.
     """
     flips, nodeids, errors = detect_collect_flip(
-        prep, checkpoint=checkpoint, batch_dir=batch_dir, env=env
+        prep, checkpoint=checkpoint, batch_dir=batch_dir, env=env, budget=budget
     )
     unexplained = {file: err for file, err in errors.items() if file not in flips}
-    if not flips or unexplained:
+    excluded = _outside_failing_closure(prep, unexplained) if unexplained else {}
+    unexplained = {
+        file: err for file, err in unexplained.items() if file not in excluded
+    }
+    if not (flips or excluded) or unexplained:
         raise suite_mod.SuiteError(f"deps: collection failed: {refusal}") from refusal
 
     prep.hidden_by_collect_flip = flips
     prep.collect_flip_nodeids = nodeids
+    prep.collect_excluded = excluded
+    progress(prep.key, "deps gate: collect oracle_tree ignoring the flipped files")
     return suite_mod.collect_only(
         checkpoint=checkpoint,
         batch_dir=batch_dir,
@@ -875,10 +995,83 @@ def _collect_flip_or_raise(
         test_cmd=prep.test_cmd,
         disk_mb=DISK_MB,
         extra_env=env,
-        ignore=sorted(flips),
+        # The same list every other run of this bug is given
+        # (:attr:`BugPrep.collect_set_aside`), read back from the fields just written
+        # so the gate and the graded suites cannot disagree about which files are set
+        # aside.
+        ignore=prep.collect_set_aside,
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
+        budget=budget,
     )
+
+
+def _outside_failing_closure(
+    prep: BugPrep, errors: Mapping[str, str]
+) -> dict[str, str]:
+    """The erroring files among ``errors`` the failing tests' closure does not reach.
+
+    Returns ``{file: reason}``, each reason naming the declared test files that are the
+    closure's roots and the file's own buggy-tree error. A ``conftest.py`` is never
+    named: pytest loads it to collect the declared tests too, so an error there is the
+    suite's own harness failing and must keep the refusal however far it sits from any
+    one test file.
+    """
+    candidates = {file: err for file, err in errors.items() if _is_excludable(file)}
+    if not candidates:
+        return {}
+    roots, closure = _failing_tests_closure(prep)
+    if not roots:
+        return {}
+    return {
+        file: (
+            f"outside the import closure of the declared tests "
+            f"({', '.join(roots)}): {err}"
+        )
+        for file, err in candidates.items()
+        if file not in closure
+    }
+
+
+def _is_excludable(file: str) -> bool:
+    """A file the collect gate may set aside: a test file, but never a ``conftest.py``."""
+    return tree_mod.is_test_path(file) and file.rsplit("/", 1)[-1] != "conftest.py"
+
+
+def _failing_tests_closure(prep: BugPrep) -> tuple[list[str], frozenset[str]]:
+    """The declared failing tests' import closure over the tree under test (§3.4).
+
+    Returns ``(roots, closure)``: ``roots`` is the files BugsInPy declares for this bug
+    (:func:`declared_test_files`) that ``oracle_tree`` actually carries, and ``closure``
+    is every tree file their module-scope imports reach — the pin audit's own
+    :func:`bake.module_import_graph` / :func:`bake.import_closure` pair, read over the
+    tree the gate collects.
+
+    [VANTA-WHY] The closure is the answer to "what do the bug's own tests need to
+    collect", which is the only question grading asks, and it is derived from the tree
+    rather than declared so a fix that adds an import is followed. When ``roots`` is
+    empty the closure is empty on purpose: a caller reading it as "set aside whatever is
+    outside" must then set nothing aside, because there is no failing-test closure to be
+    outside of and the conservative direction is the refusal. A tree that cannot be
+    walked is read as having no roots for the same reason — nothing is set aside and the
+    gate's own refusal stands, rather than a ``CompactError`` escaping ``check_deps``'s
+    ``SuiteError`` contract as a crash.
+    """
+    root = prep.root / "oracle_tree"
+    try:
+        files = [rel for rel, _ in compact_mod.tree_files(root)]
+    except compact_mod.CompactError:
+        return [], frozenset()
+
+    def read(rel: str) -> Optional[str]:
+        try:
+            return (root / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+    graph = bake_mod.module_import_graph(files, read_file=read)
+    roots = [rel for rel in declared_test_files(prep.bug) if rel in graph]
+    return roots, bake_mod.import_closure(roots, graph)
 
 
 def detect_collect_flip(
@@ -887,6 +1080,7 @@ def detect_collect_flip(
     checkpoint: str,
     batch_dir: Path,
     env: Optional[dict[str, str]] = None,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> tuple[dict[str, str], list[str], dict[str, str]]:
     """Fixed-commit test files that error on the buggy source and collect on the fixed one.
 
@@ -929,6 +1123,7 @@ def detect_collect_flip(
         extra_env=env,
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
+        budget=budget,
     )
     if not buggy.errors:
         return {}, [], {}
@@ -942,6 +1137,7 @@ def detect_collect_flip(
         extra_env=env,
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
+        budget=budget,
     )
     fixed_by_file = suite_mod.collect_by_file(sorted(fixed.nodeids))
     flips = {
@@ -973,6 +1169,27 @@ VANTA_TREE_INHERITANCE = "copied from oracle_tree (built in place)"
 """What :data:`BUILD_TREES`' record says about the tree the Creator is given."""
 
 
+def write_build_file_atomic(path: Path, content: str) -> None:
+    """Write one build file so a concurrent reader never sees a partial file.
+
+    [VANTA-WHY] The same bytes under the same name, written the long way round:
+    a unique temp file beside the target, then one ``os.replace``. A build file
+    lives in the batch directory, which two concurrent prepares of the same
+    project — the three trees' builds run at once under ``--prepare-jobs``, and a
+    second invocation can overlap them — may both write. A plain
+    ``write_text`` truncates first and fills after, so a reader or a VM that
+    mounted the batch in that window can import a half-written file and report a
+    build failure that is really a torn read. ``os.replace`` on the same
+    filesystem is atomic, so a reader sees either the previous file or the whole
+    new one, never an in-between. The temp name carries ``(pid, thread)`` so two
+    writers cannot collide on it, and the file's name, bytes and the ``carry``
+    the caller derives from ``build_files`` are unchanged.
+    """
+    tmp = path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def setup_args_for(pythonpath: Optional[str]) -> tuple[str, ...]:
     """The ``setup.py`` command that makes a tree importable where its suite looks.
 
@@ -987,7 +1204,12 @@ def setup_args_for(pythonpath: Optional[str]) -> tuple[str, ...]:
 
 
 def build_trees_in_place(
-    prep: BugPrep, *, checkpoint: str, batch_dir: Path, repo: Path
+    prep: BugPrep,
+    *,
+    checkpoint: str,
+    batch_dir: Path,
+    repo: Path,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> None:
     """Build each of the bug's trees in the layer, and record what happened.
 
@@ -1006,7 +1228,9 @@ def build_trees_in_place(
     against. The command follows the rule's own trigger (:func:`setup_args_for`) and the
     environment is the layer's (``bake.build_env_for``) with the project's own
     ``build_env`` added to it and its ``build_files`` written beside the trees, for the
-    reason ``suite.build_tree_in_place`` records.
+    reason ``suite.build_tree_in_place`` records. Each build's VM mounts a clone of its
+    own tree (M3 item V8), so the build files travel *into* that clone and each built
+    tree comes back adopted, with its fingerprint recorded on the row.
 
     Only ``full`` prepares reach this — it is called after ``load_deps`` and before the
     dependency gate — so a measure-only run never pays a compiler.
@@ -1021,6 +1245,22 @@ def build_trees_in_place(
         return
 
     env = dict(bake_mod.build_env_for(bake_mod.minor_version(prep.bug.python_version)))
+    if "CFLAGS" in env:
+        # [VANTA-WHY] M3 §8.6 round 12, item 5 — measured on ``pandas/6``, whose C
+        # parser is built from source in its own layer: ``tokenizer.c:1764`` reads one
+        # element past a ``double[309]`` table, GCC 14's ``-Warray-bounds`` catches it,
+        # and the tree's own ``-Werror`` turns that warning into a hard failure
+        # (``cc1: all warnings being treated as errors``). The subscript is 2020-era
+        # code that compiled under the compiler of its day; what changed is the
+        # diagnostic, not the tree. Appended HERE, at prepare time, so no layer is
+        # rebaked and only the builds this harness runs are affected — and only the
+        # array-bounds diagnosis is demoted, so a build that never trips it compiles as
+        # before. ``-Wno-error=``, not ``-Wno-``: the warning stays visible. GCC
+        # resolves a specific ``-Wno-error=<diag>`` over a bare ``-Werror`` regardless
+        # of position, which is what makes it hold against the tree's own ``-Werror``
+        # on the same line. Placed before the project's rule joins below, so the
+        # split's ``build_env`` still lands last.
+        env["CFLAGS"] = f"{env['CFLAGS']} -Wno-error=array-bounds"
     if prep.build_env:
         # §3.4 — the project's own build rule, added to whatever the layer set rather
         # than put in its place: the layer's ``CFLAGS`` carry the era's warning
@@ -1032,18 +1272,27 @@ def build_trees_in_place(
             env[name] = f"{layer_value} {value}".strip() if layer_value else value
     if prep.build_files:
         # §3.4 — the build's own configuration file, written into the batch directory
-        # rather than into a tree: ``batch_dir`` is what Shuru mounts at ``/workspace``,
-        # so the file lands *beside* the trees and the trees stay exactly what the
-        # benchmark ships. Written before the first VM boots, so every one of the three
-        # builds already sees it, and rewritten each time so a re-prepare is the same
-        # run. The name is a bare file name (§3.4, the split's own validation), so it
-        # cannot be a path to somewhere else.
+        # rather than into a tree, so the trees stay exactly what the benchmark ships.
+        # Written before the first VM boots, and rewritten each time so a re-prepare is
+        # the same run. Each build's VM mounts a clone of its tree only (item V8), so
+        # the name is carried into that clone beside the tree rather than being visible
+        # because the whole batch is mounted. The name is a bare file name (§3.4, the
+        # split's own validation), so it cannot be a path to somewhere else.
         for name, content in sorted(prep.build_files.items()):
-            (batch_dir / name).write_text(content, encoding="utf-8")
+            write_build_file_atomic(batch_dir / name, content)
     setup_args = setup_args_for(prep.bug.pythonpath)
     command = f"python setup.py {' '.join(setup_args)}"
-    for tree_name in BUILD_TREES:
-        suite_mod.build_tree_in_place(
+    # [VANTA-WHY] M3 item V8 — the build file lives in the batch directory, which the
+    # guest no longer sees as ``/workspace``: the VM mounts a clone of the tree only,
+    # so the name is carried in beside it. The relative path inside the clone is the
+    # same, so ``build_env``'s own ``/workspace/<name>`` still resolves.
+    carry = tuple(sorted(prep.build_files))
+    # M3 item Y1 — each build's VM holds one slot of the invocation's budget while it
+    # boots (suite.build_tree_in_place), so a concurrent prepare prices them like the
+    # suite runs they sit beside; without a budget they boot as they always did.
+    def build_one(tree_name: str) -> str:
+        progress(prep.key, f"build {tree_name}")
+        return suite_mod.build_tree_in_place(
             checkpoint=checkpoint,
             batch_dir=batch_dir,
             tree_rel=_rel(prep, tree_name),
@@ -1052,8 +1301,39 @@ def build_trees_in_place(
             disk_mb=DISK_MB,
             env=env,
             memory_mb=prep.vm_memory_mb,
+            carry=carry,
+            budget=budget,
         )
+
+    # [VANTA-WHY] M3 item AA1 — the three trees are independent exports from git, so
+    # their builds are independent work and run at the same time under the one budget,
+    # which prices them like the suite runs they sit beside. At `--prepare-jobs 1` (or
+    # for a caller with no budget) `budget.concurrent` is false and this is the serial
+    # loop it always was, in the same order, recording the same rows. When they do
+    # overlap, the rows are still written in `BUILD_TREES` order and the first failure
+    # in that order is the one raised, so `prep.builds`/`prep.tree_hashes` and the
+    # recorded gate failure are byte-for-byte what a serial run would have produced.
+    if budget is not None and budget.concurrent:
+        outcomes: dict[str, tuple[Optional[str], Optional[BaseException]]] = {}
+        with ThreadPoolExecutor(max_workers=len(BUILD_TREES)) as pool:
+            futures = {tree: pool.submit(build_one, tree) for tree in BUILD_TREES}
+            for tree, future in futures.items():
+                try:
+                    outcomes[tree] = (future.result(), None)
+                except BaseException as exc:  # recorded in order, raised below
+                    outcomes[tree] = (None, exc)
+        ordered = ((tree, *outcomes[tree]) for tree in BUILD_TREES)
+    else:
+        ordered = ((tree, build_one(tree), None) for tree in BUILD_TREES)
+
+    for tree_name, fingerprint, failure in ordered:
+        if failure is not None:
+            raise failure
         prep.builds[tree_name] = f"built: {command}"
+        # The VM built the tree and the host adopted it (item V8/Q1); the adopted
+        # bytes' fingerprint goes on the row so a later cache key can be lined up
+        # with the tree that produced it.
+        prep.tree_hashes[tree_name] = fingerprint
 
 
 # ---------------------------------------------------------------------------
@@ -1169,6 +1449,7 @@ def derive_hidden(
     checkpoint: str,
     batch_dir: Path,
     collected: Optional[set[str]] = None,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> None:
     if collected is None:
         suite_mod.collect_only(
@@ -1182,9 +1463,49 @@ def derive_hidden(
             precompile=prep.precompile,
         )
 
-    buggy = _suite(checkpoint, batch_dir, prep, "src_buggy", "src_buggy")
-    before = _suite(checkpoint, batch_dir, prep, "oracle_tree", "oracle")
-    after = _suite(checkpoint, batch_dir, prep, "src_fixed", "src_fixed")
+    # [VANTA-WHY] M3 item S5 — the three derivations are independent: each reads its own
+    # tree and nothing they produce is read by another (the sets are only combined
+    # below), so running them back to back was a sequence with no dependency to justify
+    # it. They are submitted together and the shared budget decides how many actually
+    # overlap, which is ``--prepare-jobs`` — the concurrency is the operator's, not a
+    # number this function invents. Without a budget (or at one job) the three stay
+    # sequential, which is today's order and today's memory profile; when they do
+    # overlap, the row records it (:func:`_scheduler_record`), because two suites
+    # competing for the host is a fact a later flakiness reading must be able to see.
+    trees = (
+        ("src_buggy", "src_buggy"),
+        ("oracle_tree", "oracle"),
+        ("src_fixed", "src_fixed"),
+    )
+    if budget is not None and budget.concurrent:
+        with ThreadPoolExecutor(max_workers=len(trees)) as pool:
+            futures = [
+                pool.submit(
+                    _suite,
+                    checkpoint,
+                    batch_dir,
+                    prep,
+                    tree_name,
+                    stem,
+                    budget=budget,
+                )
+                for tree_name, stem in trees
+            ]
+            buggy, before, after = (future.result() for future in futures)
+    else:
+        buggy, before, after = (
+            _suite(checkpoint, batch_dir, prep, tree_name, stem, budget=budget)
+            for tree_name, stem in trees
+        )
+    _scheduler_record(
+        prep,
+        budget,
+        (
+            ("src_buggy", buggy),
+            ("oracle_tree", before),
+            ("src_fixed", after),
+        ),
+    )
 
     flaky = (
         buggy.flaky_nodeids
@@ -1330,7 +1651,23 @@ def _suite(
     prep: BugPrep,
     tree_name: str,
     stem_suffix: str,
+    *,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> suite_mod.SuitePair:
+    # M3 item S3 — a repeat prepare of the same bug measures the same tree bytes,
+    # so the pair is served from the cache instead of re-run (``origin`` turns the
+    # lookup on; see ``suite.run_suite_twice``). The tree name is part of the
+    # origin only, never of the key: the key is the tree's bytes, so a re-prepared
+    # tree is a hit exactly when it is the same tree.
+    #
+    # M3 item S5 — ``budget`` is threaded straight through: the pair's two runs are
+    # the scheduler's unit, so one call here is up to two units and the caller's
+    # ``--prepare-jobs`` sizes them. Keyword-only so the five positional parameters
+    # stay the shape callers and tests already bind.
+    # M3 item AA1 — one progress line per suite pair, so the derivations, the
+    # stripped baseline and every other prepare suite are visible while they run
+    # rather than only when the bug finishes.
+    progress(prep.key, f"suite {tree_name} ({stem_suffix})")
     return suite_mod.run_suite_twice(
         checkpoint=checkpoint,
         batch_dir=batch_dir,
@@ -1341,10 +1678,63 @@ def _suite(
         extra_env=prep.sandbox_env or None,
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
+        origin=f"{prep.slug}/{tree_name}",
+        budget=budget,
+        # M3 §8.6 round 12, item 1 — the collect gate's set-aside list reaches every
+        # graded derivation of this bug (both the three ``derive_hidden`` trees and
+        # the stripped ``vanta_tree`` baseline), so a run of a tree the gate accepted
+        # is not refused by a collection error the gate had already set aside.
+        ignore=prep.collect_set_aside,
     )
 
 
-def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bool:
+def _scheduler_record(
+    prep: BugPrep,
+    budget: Optional[budget_mod.Budget],
+    runs: Sequence[tuple[str, suite_mod.SuitePair]],
+) -> None:
+    """Record the budget this bug's suite runs were made under, and their wall times.
+
+    [VANTA-WHY] M3 items S5/S6. Overlapping means a run's flakiness can be the host's
+    rather than the project's, so the row has to say whether the runs overlapped, under
+    what cap, on a host already at what load — and how long each of the two runs of each
+    tree actually took, because that is the figure the in-session cap is derived from
+    (item D1, ``native_secs``). Recording it here, at the moment the pairs are in hand,
+    is the only place that has both numbers; a later reader has neither.
+
+    ``budget`` is the ONE scheduler of the invocation (S5/S6/``--jobs``); ``None`` means
+    a caller that does not participate, which is recorded as the empty mapping rather
+    than as "serial", because serial is a statement about a budget that exists.
+
+    [VANTA-WHY] M3 item S7 — each tree also carries its pair's ``cache`` block
+    (``suite.SuitePair.cache``: the key, whether it was a hit, the writer and the
+    cache ROOT it came from). ``prepare`` is the only stage that measures a tree
+    through the cache, so this is the only place the Python half of the cache can
+    be audited from the batch — and the equivalence check needs it to prove the
+    two batches did not share one root. It rides the ``scheduler`` mapping, which
+    ``BugPrep.to_dict`` already writes whole and ``from_dict`` already reads with
+    ``record_of``, so no field is added to the record's own schema.
+    """
+    previous = prep.scheduler.get("runs") if prep.scheduler else None
+    recorded = dict(previous) if isinstance(previous, Mapping) else {}
+    for tree_name, pair in runs:
+        recorded[tree_name] = {
+            "run1_secs": pair.first.secs,
+            "run2_secs": pair.second.secs,
+            "cache": pair.cache,
+        }
+    block = {} if budget is None else budget.record()
+    block["runs"] = recorded
+    prep.scheduler = block
+
+
+def strip_and_baseline(
+    prep: BugPrep,
+    *,
+    checkpoint: str,
+    batch_dir: Path,
+    budget: Optional[budget_mod.Budget] = None,
+) -> bool:
     """Cut ``vanta_tree``/``vanta_clean`` from ``oracle_tree`` and re-run the suite.
 
     Returns whether the native baseline was recorded. ``False`` means this step
@@ -1371,6 +1761,7 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bo
     oracle = prep.root / "oracle_tree"
     vanta = prep.root / "vanta_tree"
 
+    progress(prep.key, "strip oracle_tree and run the stripped baseline")
     report = _read_report(batch_dir, f"{prep.slug}-oracle")
     # Through the shared reader: the oracle report of a bug whose own pytest pin caps
     # pytest-json-report at 0.2 is a flat list (§3.2), and reading only `["tests"]`
@@ -1442,11 +1833,25 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bo
             # leak above, so the bug is refused with a cause a reader can see.
             prep.gate_failures.append(f"{VERSION_PIN_ESCAPE_REASON}: {exc}")
             return False
+    elif pin.measurement_failed:
+        # [VANTA-WHY] M3 item P3 — the machinery was reached and produced no version to
+        # freeze, so the sandbox's tree would report the ``0+unknown`` placeholder. The
+        # pandas/1 shape: running on anyway reached the native suite, which aborted at
+        # collection on both sides and ended the row ``native_vacuous`` — an
+        # ``infra_failure`` naming the tree for what is a fact about the pin. Refused
+        # here, with the probe's own complaint in the record, so the cause is the row.
+        prep.gate_failures.append(
+            f"{VERSION_PIN_UNMEASURED_REASON}: {pin.reason}"
+        )
+        return False
     prep.version_pin = version_pin_mod.as_record(
-        pin.pin, reason=pin.reason, probed=pin.probed
+        pin.pin, reason=pin.reason, probed=pin.probed, skipped=pin.skipped
     )
 
-    after_strip = _suite(checkpoint, batch_dir, prep, "vanta_tree", "vanta")
+    after_strip = _suite(
+        checkpoint, batch_dir, prep, "vanta_tree", "vanta", budget=budget
+    )
+    _scheduler_record(prep, budget, (("vanta_tree", after_strip),))
     # The same rule as ``derive_hidden``'s, on the fifth graded run. The baseline below
     # is measured from it, and an unmeasured run leaves it empty — which reads as "the
     # tree is natively green" and would clear every candidate of every regression. Left
@@ -1475,7 +1880,13 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bo
     return True
 
 
-def selfcheck_dev_fix(prep: BugPrep, *, batch_dir: Path, checkpoint: str) -> bool:
+def selfcheck_dev_fix(
+    prep: BugPrep,
+    *,
+    batch_dir: Path,
+    checkpoint: str,
+    budget: Optional[budget_mod.Budget] = None,
+) -> bool:
     """Grade the developer fix with the real oracle; refuse the bug unless it is good.
 
     Returns whether the bug may continue. Called last, after the strip, because the
@@ -1496,8 +1907,13 @@ def selfcheck_dev_fix(prep: BugPrep, *, batch_dir: Path, checkpoint: str) -> boo
     if not prep.hidden_nodeids:
         return True
 
+    progress(prep.key, "developer-fix self-check (the real oracle grades the dev fix)")
     result = oracle_mod.grade_dev_fix(
-        prep=prep, batch_dir=batch_dir, checkpoint=checkpoint, disk_mb=DISK_MB
+        prep=prep,
+        batch_dir=batch_dir,
+        checkpoint=checkpoint,
+        disk_mb=DISK_MB,
+        budget=budget,
     )
     if result.patch_good:
         return True
@@ -1521,12 +1937,27 @@ def declared_test_files(bug: BugInfo) -> list[str]:
     suite run. That is the whole point (§2.4): the freeze step's inputs come from git
     alone, so a measure-only run — which has no ``FAIL_TO_PASS`` — reads a text gated
     exactly as a real run's would have been.
+
+    [VANTA-WHY] One declared token may name *several* files with ``;``. ``fastapi/11``'s
+    ``bug.info`` carries ``tests/test_union_body.py;tests/test_union_inherited_body.py``
+    and its ``run_test.sh`` the same pair as ``::nodeid`` lines. Read as a single path the
+    token was no file at all: :func:`read_declared_test_files` skipped it, so the report
+    was gated against a smaller answer than the bug has and the frozen gate named a file
+    that does not exist, and the collect gate's closure found no root. Splitting each
+    token on ``;`` — after the whitespace split, so a shell ``;`` separator is not
+    mistaken for the whitespace split — reads the declaration BugsInPy actually wrote. It
+    changes only a bug whose declaration carries a ``;``; every other token splits to
+    itself.
     """
-    files = [bug.test_file] if bug.test_file else []
-    for token in (bug.run_test_command() or "").split():
-        name = token.strip("'\"")
-        if name.endswith(".py") and "::" not in name and name not in files:
-            files.append(name)
+    declared = [bug.test_file] if bug.test_file else []
+    declared.extend(
+        token.strip("'\"") for token in (bug.run_test_command() or "").split()
+    )
+    files: list[str] = []
+    for token in declared:
+        for name in token.split(";"):
+            if name.endswith(".py") and "::" not in name and name not in files:
+                files.append(name)
     return files
 
 
@@ -1928,6 +2359,8 @@ def prepare_manifest(
     preps: list[BugPrep],
     n_ctx: int,
     n_ctx_source: str,
+    config_block: Mapping[str, Any],
+    scheduler: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """The whole ``prepare.json`` payload — the one writer ``run`` reads back.
 
@@ -1941,6 +2374,14 @@ def prepare_manifest(
     ``n_ctx``/``n_ctx_source`` are the window the gate was sized against (§1.6.1):
     recorded here, and compared against the run's own window by
     ``runner.context_window_warning``.
+
+    ``config_block`` is item 19's frozen-configuration block — ``config_hash``,
+    ``config_path``, ``config_override`` and ``config_overrides``, the same four
+    keys ``build_record`` puts on every row (item Q3). It is passed in rather than
+    loaded here so that the stage resolves the configuration *once*, at the start,
+    exactly as ``run`` does: the hash on the file is then the hash the batch
+    measured under, and a ``prepare.json`` naming a different configuration from
+    its rows is a contradiction this payload cannot express.
     """
     return {
         "schema_version": 1,
@@ -1957,8 +2398,14 @@ def prepare_manifest(
         # number came from. ``run`` reads these back and warns when its own differs.
         "n_ctx": n_ctx,
         "n_ctx_source": n_ctx_source,
+        **config_block,
         "selected": list(selected),
         "breaks": [{"bug": key, "detail": detail} for key, detail in broken],
+        # M3 items S5/S6 — the invocation's ONE scheduler, as it ended: whether the
+        # runs overlapped, the jobs asked for, the budget the host allowed, the load
+        # at the start and the peak reached. The per-bug copy is on each row
+        # (``BugPrep.scheduler``); this one is what the batch as a whole ran under.
+        "scheduler": dict(scheduler) if scheduler is not None else {},
         "bugs": [prep.to_dict() for prep in preps],
     }
 
@@ -2253,6 +2700,27 @@ def _batch_root(prep: BugPrep) -> Path:
     return prep.root.parent.parent
 
 
+PROGRESS_CLOCK = "%H:%M:%S"
+"""The wall-clock shape of a progress line (M3 item AA1)."""
+
+
+def progress(key: str, step: str) -> None:
+    """One timestamped line for a prepare step or a suite run (M3 item AA1).
+
+    [VANTA-WHY] ``prepare`` is minutes of silent work: the batch printed
+    ``[<key>] full ...`` and then nothing at all until ``[<key>] ok``, so a
+    28-minute pandas prepare, a hung one and a batch running at a crawl all read
+    the same on the terminal — the operator cannot tell progress from a stall.
+    One line per setup step and per suite run makes the stage legible while
+    changing nothing it computes: the line goes to stdout and is read by no
+    verdict, label, admission or result. It is emitted here rather than inside
+    ``suite.run_suite_twice`` because that would print for every stage of the
+    harness (``run``, ``queue``, ``replay``); ``prepare`` is the stage that was
+    silent, so ``prepare`` is where the line belongs.
+    """
+    print(f"[{datetime.now().strftime(PROGRESS_CLOCK)}] [{key}] {step}", flush=True)
+
+
 def _read_report(batch_dir: Path, stem: str) -> dict:
     path = batch_dir / f"reports/{stem}.run1.json"
     try:
@@ -2361,6 +2829,63 @@ def check_build_declared(entry: dict[str, Any], bug: BugInfo, *, repo: Path) -> 
     ]
 
 
+PYTHONPATH_DECL = re.compile(
+    r"^[ \t]*(?:export[ \t]+)?PYTHONPATH=(?P<value>[^\s#;]+)",
+    re.MULTILINE,
+)
+"""The line a project's own suite runner uses to put its import root on ``PYTHONPATH``.
+
+Covers both the shell form the projects use (``export PYTHONPATH=./docs/src``) and a
+bare assignment ahead of the test command. The value is a path token — no quotes are
+consumed here; :func:`suite_pythonpath` trims any it finds.
+"""
+
+
+def suite_pythonpath(repo: Path, commit: str) -> Optional[str]:
+    """The ``PYTHONPATH`` the project's own suite runner declares at ``commit``.
+
+    ``repo`` is the project's clone mirror, and the value is read out of that
+    commit's ``scripts/test.sh`` through :func:`trees.read_file_at` (git, no
+    checkout): whatever the project's own runner exports is what the suite is written
+    against. ``None`` when the project ships no such script or exports nothing, in
+    which case the split's recorded value stands unchanged.
+
+    [VANTA-WHY] §8.6 round 10. The split recorded one value, ``./docs_src``, for every
+    fastapi bug — the layout of its *newer* commits. fastapi/11, /5 and /6 are older
+    commits whose own ``scripts/test.sh`` export ``PYTHONPATH=./docs/src``, so the
+    deps gate's collect imported the example apps from a directory that commit does
+    not ship and refused the bug with ``No module named 'additional_responses'`` while
+    fastapi/3 passed, because only its tree carries a ``docs_src/``. The path moved
+    with the project, so it is read per commit rather than frozen into the protocol;
+    the environment variable the suite runs under is named ``PYTHONPATH`` either way,
+    whatever the project's file calls the directory.
+    """
+    text = tree_mod.read_file_at(repo, commit, "scripts/test.sh")
+    if not text:
+        return None
+    match = PYTHONPATH_DECL.search(text)
+    if not match:
+        return None
+    return match.group("value").strip().strip("'\"")
+
+
+def _sandbox_env(entry: dict[str, Any], *, repo: Path, commit: str) -> dict[str, str]:
+    """The row's ``sandbox_env``: the split's rule, with ``PYTHONPATH`` from the commit.
+
+    [VANTA-WHY] The split records *that* a project's suite needs a ``PYTHONPATH``
+    (fastapi's example apps, matplotlib's ``lib``); the *value* is read from the
+    commit for a project whose own runner states it (:func:`suite_pythonpath`), so a
+    directory the project moved is not a value frozen into the protocol. A project
+    that states nothing keeps exactly what the split recorded — including the case
+    where the split recorded no ``sandbox_env`` at all.
+    """
+    env = {str(k): str(v) for k, v in (entry.get("sandbox_env") or {}).items()}
+    declared = suite_pythonpath(repo, commit)
+    if declared is not None:
+        env["PYTHONPATH"] = declared
+    return env
+
+
 def _memory_entry(entry: dict[str, Any]) -> Optional[int]:
     """The split entry's ``vm_memory_mb``, or ``None``.
 
@@ -2398,6 +2923,7 @@ def prepare_one(
     n_ctx_source: str,
     vanta_bin: Path,
     refreeze: bool = False,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> BugPrep:
     """Everything ``prepare`` does for one bug, in the order §1.3 fixes.
 
@@ -2411,6 +2937,13 @@ def prepare_one(
 
     ``refreeze`` comes from ``prepare --refreeze PROJECT/BUG`` and means exactly one
     thing: this bug's committed report is to be re-fetched and rewritten (§2.4.3).
+
+    ``budget`` is the ONE host-capacity scheduler (M3 items S5/S6), created once per
+    ``prepare`` invocation by the caller and handed down so this bug's independent
+    suite runs (the three derivations) can overlap under ``--prepare-jobs``. It is
+    also what the row records (``BugPrep.scheduler``), so a reader can tell a
+    concurrent measurement from a serial one. ``None`` keeps the serial behaviour
+    for a caller that does not participate.
     """
     project = entry["project"]
     bug_id = int(entry["bug_id"])
@@ -2426,11 +2959,14 @@ def prepare_one(
         # them. Read from the split, which is where the command itself comes from.
         native_test_paths=[str(part) for part in entry["native_test_paths"]],
         prepare_mode=FULL if full else MEASURE_ONLY,
-        # §3.4 — the project's own suite environment. Declared on the split entry
-        # (``sandbox_env``) and only read here, so the value is never typed per bug
-        # in pipeline code: whatever the split records is what every run of this row
-        # gets. Empty for every bug but fastapi's.
-        sandbox_env={str(k): str(v) for k, v in (entry.get("sandbox_env") or {}).items()},
+        # §3.4 — the project's own suite environment. The split records *that* the
+        # project's suite needs one (``sandbox_env``) — fastapi's example apps on
+        # ``PYTHONPATH``, matplotlib's ``lib`` — and the ``PYTHONPATH`` value itself is
+        # read from the buggy commit's own ``scripts/test.sh``, so a directory the
+        # project moved between commits is not a value frozen into the protocol
+        # (:func:`_sandbox_env`). Whatever the row records is what every run of this row
+        # gets. Empty for every bug but fastapi's and matplotlib's.
+        sandbox_env=_sandbox_env(entry, repo=repo_cache, commit=bug.buggy_commit),
         # §3.4 — the project's own build rule (``build_env``), read here in the same
         # way and for the same reason: the split records it once, and every tree this
         # row builds gets it from the row rather than from a pipeline literal.
@@ -2454,6 +2990,7 @@ def prepare_one(
         precompile=_precompile_entry(entry),
     )
 
+    progress(prep.key, "check the row against the split")
     mismatches = check_declared(entry, bug)
     # `needs_build` is checked against the buggy commit's own tree and not against the
     # metadata: it is a property of the files (§3.2), and the split is the protocol, so
@@ -2464,6 +3001,7 @@ def prepare_one(
         prep.gate_failures.extend(mismatches)
         return prep
 
+    progress(prep.key, "materialise the trees (git exports)")
     prep.test_paths = build_trees(bug, repo_cache, prep.root)
 
     # The issue text comes from the committed frozen report, and it is read *here*
@@ -2474,6 +3012,7 @@ def prepare_one(
     if not github_url:
         prep.gate_failures.append(f"{FROZEN_ISSUE_REASON}: no github_url for {project}")
         return prep
+    progress(prep.key, "read the frozen issue text")
     frozen = build_issue(
         prep,
         repo_cache=repo_cache,
@@ -2494,6 +3033,7 @@ def prepare_one(
     # (the strip only removes test functions), so measuring it costs nothing and
     # saves the three double suite runs on a bug that cannot fit anyway — which is
     # the whole point of the precheck for a candidate like youtube-dl.
+    progress(prep.key, "precheck (pre-strip tree, window-sized)")
     early = ctx.precheck(
         prep.root / "oracle_tree",
         prep.issue.text,
@@ -2513,6 +3053,7 @@ def prepare_one(
     # The dependency gate comes first, and comes before the derivation, because a
     # missing dependency must never be reported as an oracle failure (§3.3). It
     # needs no oracle work at all: the layer is baked, the trees are on disk.
+    progress(prep.key, "load the layer's dependency provenance")
     try:
         deps = bake_mod.load_deps(deps_dir, checkpoint)
         prep.deps = deps
@@ -2539,27 +3080,42 @@ def prepare_one(
     # has C extensions is not importable until its own `setup.py` has run (§3.4), so
     # without this the gate's failure would be the ImportError the build exists to
     # prevent — a missing *extension* reported as a missing *dependency*.
+    progress(prep.key, "build the trees in place")
     try:
         build_trees_in_place(
-            prep, checkpoint=checkpoint, batch_dir=batch_dir, repo=repo_cache
+            prep,
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            repo=repo_cache,
+            budget=budget,
         )
     except suite_mod.SuiteError as exc:
         prep.gate_failures.append(str(exc))
         note_drops()
         return prep
 
+    progress(prep.key, "dependency gate")
     try:
         collected = check_deps(
-            prep, checkpoint=checkpoint, batch_dir=batch_dir, deps=deps
+            prep,
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            deps=deps,
+            budget=budget,
         )
     except suite_mod.SuiteError as exc:
         prep.gate_failures.append(str(exc))
         note_drops()
         return prep
 
+    progress(prep.key, "derive the hidden oracle (three suite pairs)")
     try:
         derive_hidden(
-            prep, checkpoint=checkpoint, batch_dir=batch_dir, collected=collected
+            prep,
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            collected=collected,
+            budget=budget,
         )
     except (suite_mod.SuiteError, tree_mod.TreeError) as exc:
         prep.gate_failures.append(f"hidden-oracle derivation failed: {exc}")
@@ -2573,6 +3129,7 @@ def prepare_one(
     # text was gated against a narrower oracle than the run grades with. Flagged, never
     # re-gated — the committed text is what the run sends.
     if frozen is not None:
+        progress(prep.key, "check the frozen text against the derived oracle")
         drift = check_gate_drift(prep, frozen, issues_dir=issue_sources.issues_dir)
         if drift:
             prep.gate_failures.append(drift)
@@ -2581,7 +3138,7 @@ def prepare_one(
 
     try:
         baseline_recorded = strip_and_baseline(
-            prep, checkpoint=checkpoint, batch_dir=batch_dir
+            prep, checkpoint=checkpoint, batch_dir=batch_dir, budget=budget
         )
     except suite_mod.SuiteError as exc:
         prep.gate_failures.append(f"post-strip suite run failed: {exc}")
@@ -2604,7 +3161,9 @@ def prepare_one(
     # measured as a candidate; those two numbers would only describe a bug no run will
     # ever use.
     try:
-        if not selfcheck_dev_fix(prep, batch_dir=batch_dir, checkpoint=checkpoint):
+        if not selfcheck_dev_fix(
+            prep, batch_dir=batch_dir, checkpoint=checkpoint, budget=budget
+        ):
             note_drops()
             return prep
     except suite_mod.SuiteError as exc:
@@ -2616,6 +3175,7 @@ def prepare_one(
     # issue text it will actually be given. Smaller than `early`, never larger — the
     # text is the same frozen file, and the tree is the same source with the hidden
     # tests stripped.
+    progress(prep.key, "authoritative context measurement (vanta_tree)")
     prep.context = ctx.precheck(
         prep.root / "vanta_tree",
         prep.issue.text if prep.issue else "",
@@ -2648,6 +3208,7 @@ def derive_verdict(prep: BugPrep) -> dict[str, Any]:
         "partially_hidden_functions": prep.partially_hidden_functions,
         "hidden_by_collect_flip": prep.hidden_by_collect_flip,
         "collect_flip_nodeids": sorted(prep.collect_flip_nodeids),
+        "collect_excluded": prep.collect_excluded,
         "gate_failures": prep.gate_failures,
         "prompt_tokens_estimate": prep.context.estimated_prompt_tokens
         if prep.context
@@ -2676,12 +3237,19 @@ def render_summary(
     *,
     n_ctx: Optional[int] = None,
     n_ctx_source: Optional[str] = None,
+    cache_state: Optional[str] = None,
 ) -> str:
     """The ``prepare`` console + ``prepare_summary.md`` table.
 
     The window is printed above the table (§1.6.1) because every ``context tok``
     below it is meaningless without it: the first full prepare sized against the
     65536 fallback and rejected two PySnooper bugs, and nothing in the table said so.
+
+    ``cache_state`` is one line the caller composes (``bugsinpy_run.cache_state_line``,
+    M3 item U3) saying whether every selected layer can key the suite cache. It rides
+    the summary for the same reason the window does: a layer with no ``checkpoint_id``
+    turns the cache off *silently* — every suite is measured and nothing is reused —
+    and a batch whose summary does not say so reads exactly like one whose cache is on.
     """
     lines: list[str] = []
     if n_ctx is not None:
@@ -2690,6 +3258,8 @@ def render_summary(
             "every verdict below was sized against this window.",
             "",
         ]
+    if cache_state is not None:
+        lines += [cache_state, ""]
     lines += [
         "| bug | role | wave | mode | verdict | F2P | collected | native fails | context tok | issue |",
         "|---|---|---|---|---|---|---|---|---|---|",

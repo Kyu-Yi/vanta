@@ -31,6 +31,7 @@ import hashlib
 import re
 import shutil
 import subprocess
+import threading
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,13 +56,101 @@ def _git(args: list[str], *, cwd: Optional[Path]) -> str:
     return proc.stdout
 
 
+def _clone_lock(dest: Path) -> threading.Lock:
+    """The lock that guards one cache destination's clone."""
+    with _CLONE_LOCKS_GUARD:
+        lock = _CLONE_LOCKS.get(str(dest))
+        if lock is None:
+            lock = threading.Lock()
+            _CLONE_LOCKS[str(dest)] = lock
+        return lock
+
+
+_CLONE_LOCKS: dict[str, threading.Lock] = {}
+_CLONE_LOCKS_GUARD = threading.Lock()
+
+
 def ensure_project_clone(cache_root: Path, project: str, url: str) -> Path:
-    """Clone (once) the upstream project repo and return the cache path."""
+    """Clone (once) the upstream project repo and return the cache path.
+
+    [VANTA-WHY] M3 item AA2 — this path, ``runs/bugsinpy/repos/<project>.git``, is
+    the batch's **local clone mirror**: it is the one thing that touches the
+    network, and everything downstream (``export_tree`` and the readers
+    ``read_file_at``/``list_files_at``/``commit_date``) works from it rather than
+    from the URL, so the three checkouts of one bug and every later bug cost no
+    network at all. A commit the mirror does not hold is fetched into it by
+    :func:`ensure_commit_available`, which is the only thing that ever writes it —
+    ``export_tree`` only reads it. The mirror lives under ``runs/bugsinpy/repos``,
+    which no sandbox mounts, so it is never visible inside a microVM.
+
+    [VANTA-WHY] M3 item Y1 — the "once" is now enforced under concurrency rather
+    than assumed. ``prepare`` overlaps different bugs (and different bugs of one
+    project, e.g. the dev split's two ``fastapi`` bugs), so two callers can reach
+    an absent destination at the same time; both would run ``git clone`` into it
+    and git refuses the second ("destination path already exists"), failing a bug
+    for a race rather than for anything about the bug. The lock is per
+    destination, so two *different* projects still clone in parallel, and the
+    second check inside it is what makes the common "somebody else just made it"
+    case a plain return.
+    """
     dest = cache_root / f"{project}.git"
-    if not dest.is_dir():
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        _git(["clone", "--quiet", "--", url, str(dest)], cwd=None)
+    if dest.is_dir():
+        return dest
+    with _clone_lock(dest):
+        if not dest.is_dir():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            _git(["clone", "--quiet", "--", url, str(dest)], cwd=None)
     return dest
+
+
+def _has_commit(repo: Path, commit: str) -> bool:
+    """Whether ``repo``'s object store already holds ``commit``.
+
+    A non-raising probe (``git cat-file -e``), so "the mirror is missing this
+    commit" is an ordinary answer rather than a ``TreeError``: it is the question
+    :func:`ensure_commit_available` asks before deciding whether to fetch.
+    """
+    proc = subprocess.run(
+        ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def ensure_commit_available(mirror: Path, commit: str) -> None:
+    """Guarantee ``commit`` is in the local mirror, fetching it only when missing.
+
+    [VANTA-WHY] M3 item AA2. The mirror is cloned once from the network; after that
+    the only reason to touch the network again is a commit the initial clone does
+    not hold (a PR merge or a tag-only commit that no branch reaches). The check is
+    a local ``git cat-file`` first, so the ordinary case — a commit already in the
+    mirror — is a pure local read and never a fetch. When the commit is missing it
+    is fetched by sha from the mirror's own ``origin`` (the upstream URL set at
+    clone time), under the same per-destination lock that guards the mirror's own
+    creation, and the fetch is refused unless the commit is there afterwards. This
+    function is the *only* writer of the mirror; the checkout code
+    (:func:`export_tree`) reads it and never writes it.
+    """
+    if _has_commit(mirror, commit):
+        return
+    with _clone_lock(mirror):
+        if _has_commit(mirror, commit):
+            return
+        proc = subprocess.run(
+            ["git", "fetch", "--quiet", "origin", commit],
+            cwd=mirror,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0 or not _has_commit(mirror, commit):
+            raise TreeError(
+                f"{commit} is not in the local clone mirror {mirror} and could not be "
+                f"fetched from its origin: {proc.stderr.strip() or 'git fetch failed'}"
+            )
 
 
 def read_file_at(repo: Path, commit: str, path: str) -> Optional[str]:
@@ -120,18 +209,29 @@ def export_tree(repo: Path, commit: str, dest: Path) -> None:
     meaningless once the tree is mounted inside the microVM, and ``git archive``
     drops the ``.git`` directory entirely, which costs us ``git apply`` and
     ``git diff`` inside the tree for no benefit.
+
+    [VANTA-WHY] M3 item AA2 — this clones from the *local mirror* (``repo``), never
+    from the network. A commit the mirror does not hold is put there first by
+    :func:`ensure_commit_available`, which is the only thing in the harness that
+    writes the mirror; the clone below only reads it. After the checkout the tree's
+    ``HEAD`` is read back and must equal the requested commit — a clone that
+    silently lands on a different commit (a stale mirror, a fetch that resolved the
+    wrong object) would put the wrong source under the suites, and that must be a
+    refusal rather than something the cache then records as this layer's tree.
     """
     if dest.exists():
         shutil.rmtree(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
+    ensure_commit_available(repo, commit)
     _git(["clone", "--quiet", "--no-checkout", "--", str(repo), str(dest)], cwd=None)
-    try:
-        _git(["checkout", "--quiet", "--detach", commit], cwd=dest)
-    except TreeError:
-        # A commit that lives on no branch (a PR merge, a tag-only commit) is not
-        # in the clone; fetch it by sha and retry rather than failing the bug.
-        _git(["fetch", "--quiet", "origin", commit], cwd=dest)
-        _git(["checkout", "--quiet", "--detach", commit], cwd=dest)
+    _git(["checkout", "--quiet", "--detach", commit], cwd=dest)
+    head = _git(["rev-parse", "HEAD"], cwd=dest).strip()
+    wanted = _git(["rev-parse", f"{commit}^{{commit}}"], cwd=dest).strip()
+    if head != wanted:
+        raise TreeError(
+            f"{dest}: checked out {head} but {commit} ({wanted}) was requested — "
+            f"refusing a tree that is not the commit it claims"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +736,15 @@ def _strip_source(
     # A class left empty by the removal needs a `pass`, or the file stops parsing.
     for node in ast.walk(module):
         if not isinstance(node, ast.ClassDef) or not node.body:
+            continue
+        if node.lineno in drop:
+            # [VANTA-WHY] The class *statement* is itself being removed — a nested
+            # class whose whole span a removed outer definition covers. There is no
+            # block left for the `pass` to live in: emitting one at the body's
+            # indent leaves the surrounding scope with nothing to indent under, and
+            # the file dies `unexpected indent` (measured on pandas/90 and pandas/158,
+            # whose hidden classes nest). The enclosing definition's own removal
+            # already accounts for the lines, so nothing is inserted here.
             continue
         body_lines = {stmt.lineno for stmt in node.body}
         if body_lines and body_lines <= drop:

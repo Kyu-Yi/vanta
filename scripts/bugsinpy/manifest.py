@@ -23,7 +23,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 SCHEMA_VERSION = 1
 
@@ -106,6 +106,134 @@ left no evidence has not been done."""
 
 MANIFEST_NAME = "manifest.jsonl"
 STATE_NAME = "state.json"
+
+# ---------------------------------------------------------------------------
+# the OUTCOME label, and its one fixed precedence
+# ---------------------------------------------------------------------------
+# [VANTA-WHY] A row's outcome label is what the run concluded about the patch it
+# produced. Two later corrections may overrule it, and neither rewrites the row:
+# `manifest.jsonl` is append-only evidence, and a row a paper cites must not be
+# able to change under a reader. So the corrections are recorded BESIDE the row —
+#   * `label_relabelled`          derived from the row's own artefacts (M3-E,
+#                                 `rule m3_e_terminal_final_patch`), on the row.
+#   * `label_relabelled_measured` the label was MEASURED by re-running the oracle
+#                                 on the reconstructed final patch. It lives in a
+#                                 sidecar, `<batch>/relabel/<stem>.json`, never in
+#                                 the manifest, so the evidence file is untouched.
+# Every reader of the outcome label resolves it through :func:`label_of`, in the
+# ONE order below, and reports the SOURCE it used — two tools must never disagree
+# about which value a row carries, and a reader must never have to guess whether
+# it read the original or a correction. `metrics.py`'s `known_bad` axis is a
+# different thing: it is the CANDIDATE's ground truth, which no relabel moves.
+RELABEL_DIRNAME = "relabel"
+LABEL_KEY = "label"
+DERIVED_RELABEL_KEY = "label_relabelled"
+MEASURED_RELABEL_KEY = "label_relabelled_measured"
+
+LABEL_SOURCE_MEASURED = "measured_relabel"
+LABEL_SOURCE_DERIVED = "derived_relabel"
+LABEL_SOURCE_ORIGINAL = "original_label"
+
+# Most specific first — this is a precedence, not a worst-case ranking: a measured
+# label beats a derived one, which beats the original the run wrote.
+LABEL_PRECEDENCE: tuple[tuple[str, str], ...] = (
+    (MEASURED_RELABEL_KEY, LABEL_SOURCE_MEASURED),
+    (DERIVED_RELABEL_KEY, LABEL_SOURCE_DERIVED),
+    (LABEL_KEY, LABEL_SOURCE_ORIGINAL),
+)
+
+
+def label_of(record: Mapping[str, Any]) -> tuple[str, str]:
+    """``(label, source)`` for one row, under the fixed precedence above.
+
+    ``source`` is :data:`LABEL_SOURCE_MEASURED`, :data:`LABEL_SOURCE_DERIVED` or
+    :data:`LABEL_SOURCE_ORIGINAL`, so a reader can report which one it used. A row
+    that carries no label at all returns ``("", "")`` — an absence, never a value.
+    """
+    for key, source in LABEL_PRECEDENCE:
+        raw = record.get(key)
+        # The relabel keys hold a marker block with the label inside it; the plain
+        # key holds the label itself. One read covers both shapes.
+        value = raw.get(LABEL_KEY) if isinstance(raw, Mapping) else raw
+        if isinstance(value, str) and value:
+            return value, source
+    return "", ""
+
+
+def stem(key: str) -> str:
+    """A filesystem-safe stem for one row's files, derived from its manifest key.
+
+    The ONE definition. ``run_logs/<stem>.log``, ``oracle/<stem>.json``,
+    ``issues/<stem>.txt`` and the measured-relabel sidecar
+    ``relabel/<stem>.json`` are all named by it, so a reader holding a row's key
+    can find every file that belongs to that row.
+    """
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(key))
+
+
+def relabel_dir(batch_dir: Path) -> Path:
+    """Where a batch's measured relabels live — ``<batch>/relabel/``."""
+    return Path(batch_dir) / RELABEL_DIRNAME
+
+
+def relabel_path(batch_dir: Path, key: str) -> Path:
+    """The sidecar one row's MEASURED relabel lives in."""
+    return relabel_dir(batch_dir) / f"{stem(key)}.json"
+
+
+def measured_relabels(batch_dir: Path) -> dict[str, dict[str, Any]]:
+    """``stem -> label_relabelled_measured block``, read from a batch's sidecars.
+
+    A batch with no ``relabel/`` directory is the NORMAL case, not an error: it is
+    a batch nobody has re-measured, and it contributes an empty table. A sidecar
+    that is unreadable or malformed is skipped rather than raised on, so one bad
+    file cannot take a whole report down; every other file is still read.
+    """
+    table: dict[str, dict[str, Any]] = {}
+    directory = relabel_dir(batch_dir)
+    if not directory.is_dir():
+        return table
+    for path in sorted(directory.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        block = payload.get(MEASURED_RELABEL_KEY)
+        if isinstance(block, Mapping):
+            table[path.stem] = dict(block)
+    return table
+
+
+def with_measured_relabels(
+    records: Iterable[dict[str, Any]], batch_dir: Path
+) -> list[dict[str, Any]]:
+    """``records`` with each row's measured relabel attached from its sidecar.
+
+    [VANTA-WHY] The measured block lives beside the batch rather than on the row, so
+    a reader that only has the rows (the digest, ``write_labels``, the analysis)
+    cannot see it. Attaching it here — under :data:`MEASURED_RELABEL_KEY`, the same
+    key :func:`label_of` looks for — gives every reader the one view of a row, and
+    :func:`label_of` then resolves the precedence in exactly one place.
+
+    A batch with no sidecars returns the rows unchanged (the same objects, no
+    copies), so nothing on disk is touched and the cost of the normal case is one
+    ``stat``.
+    """
+    table = measured_relabels(batch_dir)
+    if not table:
+        return list(records)
+    out: list[dict[str, Any]] = []
+    for record in records:
+        block = table.get(stem(str(record.get("key") or ""))) if isinstance(record, Mapping) else None
+        if block is None:
+            out.append(record)
+        else:
+            row = dict(record)
+            row[MEASURED_RELABEL_KEY] = block
+            out.append(row)
+    return out
 
 
 def oracle_inconclusive(record: Optional[dict[str, Any]]) -> bool:
@@ -235,8 +363,13 @@ class Manifest:
 
         See :func:`effective_records`: the raw list is every row ever appended, so a
         report built from it counts a superseded or re-run job twice.
+
+        A row a batch has MEASURED-relabelled carries that correction too
+        (:func:`with_measured_relabels`), so a reader that goes through the manifest
+        sees the same label every other reader resolves — the sidecar is read here,
+        once, rather than by each of them.
         """
-        return effective_records(self.records())
+        return with_measured_relabels(effective_records(self.records()), self.batch_dir)
 
     def find(self, key: str) -> Optional[dict[str, Any]]:
         for record in reversed(self.records()):

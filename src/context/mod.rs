@@ -39,6 +39,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::pipeline::summary_escape::encode_summary_value;
+
 // ----------------------------------------------------------------------------
 // Walk constants — the extension set and prune list, one definition
 // ----------------------------------------------------------------------------
@@ -772,7 +774,11 @@ impl ContextSelection {
     ///
     /// The line is single and space-free because it is embedded in rows that are
     /// parsed as space-separated `key=value` pairs, where a space would silently
-    /// split a key and a newline would split a row.
+    /// split a key and a newline would split a row. Both paths it carries are
+    /// percent-encoded (M3 item T2) for exactly that reason: a selected or pruned
+    /// path is the tree's own text, and one containing a space would otherwise
+    /// truncate the value and could inject a `key=value` the row never wrote. The
+    /// runner decodes each path back in `selected_paths`/`selected_forms`.
     pub fn provenance_line(&self) -> String {
         let files = if self.files.is_empty() {
             "none".to_string()
@@ -782,7 +788,7 @@ impl ContextSelection {
                 .map(|file| {
                     format!(
                         "{}@{}[{}]{}:{}B/{}tok",
-                        file.path,
+                        encode_summary_value(&file.path),
                         file.score,
                         file.reasons
                             .iter()
@@ -802,7 +808,7 @@ impl ContextSelection {
         } else {
             self.skipped
                 .iter()
-                .map(|skip| format!("{}:{}", skip.path, skip.reason))
+                .map(|skip| format!("{}:{}", encode_summary_value(&skip.path), skip.reason))
                 .collect::<Vec<_>>()
                 .join(";")
         };
@@ -2631,6 +2637,40 @@ mod tests {
                 "each selected file travels with score, reason, bytes and tokens; missing {entry} in {line}"
             );
         }
+    }
+
+    /// [VANTA-WHY] M3 item T2 — both paths on the line are the tree's own text, and
+    /// the line is embedded in a space-separated `key=value` row. A path with a
+    /// space must therefore be percent-encoded: left raw it truncates the value at
+    /// the space, and a `key=value` after the space would inject a field the row
+    /// never wrote. A path without a space is written byte-for-byte, so every row
+    /// already on disk keeps its meaning.
+    #[test]
+    fn the_provenance_line_percent_encodes_paths_that_contain_a_space() {
+        let candidates = vec![candidate(
+            "pkg/odd name.py",
+            "def frobnicate(value):\n    return value\n",
+        )];
+        let mut selection =
+            select_repair_context(&candidates, "`frobnicate` raises.\n", "creator", 60_000);
+        selection.skipped.push(SkipRecord {
+            path: "vendor/odd dir/x.py".to_string(),
+            reason: "vendored".to_string(),
+        });
+
+        let line = selection.provenance_line();
+        assert!(
+            !line.contains(' '),
+            "a spaced path must not put a space on the line; got {line}"
+        );
+        assert!(
+            line.contains("selected=[pkg/odd%20name.py@"),
+            "the selected path is percent-encoded; got {line}"
+        );
+        assert!(
+            line.contains("pruned=[vendor/odd%20dir/x.py:vendored]"),
+            "the pruned path is percent-encoded too; got {line}"
+        );
     }
 
     /// [VANTA-WHY] §1.6.2 item 6 — the ranking is the whole point of the change,

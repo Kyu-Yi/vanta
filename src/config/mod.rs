@@ -952,6 +952,10 @@ mod tests {
 
     #[test]
     fn test_context_window_tokens_from_env() {
+        // M3 item X4 — the crate-wide environment lock. `from_env` reads the whole
+        // environment, so this test must not run beside any other test that writes
+        // it (item X4's note in `lib.rs::test_env` has the full reason).
+        let _env = crate::test_env::lock();
         unsafe {
             env::set_var("VANTA_LLM_CONTEXT_TOKENS", "131072");
         }
@@ -993,6 +997,9 @@ mod tests {
     /// failure would depend on thread scheduling rather than on the code.
     #[test]
     fn test_backend_selection_from_env() {
+        // M3 item X4 — the crate-wide environment lock, so these writes are
+        // exclusive with every other test that reads or writes the environment.
+        let _env = crate::test_env::lock();
         unsafe {
             env::remove_var("VANTA_LLM_BACKEND");
             env::remove_var("VANTA_LLM_BASE_URL");

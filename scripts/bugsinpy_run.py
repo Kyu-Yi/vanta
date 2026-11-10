@@ -41,16 +41,19 @@ import os
 import subprocess
 import sys
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence, Union
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS_DIR.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+from bugsinpy import arms as arms_mod  # noqa: E402
 from bugsinpy import bake as bake_mod  # noqa: E402
+from bugsinpy import budget as budget_mod  # noqa: E402
 from bugsinpy import bugsinpy_meta as meta_mod  # noqa: E402
 from bugsinpy import compact as compact_mod  # noqa: E402
 from bugsinpy import context as context_mod  # noqa: E402
@@ -67,6 +70,7 @@ from bugsinpy import replay as replay_mod  # noqa: E402
 from bugsinpy import runner as runner_mod  # noqa: E402
 from bugsinpy import split as split_mod  # noqa: E402
 from bugsinpy import suite as suite_mod  # noqa: E402
+from bugsinpy import suite_cache  # noqa: E402
 from bugsinpy import trees as tree_mod  # noqa: E402
 from bugsinpy.shuru import ShuruError  # noqa: E402
 from bugsinpy.split import Split, SplitError, load_split  # noqa: E402
@@ -217,7 +221,174 @@ def render_plan(selected: list[tuple[dict[str, Any], bool]]) -> str:
 # ---------------------------------------------------------------------------
 # prepare
 # ---------------------------------------------------------------------------
+def cache_state_line(
+    *, checkpoints: Sequence[str], unstamped: Sequence[str]
+) -> str:
+    """One line stating whether the selected layers can key the suite cache.
+
+    [VANTA-WHY] M3 item U3 — the failure this guards against is silent. A layer whose
+    provenance carries no ``checkpoint_id`` makes ``suite._measure_suite`` answer
+    ``off:unknown_checkpoint``, so its suites are measured on every run and never reused,
+    while every other line of the batch looks normal. The state is therefore *stated* in
+    the summary rather than left to be inferred from a hit count of zero.
+    """
+    if suite_cache.cache_disabled():
+        return (
+            "Suite cache: OFF — --no-cache was passed; every suite is measured this run "
+            "(U2 still replaces an entry it could not use)."
+        )
+    if not checkpoints:
+        return "Suite cache: on — no layer is selected, so there is nothing to key."
+    if unstamped:
+        return (
+            f"Suite cache: OFF — {len(unstamped)} of {len(checkpoints)} selected layer(s) "
+            "carry no checkpoint_id, so no suite of theirs can be keyed or reused: "
+            + ", ".join(unstamped)
+            + ". Fix them once, without re-baking: "
+            "`python3 scripts/bugsinpy_run.py stamp-existing`."
+        )
+    return (
+        f"Suite cache: on — all {len(checkpoints)} selected layer(s) carry a "
+        "checkpoint_id."
+    )
+
+
+def issues_dir_flag(args: argparse.Namespace) -> Optional[Path]:
+    """The ``--issues-dir`` this invocation was given, or ``None`` for the committed default.
+
+    ``None`` is not "no directory": it is "the flag was not given", and every stage then
+    reads and writes the committed ``plans/bugsinpy_issues`` exactly as before. A caller
+    that gives the flag gets a *required* directory — a report missing there is a refusal,
+    never a fall back to the default (§2.4).
+    """
+    raw = getattr(args, "issues_dir", None)
+    return None if raw is None else Path(raw)
+
+
+def prepare_issues_dir(args: argparse.Namespace) -> Path:
+    """The directory ``prepare`` freezes into and reads: ``--issues-dir``, else the default.
+
+    A held-out split passes ``--issues-dir plans/private/bugsinpy_issues`` (gitignored) so
+    its report text is frozen and verifiable without being published; the dev split omits
+    the flag and gets the committed ``plans/bugsinpy_issues`` byte-for-byte.
+    """
+    given = issues_dir_flag(args)
+    return (REPO_ROOT / issue_source.ISSUES_DIR) if given is None else given
+
+
+def prepare_one_bug(
+    *,
+    entry: Mapping[str, Any],
+    full: bool,
+    split: Split,
+    bugsinpy_root: Path,
+    repo_cache: Path,
+    batch_dir: Path,
+    deps_dir: Path,
+    issue_sources: Any,
+    n_ctx: int,
+    n_ctx_source: str,
+    vanta_bin: Path,
+    refreeze_keys: set[str],
+    missing_layers: set[str],
+    missing_provenance: set[str],
+    budget: budget_mod.Budget,
+    traceback_on: bool,
+) -> tuple[str, Any]:
+    """One bug's prepare, under the invocation's one budget (M3 item Y1).
+
+    [VANTA-WHY] M3 item AA4. This body lived inside ``cmd_prepare`` as the closure
+    ``prepare_bug``; the pipelined queue needs the very same work — a bug prepared
+    to a frozen record before its rows start — without a second copy of it, so it
+    is a function here and ``cmd_prepare`` and ``_queue_pipeline`` both call it.
+    It prints the same two progress lines the serial prepare always printed
+    (``[key] full ...`` and then ``ok``/``not runnable``/``FAILED``), so a pipeline
+    prints the same story a serial ``prepare`` does.
+
+    Returns ``("prep", BugPrep)`` or ``("broken", (key, detail))``; nothing is
+    raised, because one bug's failure must not take the batch down (§3.2).
+    """
+    key = bug_key(entry)
+    project = entry["project"]
+    print(f"[{key}] {'full' if full else 'context-only'} ...", flush=True)
+    checkpoint = entry["checkpoint"]
+    if full and checkpoint in missing_layers:
+        detail = (
+            f"PrepareError: checkpoint {checkpoint} does not exist. Bake it first "
+            "(design §11 step 3 for py3.8, §3.2 for the older interpreters)."
+        )
+        print(f"[{key}] FAILED — {detail}", flush=True)
+        return "broken", (key, detail)
+    if full and checkpoint in missing_provenance:
+        detail = (
+            f"BakeError: no dependency provenance for {checkpoint} under {deps_dir}. "
+            "Its dependencies could not be read at bake time; re-run bake for it."
+        )
+        print(f"[{key}] FAILED — {detail}", flush=True)
+        return "broken", (key, detail)
+    try:
+        url = meta_mod.project_github_url(bugsinpy_root, project)
+        if not url:
+            raise SplitError(f"no github_url for {project} in project.info")
+        repo = tree_cache(repo_cache, project, url)
+        prep = prepare_mod.prepare_one(
+            entry,
+            split=split,
+            bugsinpy_root=bugsinpy_root,
+            repo_cache=repo,
+            batch_dir=batch_dir,
+            deps_dir=deps_dir,
+            issue_sources=issue_sources,
+            full=full,
+            n_ctx=n_ctx,
+            n_ctx_source=n_ctx_source,
+            vanta_bin=vanta_bin,
+            refreeze=key in refreeze_keys,
+            budget=budget,
+        )
+    except Exception as exc:  # one bug must not take the batch down
+        detail = f"{type(exc).__name__}: {exc}"
+        print(f"[{key}] FAILED — {detail}", flush=True)
+        if traceback_on:
+            traceback.print_exc()
+        return "broken", (key, detail)
+    print(f"[{key}] {'ok' if prep.runnable else 'not runnable'}", flush=True)
+    return "prep", prep
+
+
 def cmd_prepare(args: argparse.Namespace) -> int:
+    # Item 19 / Q3 — the frozen configuration, resolved exactly as `run` resolves
+    # it and before anything else. `resolve` REFUSES the invocation when the
+    # caller's own environment contradicts a setting the file freezes to a
+    # literal, unless `--allow-override` waives it, and it returns the row block
+    # (`config_hash` and friends, written into `prepare.json` below) and the
+    # `[env]` settings to apply. prepare used to read `os.environ` alone for the
+    # context window (§1.6.1), so a shell that exported none of the frozen
+    # settings — the normal case — failed the gate even though the file freezes
+    # `VANTA_LLM_CONTEXT_TOKENS`: the gate sized against nothing while every child
+    # of the batch would have been handed the frozen window. Resolving here is
+    # what lets it size against the window the run will actually use.
+    frozen = frozen_mod.load()
+    config_block, frozen_env = frozen_mod.resolve(
+        frozen, environ=os.environ, allow_override=args.allow_override
+    )
+    print(
+        f"[config] {frozen.name} {frozen.sha256[:12]} ({config_block['config_path']})"
+        + (
+            "; --allow-override waives "
+            + ", ".join(config_block["config_overrides"])
+            if config_block["config_overrides"]
+            else ""
+        ),
+        flush=True,
+    )
+    # M3 items S1–S3 — `--no-cache` before the first suite of this stage.
+    honour_no_cache(args)
+    # Item B1 — the ONE effective environment, the caller's own with the frozen
+    # `[env]` settings applied exactly as `runner.vanta_env` will apply them to
+    # each child. The window the gate resolves below is read from it, so a clean
+    # shell sizes the gate against the frozen value rather than refusing.
+    invocation_env = effective_env(frozen_env)
     split_path: Path = args.split.resolve()
     split = load_split(split_path)
     if args.refreeze and args.measure_only:
@@ -257,8 +428,13 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     # source only (§1.6.1). This happens before the first checkout on purpose: with
     # the window unresolved the gate would size against the 65536 fallback and
     # reject bugs for a prompt no run would ever send, and it would do that after
-    # hours of suite runs rather than before them.
-    n_ctx, n_ctx_source = context_mod.explicit_context_window(n_ctx=args.n_ctx)
+    # hours of suite runs rather than before them. Read from the invocation's own
+    # environment (`invocation_env`, item Q3): the frozen `[env]` settings are what
+    # every child gets, so a shell that exported none of them still sizes the gate
+    # against the frozen window instead of refusing.
+    n_ctx, n_ctx_source = context_mod.explicit_context_window(
+        n_ctx=args.n_ctx, environ=invocation_env
+    )
     print(
         f"context window: n_ctx={n_ctx} (source: {n_ctx_source}) — the context gate "
         "is sized against this window",
@@ -295,14 +471,41 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     missing_provenance = set(
         bake_mod.missing_deps(deps_dir, [entry["checkpoint"] for entry in selected_full])
     )
+    # M3 item U3 — a layer baked before the identity existed has a provenance file and no
+    # ``checkpoint_id``, so the suite cache answers ``off:unknown_checkpoint`` for every
+    # suite of it and reuses nothing. `prepare` does NOT fix that for itself: silently
+    # stamping a layer is exactly how a layer that changed would keep an identity it no
+    # longer deserves (the stamp is refused by a boot-verify, and only `stamp-existing`
+    # performs one). It names the layers, the command, and — below, in the summary — the
+    # cache state, so the cache can never be off without the batch saying so.
+    selected_checkpoints = [entry["checkpoint"] for entry in selected_full]
+    unstamped = bake_mod.unstamped_deps(deps_dir, selected_checkpoints)
+    cache_state = cache_state_line(
+        checkpoints=selected_checkpoints, unstamped=unstamped
+    )
+    if unstamped and not suite_cache.cache_disabled():
+        print(
+            f"WARNING: the suite cache is OFF for {len(unstamped)} layer(s) with no "
+            f"checkpoint_id: {', '.join(unstamped)}.\n"
+            "  Every suite run of those layers is measured and never reused. Fix them "
+            "once, without re-baking any of them:\n"
+            "    python3 scripts/bugsinpy_run.py stamp-existing\n"
+            "  then re-run this prepare.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     batch_dir: Path = (args.batch or (RUNS_DIR / f"prepare-{utc_stamp()}")).resolve()
     batch_dir.mkdir(parents=True, exist_ok=True)
     repo_cache = RUNS_DIR / "repos"
-    # The frozen issue reports are committed (§2.4); the API cache is machine-local and
-    # stays under `runs/`, which `.gitignore` already ignores.
+    # The frozen issue reports live under the directory this invocation named: the
+    # committed `plans/bugsinpy_issues` by default (§2.4 — the dev bugs' reports are
+    # committed), or `--issues-dir` as given (a held-out run passes the gitignored
+    # `plans/private/bugsinpy_issues`, so its report text is frozen and verifiable
+    # without being published). The API cache is machine-local and stays under
+    # `runs/`, which `.gitignore` already ignores.
     issue_sources = prepare_mod.IssueSources(
-        issues_dir=REPO_ROOT / issue_source.ISSUES_DIR,
+        issues_dir=prepare_issues_dir(args),
         github_cache_dir=RUNS_DIR / "github-cache",
     )
 
@@ -310,56 +513,73 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     broken: list[tuple[str, str]] = []
     refreeze_keys = set(args.refreeze)
 
-    for entry, full in selected:
-        key = bug_key(entry)
-        project = entry["project"]
-        print(f"[{key}] {'full' if full else 'context-only'} ...", flush=True)
-        checkpoint = entry["checkpoint"]
-        if full and checkpoint in missing_layers:
-            detail = (
-                f"PrepareError: checkpoint {checkpoint} does not exist. Bake it first "
-                "(design §11 step 3 for py3.8, §3.2 for the older interpreters)."
-            )
-            broken.append((key, detail))
-            print(f"[{key}] FAILED — {detail}", flush=True)
-            continue
-        if full and checkpoint in missing_provenance:
-            detail = (
-                f"BakeError: no dependency provenance for {checkpoint} under {deps_dir}. "
-                "Its dependencies could not be read at bake time; re-run bake for it."
-            )
-            broken.append((key, detail))
-            print(f"[{key}] FAILED — {detail}", flush=True)
-            continue
-        try:
-            url = meta_mod.project_github_url(bugsinpy_root, project)
-            if not url:
-                raise SplitError(f"no github_url for {project} in project.info")
-            repo = tree_cache(repo_cache, project, url)
-            prep = prepare_mod.prepare_one(
-                entry,
-                split=split,
-                bugsinpy_root=bugsinpy_root,
-                repo_cache=repo,
-                batch_dir=batch_dir,
-                deps_dir=deps_dir,
-                issue_sources=issue_sources,
-                full=full,
-                n_ctx=n_ctx,
-                n_ctx_source=n_ctx_source,
-                vanta_bin=vanta_bin,
-                refreeze=key in refreeze_keys,
-            )
-        except Exception as exc:  # one bug must not take the batch down
-            detail = f"{type(exc).__name__}: {exc}"
-            broken.append((key, detail))
-            print(f"[{key}] FAILED — {detail}", flush=True)
-            if args.traceback:
-                traceback.print_exc()
-            continue
+    # [VANTA-WHY] M3 item S5 — the ONE scheduler of this invocation, created here and
+    # handed to every bug's suite runs. Default 1 keeps today's behaviour exactly
+    # (one suite run at a time); a higher `--prepare-jobs` lets a bug's independent
+    # derivations overlap, capped at host cores − 2 so the machine that owns the
+    # checkpoints and the batch directory keeps room. It is created per invocation
+    # rather than at import, so the recorded host load is this run's and no state
+    # survives from an earlier `prepare` in the same process.
+    budget = budget_mod.Budget(args.prepare_jobs, peak_vms=args.peak_vms)
+    print(
+        f"[scheduler] jobs={budget.jobs} concurrent={'yes' if budget.concurrent else 'no'} "
+        f"cores={budget.cores}/{budget.cap_cores} memory="
+        f"{'unbounded' if budget.cap_memory_mb is None else f'{budget.cap_memory_mb} MB'} "
+        f"host_load={budget.host_load}",
+        flush=True,
+    )
 
-        preps.append(prep)
-        print(f"[{key}] {'ok' if prep.runnable else 'not runnable'}", flush=True)
+    # [VANTA-WHY] M3 item Y1 — different bugs are independent, so every bug is
+    # submitted at once and the ONE budget decides how many overlap, exactly as it
+    # does for a bug's own derivations. Submitting them adds no concurrency the
+    # operator did not ask for: at `--prepare-jobs 1` the budget is a single core,
+    # so the gate admits one suite run at a time and a bug's second VM waits for the
+    # first's slot to free; the pool below is `max(1, budget.cores)` workers, which
+    # is one at that setting and therefore the same serial loop, in the same order,
+    # producing the same `preps` and `broken` — the worker's index decides a bug's
+    # place in both lists, never its completion order. This is what lets bug A's
+    # vanta run (which starts when A's oracle pair lands, its real dependency)
+    # overlap bug B's still-running derivations instead of waiting for the whole
+    # batch to reach A's turn.
+    slots: list[Optional[tuple[str, Any]]] = [None] * len(selected)
+
+    def prepare_bug(index: int, entry: Mapping[str, Any], full: bool) -> None:
+        """One bug's prepare, under the invocation's one budget (M3 item Y1)."""
+        slots[index] = prepare_one_bug(
+            entry=entry,
+            full=full,
+            split=split,
+            bugsinpy_root=bugsinpy_root,
+            repo_cache=repo_cache,
+            batch_dir=batch_dir,
+            deps_dir=deps_dir,
+            issue_sources=issue_sources,
+            n_ctx=n_ctx,
+            n_ctx_source=n_ctx_source,
+            vanta_bin=vanta_bin,
+            refreeze_keys=refreeze_keys,
+            missing_layers=missing_layers,
+            missing_provenance=missing_provenance,
+            budget=budget,
+            traceback_on=args.traceback,
+        )
+
+    with ThreadPoolExecutor(max_workers=max(1, budget.cores)) as pool:
+        futures = [
+            pool.submit(prepare_bug, index, entry, full)
+            for index, (entry, full) in enumerate(selected)
+        ]
+        for future in futures:
+            future.result()
+
+    for slot in slots:
+        if slot is None:
+            continue
+        kind, value = slot
+        if kind == "prep":
+            preps.append(value)
+        else:
+            broken.append(value)
 
     for prep in preps:
         if prep.issue is not None:
@@ -371,7 +591,9 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         batch_dir, preps, n_ctx=n_ctx, n_ctx_source=n_ctx_source
     )
 
-    summary = prepare_mod.render_summary(preps, n_ctx=n_ctx, n_ctx_source=n_ctx_source)
+    summary = prepare_mod.render_summary(
+        preps, n_ctx=n_ctx, n_ctx_source=n_ctx_source, cache_state=cache_state
+    )
     (batch_dir / "prepare_summary.md").write_text(summary, encoding="utf-8")
     # The split is an input, never an output: how many bugs this run measured, and
     # which of them it rejected, belongs in the batch's own artifacts. Rehashing the
@@ -389,6 +611,8 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         preps=preps,
         n_ctx=n_ctx,
         n_ctx_source=n_ctx_source,
+        config_block=config_block,
+        scheduler=budget.record(),
     )
     (batch_dir / "prepare.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
@@ -451,10 +675,11 @@ def cmd_bake(args: argparse.Namespace) -> int:
     ``--preflight-only`` stops after it, and does not need ``--yes`` — the preflight
     builds nothing, and the pins it classifies are the same ones either way.
 
-    Every layer the build attempts leaves its whole output in
-    ``runs/bugsinpy/bake-logs/<layer>.log`` (emptied at the start of each bake), and
-    each failed layer's one-line entry in the failure report names its own error and
-    points at that file.
+    Every layer the build attempts leaves its whole output in this run's own
+    ``runs/bugsinpy/bake-logs/<UTC stamp>/<layer>.log`` (:func:`bake.bake_logs_dir`),
+    which is never emptied — an earlier bake's logs, the failed ones especially, stay
+    readable — and each failed layer's one-line entry in the failure report names its
+    own error and points at that file.
     """
     split = load_split(args.split.resolve())
     pythons = parse_pythons(args.pythons, split)
@@ -618,11 +843,11 @@ def cmd_bake(args: argparse.Namespace) -> int:
     for action in actions:
         print(f"  {action.describe()}", flush=True)
 
-    # Every layer's whole build log is written here by run_bake_actions, and the
-    # directory is emptied first, so what it holds is always this bake's logs and a
-    # layer that failed can be read in full rather than through the one error line the
-    # summary prints.
-    logs_dir = RUNS_DIR / "bake-logs"
+    # Every layer's whole build log is written here by run_bake_actions. This run gets
+    # its own timestamped folder (bake.bake_logs_dir) and nothing in it is ever deleted,
+    # so a layer that failed can be read in full and an earlier bake's logs — the failed
+    # ones especially — are never wiped by this one.
+    logs_dir = bake_mod.bake_logs_dir(RUNS_DIR)
     # §3.2's own-pin gate needs to know which pins are BugsInPy's own for the layer
     # being built, and to write back what the layer's own ``pip check`` found. Both are
     # per checkpoint and both come from the provenance this run just wrote.
@@ -661,6 +886,22 @@ def cmd_bake(args: argparse.Namespace) -> int:
         )
         for item in bug_deps
     }
+    # §8.6 R2(ii)'s two callables. The retry is asked once about a per-bug layer whose
+    # build *failed*, with that layer's own merged output, and answers a second recipe
+    # only when the failure names pins this rule may drop — a log that names none (R1's
+    # ``setup.py egg_info`` crash), a pin §8.6's safeguard protects and a pin the graded
+    # tests reach all answer None and leave the ordinary failure path alone. The material
+    # it needs came through resolve_bug_deps on each BugDeps, so the closure and the
+    # safeguard are the same two this layer was resolved with and not a second opinion.
+    # record_drops writes what it dropped, and why, into that layer's own provenance.
+    deps_by_checkpoint = {item.checkpoint: item for item in bug_deps}
+
+    def retry_layers(name: str, built: bake_mod.ExecResult) -> Optional[bake_mod.RetryPlan]:
+        item = deps_by_checkpoint.get(name)
+        if item is None:
+            return None
+        return bake_mod.retry_plan(item, built.stdout + built.stderr)
+
     try:
         summary = bake_mod.run_bake_actions(
             actions,
@@ -682,6 +923,8 @@ def cmd_bake(args: argparse.Namespace) -> int:
             provided=provided,
             dropped=dropped,
             tree_provided=tree_provided,
+            retry=retry_layers,
+            record_drops=lambda name, plan: bake_mod.record_retry(deps_dir, name, plan),
         )
     except BaseException:
         report_flagged()
@@ -690,6 +933,139 @@ def cmd_bake(args: argparse.Namespace) -> int:
     report_flagged()
     print("bake complete", flush=True)
     return EXIT_BUG_FAILED if flagged else EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# stamp-existing — an identity for the layers baked before U3 (M3 item U3)
+# ---------------------------------------------------------------------------
+def render_stamp_table(outcomes: Sequence[bake_mod.StampOutcome]) -> str:
+    """One line per deps file: what it is, its identity, and what the boot said.
+
+    [VANTA-WHY] M3 item U3 — the digest is printed beside the identity so the reader can
+    check the invariant by hand (``checkpoint_id == sha256("<baked_at>\\x00<digest>")``),
+    and the two are truncated because they are the same 64 hex characters in every row
+    and the full values are in the files. ``baked`` versus ``stamped`` is the column that
+    says whether a layer's identity came from a bake or from this command, which is the
+    only way to tell a layer this step touched from one it skipped.
+
+    ``interpreter`` and ``python`` are what the verify actually queried, read back from
+    the boot rather than assumed: the pre-registration records *what was checked*, and a
+    row that showed only "ok" would not say through which environment.
+    """
+    lines = [
+        "| project | checkpoint | checkpoint id | digest | baked/stamped | "
+        "interpreter | python | verify |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for outcome in outcomes:
+        lines.append(
+            "| {project} | {checkpoint} | {cid} | {digest} | {origin} | {interp} | "
+            "{pyver} | {verify} |".format(
+                project=outcome.project or "—",
+                checkpoint=outcome.checkpoint,
+                cid=(outcome.checkpoint_id[:12] + "…")
+                if outcome.checkpoint_id
+                else "—",
+                digest=(outcome.digest[:12] + "…") if outcome.digest else "—",
+                origin=outcome.origin,
+                interp=outcome.interpreter or "—",
+                pyver=outcome.python_version or "—",
+                verify=outcome.verify or "—",
+            )
+        )
+    return "\n".join(lines)
+
+
+def layer_interpreters() -> dict[str, str]:
+    """``{project: test_cmd[0]}`` over both splits — the interpreter each suite runs.
+
+    [VANTA-WHY] ``stamp-existing`` verifies a layer by asking the interpreter *inside it*
+    what it can see installed, and the only answer that means anything is the one from the
+    interpreter ``test_cmd[0]`` names — the one ``suite.run_suite_twice`` runs. Every
+    project names bare ``python`` today, so this map only ever confirms the default; it
+    exists so that a split which later names another interpreter makes this command
+    *refuse* that layer rather than verify a different environment and stamp the layer on
+    that basis. A project in neither split maps to nothing, and a layer of it is refused
+    for the same reason: the interpreter is not knowable, so it is not guessed.
+    """
+    interpreters: dict[str, str] = {}
+    for path in (DEV_SPLIT, DEFAULT_SPLIT):
+        if not path.is_file():
+            continue
+        split = load_split(path)
+        for entry in split.bugs:
+            test_cmd = entry.get("test_cmd") or []
+            if test_cmd:
+                interpreters[str(entry["project"])] = str(test_cmd[0])
+    return interpreters
+
+
+def cmd_stamp_existing(args: argparse.Namespace) -> int:
+    """Give every layer baked before M3 item U3 an identity, without re-baking it.
+
+    The layers this fixes were baked before the stamp existed, so their provenance has no
+    ``checkpoint_id`` and the suite cache reads ``off:unknown_checkpoint`` for each of
+    them: every suite is measured and nothing is reused. Each layer is booted once,
+    read-only, and asked — through the same interpreter its suite runs
+    (:func:`layer_interpreters`) — what it can see installed; that listing is compared
+    against the pins its provenance records. A layer that no longer matches is *left
+    unstamped* and reported, not re-baked and not stopped for, so ``prepare`` keeps
+    warning about it and its cache stays off. A layer whose checkpoint is simply gone is
+    reported ``missing`` and is not a failure: there is nothing to act on. ``prepare``
+    never does this for itself, on purpose: a stamp is an identity, and handing one to a
+    layer that changed is the failure the boot-verify exists to refuse.
+
+    A boot-verify that could not *read* the environment — no interpreter, a listing that
+    failed or came back empty — refuses the layer with :data:`bake_mod.ENV_UNREADABLE`
+    rather than reporting a mismatch, because an unread layer is a probe problem and a
+    mismatch is a layer problem, and they want different responses.
+
+    Writes exactly where ``bake.write_deps`` writes, in the same shape, so a layer's
+    identity is fixed from here on. A later re-bake of the same layer still gets a fresh
+    identity, because a bake never records the ``stamped_existing`` marker this step does.
+    """
+    deps_dir: Path = RUNS_DIR / "deps"
+    if not deps_dir.is_dir():
+        raise bake_mod.BakeError(
+            f"no dependency provenance directory at {deps_dir}: nothing has been baked "
+            "here, so there is no layer to stamp."
+        )
+    print(f"stamp-existing: {deps_dir}", flush=True)
+    outcomes = bake_mod.stamp_existing(deps_dir, interpreters=layer_interpreters())
+    if not outcomes:
+        print("no deps files found — nothing to stamp.", flush=True)
+        return EXIT_OK
+    print(render_stamp_table(outcomes), flush=True)
+    stamped = [o for o in outcomes if o.action == "stamped"]
+    already = [o for o in outcomes if o.action == "already"]
+    refused = [o for o in outcomes if o.action == "refused"]
+    missing = [o for o in outcomes if o.action == "missing"]
+    skipped = [o for o in outcomes if o.action == "not a layer's provenance"]
+    print(
+        f"\nstamped {len(stamped)}, already {len(already)}, missing {len(missing)}, "
+        f"refused {len(refused)}, not a layer {len(skipped)}",
+        flush=True,
+    )
+    if refused:
+        print(
+            "\nrefused layers were left exactly as they were, so `prepare` keeps warning "
+            "about them and their cache stays off. Re-bake them (their environment no "
+            "longer matches its record) or investigate the difference above.",
+            file=sys.stderr,
+            flush=True,
+        )
+    if missing:
+        print(
+            "missing layers have a provenance record but no checkpoint: there is nothing "
+            "to stamp, and no cache entry to key.",
+            flush=True,
+        )
+    if stamped:
+        print(
+            "the suite cache can now key every stamped layer; re-run `prepare`.",
+            flush=True,
+        )
+    return EXIT_BUG_FAILED if refused else EXIT_OK
 
 
 def tree_cache(repo_cache: Path, project: str, url: str) -> Path:
@@ -800,6 +1176,133 @@ def max_spend_usd_from_env(env: Mapping[str, str]) -> Optional[float]:
     return cap
 
 
+def pause_spend_usd_from_env(env: Mapping[str, str]) -> Optional[float]:
+    """Phase 3 — ``VANTA_PAUSE_SPEND_USD``: the batch's pause, or ``None`` for none.
+
+    The pause is the cap's sibling one step earlier: a second, **harness-only**
+    threshold *below* ``VANTA_MAX_SPEND_USD`` at which the queue stops claiming
+    rows and writes STOP, so a run can be inspected before it is allowed to spend
+    the rest of its budget. It is read here for the same reason the cap is — it
+    belongs to the *invocation*, not to ``run_batch``, so a test that drives the
+    batch loop is not paused by whatever the developer exported.
+
+    This is deliberately **not** a frozen ``[env]`` key (§14.29's cap is), and it
+    is **not** a behavioural parameter: it changes nothing about any row, only
+    whether the next one is claimed, so it carries no ``config_hash``. Unset or
+    empty means no pause, which is how every batch before Phase 3 ran. A value
+    that is not a positive number is refused rather than ignored, exactly as the
+    cap is — a typo in a safety net must not quietly remove the net.
+    """
+    raw = (env.get("VANTA_PAUSE_SPEND_USD") or "").strip()
+    if not raw:
+        return None
+    try:
+        pause = float(raw)
+    except ValueError:
+        raise runner_mod.RunnerError(
+            f"VANTA_PAUSE_SPEND_USD='{raw}' is not a number; unset it for no pause."
+        )
+    if not pause > 0:
+        raise runner_mod.RunnerError(
+            f"VANTA_PAUSE_SPEND_USD='{raw}' must be > 0; unset it for no pause."
+        )
+    return pause
+
+
+def row_budget(
+    args: argparse.Namespace, env: Mapping[str, str], *, flag: str
+) -> budget_mod.Budget:
+    """M3 item S6 — the ONE scheduler of a ``run``/``queue`` invocation.
+
+    [VANTA-WHY] §14.33's closing rule: "``Default stays 1``, and ``1`` must be
+    byte-identical to today". So a ``--jobs 1`` budget is created but never
+    advertises itself — no ``[scheduler]`` line and, because
+    :func:`runner.run_batch` guards its row block on ``budget.concurrent``, no
+    ``scheduler`` key on any row. A serial batch is therefore the batch it was
+    before this item, and the pool is a path ``--jobs 1`` does not enter rather
+    than one that degenerates to serial.
+
+    Above one, the backend gate is §14.33's second rule: parallel rows all call
+    the same provider, so only the hosted backend may run them — every other
+    backend is a local model that would be oversubscribed by its own concurrency.
+    The check is on the *requested* jobs, before the host's core cap, so a
+    smaller machine refuses ``--jobs 4`` for the same reason a large one does.
+    """
+    jobs = int(args.jobs)
+    if jobs < 1:
+        raise runner_mod.RunnerError(f"{flag} must be at least 1, not {jobs}.")
+    if jobs > 1:
+        backend = (env.get("VANTA_LLM_BACKEND") or "").strip()
+        if backend.lower() != "openai":
+            raise runner_mod.RunnerError(
+                f"{flag}={jobs} needs VANTA_LLM_BACKEND=openai: concurrent rows all "
+                "call the same provider (§14.33), and every other backend is a local "
+                "model that this concurrency would oversubscribe. "
+                f"VANTA_LLM_BACKEND={backend or '(unset)'}."
+            )
+    budget = budget_mod.Budget(jobs, peak_vms=args.peak_vms)
+    if budget.concurrent:
+        print(
+            f"[scheduler] jobs={budget.jobs} concurrent=yes "
+            f"cores={budget.cores}/{budget.cap_cores} memory="
+            f"{'unbounded' if budget.cap_memory_mb is None else f'{budget.cap_memory_mb} MB'} "
+            f"peak_vms={budget.peak_vms} host_load={budget.host_load}",
+            flush=True,
+        )
+    return budget
+
+
+def _start_host_sampler(
+    batch_dir: Path, budget: budget_mod.Budget
+) -> Optional[budget_mod.HostSampler]:
+    """M3 item S6 — sample the host only when rows will actually overlap.
+
+    A serial batch gains neither the file nor the thread: §14.33's ``--jobs 1``
+    must be byte-identical to today, and a sampler that ran would write a new
+    artifact into a batch directory that is supposed to be unchanged.
+    """
+    if not budget.concurrent:
+        return None
+    return budget_mod.HostSampler(batch_dir / budget_mod.HOST_SAMPLES_NAME).start()
+
+
+def _stop_host_sampler(sampler: Optional[budget_mod.HostSampler]) -> Optional[dict]:
+    """Stop the sampler and return its summary, or ``None`` when there was none."""
+    if sampler is None:
+        return None
+    sampler.stop()
+    return sampler.record()
+
+
+def honour_no_cache(args: argparse.Namespace) -> None:
+    """``--no-cache`` — force a fresh suite run, in BOTH processes of the stage.
+
+    [VANTA-WHY] M3 items S1–S3. A suite is run by two processes and each looks for
+    the cache by the same environment variable: the harness process itself (item
+    S3's ``prepare`` gate and item S2's ``oracle.grade``, both in-process, reading
+    ``suite_cache.cache_disabled()``) and the ``vanta_m3`` child it spawns (item
+    S1's in-session native gate, reading ``suite_cache.rs``'s ``DISABLE_ENV``).
+    Setting it once here covers both, because ``runner.vanta_env`` builds the
+    child's environment from ``os.environ`` and only ever ADDS keys — and the
+    frozen ``[env]`` does not name this one, so nothing overrides it.
+
+    Called AFTER ``frozen_config.resolve``: that function refuses an invocation
+    whose environment contradicts ``configs/v1-m3.toml``, and it reads
+    ``os.environ``. A flag-set variable the file does not freeze is not a
+    contradiction, but resolving first keeps this function from ever being the
+    reason a refusal fires.
+
+    The flag does not HIDE the cache: ``suite_cache.read_entry`` is still
+    consulted so the row can record that the entry would have hit
+    (``off:no_cache``, with ``would_hit`` in the row's own ``cache`` list), and
+    the fresh payload then replaces the entry it could not use (M3 item U2) —
+    unless the fresh run measured nothing, which `run_state` refuses on both
+    sides. That is what makes the cache verifiable on demand.
+    """
+    if getattr(args, "no_cache", False):
+        os.environ[suite_cache.DISABLE_ENV] = "1"
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Run a prepared batch: repairs first, then both reviews, one job at a time.
 
@@ -829,6 +1332,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         ),
         flush=True,
     )
+    # M3 items S1–S3 — `--no-cache` before the first job of this stage.
+    honour_no_cache(args)
     # Item B1 — the ONE effective environment: the caller's own, with the frozen
     # `[env]` settings applied exactly as `runner.vanta_env` will apply them to
     # each child. Every read this invocation makes about its OWN configuration
@@ -852,10 +1357,22 @@ def cmd_run(args: argparse.Namespace) -> int:
     batch = runner_mod.load_prepared(
         batch_dir=batch_dir, split=split, bugsinpy_root=bugsinpy_root
     )
+    # Item T3 — the preparation resolved the frozen configuration too and recorded it
+    # in `prepare.json`; a run that contradicts it is a contradiction only
+    # `--allow-override` waives, checked here so the refusal lands before the first
+    # job rather than mid-wave. `--plan` runs the same check: the schedule a plan
+    # prints would be a schedule for a batch nobody is allowed to run.
+    config_mismatch = runner_mod.prepared_config_mismatch(batch.config_block, config_block)
+    if config_mismatch and not args.allow_override:
+        raise runner_mod.RunnerError(config_mismatch)
     # Before anything runs, and before --plan prints: a run whose window differs
     # from the one prepare sized against is measuring a different prompt than the
-    # batch's verdicts describe (§1.6.1), and the cheap moment to notice is now.
-    window_warning = runner_mod.context_window_warning(batch)
+    # batch's verdicts describe (§1.6.1), and the cheap moment to notice is now. The
+    # comparison reads the same effective environment every child inherits (item T5),
+    # so a setting frozen in the file but not exported is not read as a divergence.
+    window_warning = runner_mod.context_window_warning(
+        batch, environ=invocation_env
+    )
     if window_warning:
         print(f"WARNING: {window_warning}", file=sys.stderr, flush=True)
     waves = parse_waves(args.waves)
@@ -881,6 +1398,24 @@ def cmd_run(args: argparse.Namespace) -> int:
             "the first job that would start once its rows' cost has reached this.",
             flush=True,
         )
+    # Phase 3 — the harness-only pause, a second threshold below the cap. Read and
+    # announced beside the cap; it stops the batch the same way, at STOP, so the
+    # resume is "delete STOP and re-run". Not in the frozen configuration, so it
+    # carries no config_hash and changes nothing about any row.
+    pause_usd = pause_spend_usd_from_env(invocation_env)
+    if pause_usd is not None:
+        print(
+            f"[spend] VANTA_PAUSE_SPEND_USD=${pause_usd:g}: the batch writes STOP and "
+            "stops before the first job that would start once its rows' cost has "
+            "reached this (delete STOP and re-run to continue).",
+            flush=True,
+        )
+
+    # M3 item S6 — the ONE scheduler of this run. `--jobs 1` returns quietly and
+    # changes nothing; above one it is announced here, before the first VM. The
+    # host sampler rides along only for a run that will actually overlap rows.
+    budget = row_budget(args, invocation_env, flag="--jobs")
+    sampler = None if args.plan else _start_host_sampler(batch_dir, budget)
 
     code, results = runner_mod.run_batch(
         batch_dir=batch_dir,
@@ -894,28 +1429,43 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_attempts=args.max_attempts,
         fixed_rounds=args.fixed_rounds,
         fixed_rounds_declaration=frozen.fixed_rounds(),
+        attempts_declaration=frozen.attempts(),
         disk_mb=args.disk_mb,
         show_hints=args.show_hints,
+        # The `--issues-dir` this invocation named, or `None` for the committed
+        # default. `run_batch` refuses the batch, by name, when a report it may read
+        # is missing there — never a fall back and never a live re-fetch (§2.4).
+        issues_dir=issues_dir_flag(args),
         plan_only=args.plan,
         max_spend_usd=max_spend_usd,
+        pause_usd=pause_usd,
         # Item 14's per-row half. `--plan` returns from `run_batch` before the loop,
         # so passing the probe unconditionally cannot make a plan need an endpoint.
         # Bound to the effective environment (item B1) so the per-row probe asks the
         # same endpoint the children will use.
         preflight=partial(runner_mod.model_endpoint_preflight, env=invocation_env),
         # Item 19 — the frozen configuration resolved above: the block lands on every
-        # row, the environment on every child.
+        # row, the environment on every child. Item T3 — the preparation's own block
+        # rides along so each row states both configurations.
         config_block=config_block,
+        prep_config_block=batch.config_block,
         frozen_env=frozen_env,
+        budget=budget,
     )
     if args.plan:
         return EXIT_OK
+
+    # M3 item S6 — stop sampling before the report is derived, so the batch's own
+    # host samples are complete and consistent with the rows.
+    host_samples = _stop_host_sampler(sampler)
 
     # The report is derived from the manifest on disk, not from this invocation's
     # return value: a resumed run must summarise the whole batch, not the tail of it.
     records = manifest_mod.Manifest(batch_dir).effective_records()
     if records:
-        labels_path, payload = runner_mod.write_batch_report(batch_dir, records)
+        labels_path, payload = runner_mod.write_batch_report(
+            batch_dir, records, host_samples=host_samples
+        )
         print()
         print(runner_mod.render_digest(payload))
         print()
@@ -934,15 +1484,24 @@ def cmd_run(args: argparse.Namespace) -> int:
     return code
 
 
-def _parse_arms(raw: str) -> Optional[list[str]]:
+def _parse_arms(raw: Union[str, Sequence[str]]) -> Optional[list[str]]:
     """``--arms`` as a spelling list, or ``None`` for the split's own arms.
 
     Empty means "not given", which is the whole protocol — the same default the
     ``run`` command has, so a queue with no ``--arms`` runs every arm.
+
+    [VANTA-WHY] M3 item G — the flag is ``action="append"``, so a repeated
+    ``--arms b1-k4 --arms b3-k4`` accumulates rather than silently keeping only
+    the last value (which is how the scheduled ``b1-k4`` arm was dropped from a
+    smoke run). Every element may itself be comma- or space-separated, so the
+    older ``--arms a,b`` spelling keeps working.
     """
-    if not raw.strip():
-        return None
-    return [part for part in raw.replace(",", " ").split() if part]
+    if isinstance(raw, str):
+        raw = [raw]
+    spellings: list[str] = []
+    for chunk in raw:
+        spellings.extend(part for part in chunk.replace(",", " ").split() if part)
+    return spellings or None
 
 
 def _parse_seeds(raw: str) -> Optional[list[int]]:
@@ -953,6 +1512,615 @@ def _parse_seeds(raw: str) -> Optional[list[int]]:
         return [int(part) for part in raw.replace(",", " ").split()]
     except ValueError as exc:
         raise SplitError(f"--seeds must be comma-separated integers, got {raw!r}") from exc
+
+
+def _render_pipeline_schedule(
+    batch_id: str,
+    selected: Sequence[tuple[dict[str, Any], bool]],
+    spellings: Sequence[str],
+    seeds: Sequence[int],
+    waves: Sequence[int],
+) -> str:
+    """The pipeline's plan: ``_render_schedule``'s table, read from the split.
+
+    [VANTA-WHY] M3 item AA4 — ``runner._render_schedule`` prints this table from
+    ``BugPrep`` objects, and in a pipeline none exist when the table is printed:
+    the bugs it introduces are prepared by the very run that follows. The split
+    names them already, and the row arithmetic is the same floor the queue's own
+    renderer uses, so the table is the same table.
+    """
+    phases = arms_mod.phases_for(spellings)
+    repairs = sum(1 for mode, _ in phases if mode == arms_mod.REPAIR)
+    reviews = sum(1 for mode, _ in phases if mode == arms_mod.REVIEW)
+    lines = [
+        f"batch {batch_id} (pipelined: prepare then run, per bug)",
+        f"order: {' → '.join(f'{mode} {written}' for mode, written in phases)}",
+        "",
+        "| wave | bug | checkpoint | py (pinned) | repair rows | review rows (floor) |",
+        "|---|---|---|---|---|---|",
+    ]
+    total = 0
+    for wave in waves:
+        for entry, _full in selected:
+            if int(entry["wave"]) != wave:
+                continue
+            repair = repairs * len(seeds)
+            review = reviews * 2 * len(seeds)
+            total += repair + review
+            lines.append(
+                f"| {wave} | {bug_key(entry)} | {entry['checkpoint']} | "
+                f"{entry['python_version']} | {repair} | {review} |"
+            )
+    lines += [
+        "",
+        f"{total} rows if no bug yields a pooled failed patch; "
+        f"up to {total * 2} if every bug yields two (§7.1).",
+    ]
+    return "\n".join(lines)
+
+
+def _queue_pipeline(
+    args: argparse.Namespace,
+    *,
+    split: Split,
+    config_block: dict[str, Any],
+    frozen_env: Mapping[str, str],
+    invocation_env: Mapping[str, str],
+    fixed_rounds_declaration: Optional[Mapping[str, int]],
+    attempts_declaration: Optional[Mapping[str, int]],
+) -> int:
+    """M3 item AA4 — ``queue --pipeline``: prepare each bug, then start its rows.
+
+    [VANTA-WHY] The serial shape is ``prepare`` for the whole split, then ``queue``.
+    A bug's rows therefore wait for every other bug's prepare, however long the
+    last one takes, even though a bug's rows depend on nothing but that bug's own
+    prepare and its predecessors inside its own wave (D13, §7.1). This command runs
+    the two stages as one: within a wave, every selected bug's prepare is submitted
+    at once, and the moment one bug's prepare is final and frozen its rows are
+    submitted — while the other bugs are still preparing. Waves stay sequential,
+    because §8.1's gate is a statement about the earlier stages of the same batch.
+
+    What does NOT change, deliberately:
+      * ONE ``Budget`` governs every suite run AND every row (S5 + S6 + Y1). The
+        budget's size is ``max(--prepare-jobs, --jobs)``; the prepare pool is
+        ``--prepare-jobs`` wide and the row pool ``--jobs`` wide, so each flag keeps
+        its own meaning while the memory/core gate is a single object.
+      * ONE ``SpendGate`` for the whole batch (G1), created here exactly as
+        ``_run_queue`` creates it.
+      * Each bug's rows are run by ``runner._run_task`` — literally the queue's own
+        per-bug unit — so a row is the row the queue would have written, D13 order
+        included, and admission is unchanged.
+      * The batch-level prepare record is the one ``cmd_prepare`` writes: the same
+        ``prepare.json``/``prepare_summary.md``/``context_report.json``/
+        ``signals.md``/``issue_texts_all.md``, from the same preps and broken list,
+        written once every wave is done (a pipeline's prepare.json can only be
+        complete at the end: later waves have not been prepared yet). Its
+        ``scheduler`` block describes the whole pipeline invocation, which is what
+        it is the record of.
+      * ``--only``/``--waves``/``--reserves``/``--measure-only``/``--refreeze``
+        select bugs exactly as they do in ``prepare``.
+
+    One thing the caller CAN change: ``--seed-major`` (Phase 3). With it a wave's rows
+    are claimed one seed at a time — every bug's seed 0, then every bug's seed 1, … —
+    which requires the whole wave to be prepared before the first row is claimed, so
+    the per-bug pipelining of the ROW stage gives way to a seed column at a time. The
+    prepare stage is unchanged (every bug of the wave is prepared at once) and the
+    rows written are still one per ``(bug, seed)``; only the claim order moves.
+    """
+    # The same two refusals `prepare` makes, in `prepare`'s own order and for the
+    # same reasons: the flags are prepare flags and `--pipeline` runs the prepare.
+    if args.refreeze and args.measure_only:
+        raise SplitError(
+            "--refreeze rewrites a frozen issue report, and --measure-only freezes nothing: "
+            "a measure-only pass reads the file a full prepare wrote. The re-fetch and the "
+            "rewrite have to run with suites (§2.4.3), so drop --measure-only."
+        )
+    selected = select(
+        split,
+        only=args.only,
+        waves=parse_waves(args.waves),
+        reserves=args.reserves,
+        measure_only=args.measure_only,
+        refreeze=args.refreeze,
+    )
+    if not selected:
+        raise SplitError("the selection is empty")
+    # `--plan` decides the selection and stops, exactly where `prepare --plan` stops:
+    # before the clone, the context window and the binary. A plan that needed the
+    # network or a build to print would be a plan of a different command.
+    if args.plan:
+        sys.stdout.write(render_plan(selected))
+        return EXIT_OK
+
+    bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
+    commit = meta_mod.ensure_clone(bugsinpy_root, commit=split.bugsinpy_commit)
+    if commit != split.bugsinpy_commit:
+        raise SplitError(
+            f"BugsInPy is at {commit}, the split pins {split.bugsinpy_commit}. "
+            "Refusing to derive ground truth from metadata that moved."
+        )
+    n_ctx, n_ctx_source = context_mod.explicit_context_window(
+        n_ctx=args.n_ctx, environ=invocation_env
+    )
+    print(
+        f"context window: n_ctx={n_ctx} (source: {n_ctx_source}) — the context gate "
+        "is sized against this window",
+        flush=True,
+    )
+    # `prepare` refuses a stale binary (the gate shells out to it), and a pipeline
+    # IS a prepare, so it refuses for the same reason here.
+    vanta_bin = runner_mod.require_vanta_bin(args.vanta_bin.resolve())
+    stale_warning = runner_mod.stale_binary_warning(vanta_bin)
+    if stale_warning:
+        raise runner_mod.RunnerError(
+            f"{stale_warning} `prepare` cannot size the context gate against it: the "
+            "gate shells out to this binary, so every verdict it writes would describe "
+            "a Vanta the batch will not run."
+        )
+
+    selected_full = [entry for entry, full in selected if full]
+    missing_layers = set(
+        prepare_mod.missing_checkpoints([entry["checkpoint"] for entry in selected_full])
+    )
+    deps_dir = RUNS_DIR / "deps"
+    missing_provenance = set(
+        bake_mod.missing_deps(deps_dir, [entry["checkpoint"] for entry in selected_full])
+    )
+    selected_checkpoints = [entry["checkpoint"] for entry in selected_full]
+    unstamped = bake_mod.unstamped_deps(deps_dir, selected_checkpoints)
+    cache_state = cache_state_line(
+        checkpoints=selected_checkpoints, unstamped=unstamped
+    )
+    if unstamped and not suite_cache.cache_disabled():
+        print(
+            f"WARNING: the suite cache is OFF for {len(unstamped)} layer(s) with no "
+            f"checkpoint_id: {', '.join(unstamped)}.\n"
+            "  Every suite run of those layers is measured and never reused. Fix them "
+            "once, without re-baking any of them:\n"
+            "    python3 scripts/bugsinpy_run.py stamp-existing\n"
+            "  then re-run this prepare.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    repo_cache = RUNS_DIR / "repos"
+    # The pipelined prepare freezes into (and reads from) the directory the invocation
+    # named — `--issues-dir`, or the committed default — exactly as `prepare` does.
+    issue_sources = prepare_mod.IssueSources(
+        issues_dir=prepare_issues_dir(args),
+        github_cache_dir=RUNS_DIR / "github-cache",
+    )
+
+    # §14.33's backend gate for `--jobs`, same sentence `row_budget` uses: the
+    # pipeline creates its own one Budget (S5 + S6), so it makes the check itself.
+    if args.jobs > 1:
+        backend = (invocation_env.get("VANTA_LLM_BACKEND") or "").strip()
+        if backend.lower() != "openai":
+            raise runner_mod.RunnerError(
+                f"--jobs={args.jobs} needs VANTA_LLM_BACKEND=openai: concurrent rows all "
+                "call the same provider (§14.33), and every other backend is a local "
+                "model that this concurrency would oversubscribe. "
+                f"VANTA_LLM_BACKEND={backend or '(unset)'}."
+            )
+    # The ONE scheduler of the whole invocation: a bug's suite runs and every row
+    # charge come out of this one object. Its size is the wider of the two flags,
+    # because each pool is capped by its own flag below while the resources are
+    # gated here.
+    budget = budget_mod.Budget(
+        max(args.prepare_jobs, args.jobs), peak_vms=args.peak_vms
+    )
+    print(
+        f"[scheduler] jobs={budget.jobs} concurrent={'yes' if budget.concurrent else 'no'} "
+        f"cores={budget.cores}/{budget.cap_cores} memory="
+        f"{'unbounded' if budget.cap_memory_mb is None else f'{budget.cap_memory_mb} MB'} "
+        f"host_load={budget.host_load}",
+        flush=True,
+    )
+
+    seeds = _parse_seeds(args.seeds) or split.seeds
+    # Phase 3 — `--seed-major` applies to the pipeline too. With it a wave's rows are
+    # claimed one seed at a time (every bug's seed 0, then every bug's seed 1, …) so a
+    # pause leaves a whole seed column done; without it each bug's rows start the
+    # moment its own prepare finishes, which is the point of `--pipeline`. Read here
+    # rather than dropped, so `--pipeline` and `--seed-major` never silently disagree.
+    seed_major = bool(args.seed_major)
+    arm_spellings = _parse_arms(args.arms)
+    max_spend_usd = max_spend_usd_from_env(invocation_env)
+    if max_spend_usd is not None:
+        print(
+            f"[spend] VANTA_MAX_SPEND_USD=${max_spend_usd:g}: the queue stops claiming "
+            "once its rows' cost has reached this.",
+            flush=True,
+        )
+    # Phase 3 — the harness-only pause, a second threshold below the cap: at it the
+    # queue writes STOP and stops claiming, and re-running after deleting STOP
+    # continues. Read from the effective environment like the cap, so a phase-3
+    # batch can set it in the invocation rather than in the frozen file.
+    pause_usd = pause_spend_usd_from_env(invocation_env)
+    if pause_usd is not None:
+        print(
+            f"[spend] VANTA_PAUSE_SPEND_USD=${pause_usd:g}: the queue writes STOP and "
+            "stops claiming once its rows' cost has reached this (delete STOP and "
+            "re-run to continue).",
+            flush=True,
+        )
+    # The queue's own refusals, made once here instead of once per bug — the same
+    # five `_run_queue` makes before it prints the schedule.
+    spellings = runner_mod._select_arms(split, arm_spellings)
+    runner_mod._require_arm_list(spellings)
+    runner_mod._require_arm_budget(spellings, args.max_attempts)
+    runner_mod._require_fixed_rounds(
+        spellings, args.fixed_rounds, fixed_rounds_declaration
+    )
+    runner_mod._require_attempts(spellings, args.max_attempts, attempts_declaration)
+    runner_mod._require_seeds(split, seeds)
+
+    entries = {bug_key(entry): entry for entry in split.bugs}
+    waves = parse_waves(args.waves) or sorted(
+        {int(entry["wave"]) for entry, _full in selected}
+    )
+    stop_file = runner_mod.queue_stop_path(batch_dir)
+    manifest = manifest_mod.Manifest(batch_dir)
+    spend_gate = (
+        runner_mod.SpendGate(batch_dir, max_spend_usd, manifest)
+        if max_spend_usd is not None
+        else None
+    )
+    # `runner._run_task`'s own keyword set, built once: every bug of every wave is
+    # run through the queue's per-bug unit, so a row is exactly the row a `queue`
+    # would have written.
+    run_kwargs: dict[str, Any] = dict(
+        batch_dir=batch_dir,
+        batch_id=batch_dir.name,
+        split=split,
+        entries=entries,
+        seeds=seeds,
+        vanta_bin=vanta_bin,
+        max_attempts=args.max_attempts,
+        fixed_rounds=args.fixed_rounds,
+        fixed_rounds_declaration=fixed_rounds_declaration,
+        attempts_declaration=attempts_declaration,
+        disk_mb=args.disk_mb,
+        show_hints=args.show_hints,
+        # The `--issues-dir` this invocation named, so a `--show-hints` row of a
+        # pipelined bug reads the same frozen report its prepare stage read.
+        issues_dir=issues_dir_flag(args),
+        max_spend_usd=max_spend_usd,
+        pause_usd=pause_usd,
+        spend_gate=spend_gate,
+        preflight=partial(runner_mod.model_endpoint_preflight, env=invocation_env),
+        config_block=config_block,
+        # The preparation's block is this invocation's block: in a pipeline the
+        # prepare and the run are one command, so what `prepare.json` will record
+        # and what the rows carry cannot disagree.
+        prep_config_block=config_block,
+        frozen_env=frozen_env,
+        arm_spellings=arm_spellings,
+        budget=budget,
+    )
+
+    print(_render_pipeline_schedule(batch_dir.name, selected, spellings, seeds, waves))
+    tail = ""
+    if budget.concurrent:
+        tail = (
+            f"; one scheduler, cores={budget.cores}/{budget.cap_cores} "
+            f"memory={'unbounded' if budget.cap_memory_mb is None else f'{budget.cap_memory_mb} MB'}"
+        )
+    shape = "wave × seed × bug" if seed_major else "wave × bug"
+    task_count = len(selected) * (len(seeds) if seed_major else 1)
+    print(
+        f"[queue] {task_count} task(s) = {shape}, up to {args.jobs} rows at once, "
+        f"prepare up to {args.prepare_jobs}{tail}; stop file {stop_file}",
+        flush=True,
+    )
+    if stop_file.exists():
+        print(
+            f"[queue] {stop_file} already exists: no job will be claimed. Delete it "
+            "and run again.",
+            flush=True,
+        )
+
+    owner = runner_mod.queue_lock(batch_dir)
+    if not owner.acquire(blocking=False):
+        raise manifest_mod.BatchLocked(str(owner.held_message))
+    preps: list[prepare_mod.BugPrep] = []
+    broken: list[tuple[str, str]] = []
+    outcomes: list[Any] = []
+    refreeze_keys = set(args.refreeze)
+    sampler = _start_host_sampler(batch_dir, budget)
+    try:
+        for wave in waves:
+            wave_selected = [
+                (entry, full)
+                for entry, full in selected
+                if int(entry["wave"]) == wave
+            ]
+            if not wave_selected:
+                continue
+            print(
+                f"\n=== wave {wave}: {len(wave_selected)} bug(s), up to "
+                f"{min(args.jobs, len(wave_selected))} rows at once, prepare up to "
+                f"{min(args.prepare_jobs, len(wave_selected))} ===",
+                flush=True,
+            )
+            wave_outcomes: list[Any] = []
+            with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as row_pool, \
+                    ThreadPoolExecutor(max_workers=max(1, args.prepare_jobs)) as prep_pool:
+                # Every bug of the wave is prepared at once (up to `--prepare-jobs`
+                # in flight), and a bug's rows are submitted the moment THAT bug's
+                # prepare returns — `as_completed`, not submission order — so one
+                # bug's slow prepare cannot hold back another's rows. That is the
+                # whole point of the item. The record stays deterministic anyway:
+                # `preps` and `broken` are rebuilt in the split's own file order.
+                prep_futures = {
+                    prep_pool.submit(
+                        prepare_one_bug,
+                        entry=_entry,
+                        full=_full,
+                        split=split,
+                        bugsinpy_root=bugsinpy_root,
+                        repo_cache=repo_cache,
+                        batch_dir=batch_dir,
+                        deps_dir=deps_dir,
+                        issue_sources=issue_sources,
+                        n_ctx=n_ctx,
+                        n_ctx_source=n_ctx_source,
+                        vanta_bin=vanta_bin,
+                        refreeze_keys=refreeze_keys,
+                        missing_layers=missing_layers,
+                        missing_provenance=missing_provenance,
+                        budget=budget,
+                        traceback_on=args.traceback,
+                    ): index
+                    for index, (_entry, _full) in enumerate(wave_selected)
+                }
+                prepared: dict[int, prepare_mod.BugPrep] = {}
+                wave_broken: dict[int, tuple[str, str]] = {}
+                row_futures: list[Any] = []
+                for future in as_completed(prep_futures):
+                    index = prep_futures[future]
+                    kind, value = future.result()
+                    if kind == "broken":
+                        wave_broken[index] = value
+                        continue
+                    prep = value
+                    prepared[index] = prep
+                    if not prep.runnable:
+                        reasons = (
+                            "; ".join(prep.gate_failures) or "no gate reason recorded"
+                        )
+                        print(
+                            f"  [queue] NOT RUNNABLE {prep.key}: {reasons} — its rows "
+                            "are not run.",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
+                    if seed_major:
+                        # Phase 3 — with `--seed-major` no row is claimed until EVERY
+                        # bug of the wave is prepared (the seed-major block below):
+                        # seed 0 has to cover every bug before seed 1 starts, and that
+                        # is only claimable once all of them are ready. The prepare
+                        # stage itself is unchanged — every bug of the wave is still
+                        # prepared at once.
+                        continue
+                    if stop_file.exists():
+                        print(
+                            f"  [queue] {stop_file} appeared: not claiming "
+                            f"{prep.key}.",
+                            flush=True,
+                        )
+                        continue
+                    row_futures.append(
+                        row_pool.submit(
+                            runner_mod._run_task,
+                            wave=wave,
+                            prep=prep,
+                            stop_file=stop_file,
+                            **run_kwargs,
+                        )
+                    )
+                for index in sorted(prepared):
+                    preps.append(prepared[index])
+                for index in sorted(wave_broken):
+                    broken.append(wave_broken[index])
+                if seed_major:
+                    # Phase 3 — `_run_queue`'s own seed-major shape, applied to the bugs
+                    # this wave has just prepared: one scope per seed, each scope claimed
+                    # to completion before the next begins, so every bug's seed 0 is
+                    # claimed before any bug's seed 1 and a pause leaves a WHOLE seed
+                    # column done. `seeds` is narrowed to the scope exactly as
+                    # `_run_queue` narrows it, so the row written is the row the wave
+                    # would have written and only the claim order moved.
+                    for scope in [[seed] for seed in seeds]:
+                        if stop_file.exists():
+                            print(
+                                f"  [queue] {stop_file} appeared: not claiming "
+                                f"seed {scope[0]}.",
+                                flush=True,
+                            )
+                            break
+                        scope_futures = []
+                        for index in sorted(prepared):
+                            prep = prepared[index]
+                            if not prep.runnable:
+                                continue
+                            if stop_file.exists():
+                                print(
+                                    f"  [queue] {stop_file} appeared: not claiming "
+                                    f"{prep.key} at seed {scope[0]}.",
+                                    flush=True,
+                                )
+                                break
+                            scope_futures.append(
+                                row_pool.submit(
+                                    runner_mod._run_task,
+                                    wave=wave,
+                                    prep=prep,
+                                    stop_file=stop_file,
+                                    **dict(run_kwargs, seeds=list(scope)),
+                                )
+                            )
+                        scope_outcomes = [
+                            future.result() for future in scope_futures
+                        ]
+                        wave_outcomes.extend(scope_outcomes)
+                        if any(
+                            outcome.reason
+                            in ("stop_file", "pause", "spend_cap", "gate")
+                            for outcome in scope_outcomes
+                        ):
+                            break
+                else:
+                    for future in row_futures:
+                        wave_outcomes.append(future.result())
+            outcomes.extend(wave_outcomes)
+            # §8.1 — the same gate `_run_queue` applies: a wave whose gate failed,
+            # or that was stopped deliberately, stops the next wave. `pause` is in
+            # the list because `_stop_reason` spells the pause's own STOP that way,
+            # and a pause must stop the next wave exactly as an operator's STOP does.
+            stoppers = [
+                outcome
+                for outcome in wave_outcomes
+                if outcome.reason in ("stop_file", "pause", "spend_cap", "gate")
+            ]
+            if stoppers:
+                print(
+                    f"\n=== queue stopped in wave {wave}: "
+                    + ", ".join(f"{o.bug} ({o.reason})" for o in stoppers)
+                    + " ===",
+                    flush=True,
+                )
+                break
+    finally:
+        owner.release()
+    host_samples = _stop_host_sampler(sampler)
+
+    # The batch-level prepare record, exactly as `cmd_prepare` writes it. Written
+    # once, here, because a pipelined batch's prepare is only complete when its last
+    # wave has been prepared.
+    for prep in preps:
+        if prep.issue is not None:
+            prepare_mod.write_leak_gate(batch_dir, prep)
+    prepare_mod.write_issue_texts(batch_dir, preps)
+    prepare_mod.write_context_sizes(batch_dir, preps)
+    prepare_mod.write_signals(batch_dir, preps)
+    prepare_mod.write_context_report(
+        batch_dir, preps, n_ctx=n_ctx, n_ctx_source=n_ctx_source
+    )
+    summary = prepare_mod.render_summary(
+        preps, n_ctx=n_ctx, n_ctx_source=n_ctx_source, cache_state=cache_state
+    )
+    (batch_dir / "prepare_summary.md").write_text(summary, encoding="utf-8")
+    split_path = args.split.resolve()
+    split_sha_before = split_mod.sha256_file(split_path)
+    prepare_record = prepare_mod.prepare_manifest(
+        split=split,
+        split_path=split_path,
+        split_sha_before=split_sha_before,
+        batch_dir=batch_dir,
+        commit=commit,
+        bugsinpy_root=bugsinpy_root,
+        selected=[bug_key(entry) for entry, _ in selected],
+        broken=broken,
+        preps=preps,
+        n_ctx=n_ctx,
+        n_ctx_source=n_ctx_source,
+        config_block=config_block,
+        scheduler=budget.record(),
+    )
+    (batch_dir / "prepare.json").write_text(
+        json.dumps(prepare_record, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    split_sha_after = split_mod.sha256_file(split_path)
+    if split_sha_after != split_sha_before:
+        raise SplitError(
+            f"{split_path} changed during prepare ({split_sha_before} → "
+            f"{split_sha_after}). The split is an input; something wrote to it."
+        )
+
+    print()
+    print(summary)
+    print()
+    print(prepare_mod.render_context_table(preps))
+    if broken:
+        print()
+        print(render_flagged(broken))
+    print()
+    print(f"batch dir : {batch_dir}")
+    print(f"split     : {split_path} (read-only; {split_sha_after[:12]} unchanged)")
+
+    # The queue's own tail, unchanged.
+    records = manifest_mod.Manifest(batch_dir).effective_records()
+    if records:
+        labels_path, payload = runner_mod.write_batch_report(
+            batch_dir, records, host_samples=host_samples
+        )
+        print()
+        print(runner_mod.render_digest(payload))
+        print()
+        print(f"{payload['runs']} rows -> {batch_dir / 'run_digest.md'}")
+        print(f"labels for metrics.py -> {labels_path}")
+
+    failed = sum(outcome.failed for outcome in outcomes)
+    raised = [outcome.bug for outcome in outcomes if outcome.reason == "task_failed"]
+    if failed:
+        print(
+            f"\n{failed} job(s) left no usable session and were written to "
+            f"{batch_dir / 'failures.jsonl'}; their keys stay `failed` in "
+            "state.json, so the next `queue` re-runs them.",
+            file=sys.stderr,
+        )
+    if raised:
+        print(
+            f"\n{len(raised)} bug(s) raised and were skipped: {raised}. Re-run them "
+            "once the cause is fixed; their claimed jobs keep their keys.",
+            file=sys.stderr,
+        )
+    unprepared = [prep for prep in preps if not prep.runnable]
+    unprepared_keys = {prep.key for prep in unprepared}
+    if unprepared:
+        print(
+            f"\n{len(unprepared)} bug(s) did not prepare and their rows were not run: "
+            f"{sorted(unprepared_keys)}.",
+            file=sys.stderr,
+            flush=True,
+        )
+    # §7.1 — every selected bug that is meant to run rows must have written at least
+    # one. A bug that prepared runnable but was never claimed (the stop file, the
+    # spend cap) leaves no outcome at all, so this row count is the only place it is
+    # caught: without it a stopped run exits 0 having silently dropped every bug after
+    # the stop. The floor is one row per selected *full* bug; a `full=False` reserve is
+    # measured only and is not expected to write rows.
+    rows_by_bug: dict[str, int] = {}
+    for record in records:
+        bug = str(record.get("bug") or "")
+        if bug:
+            rows_by_bug[bug] = rows_by_bug.get(bug, 0) + 1
+    broken_keys = {key for key, _reason in broken}
+    expected_bugs = [bug_key(entry) for entry, full in selected if full]
+    no_rows = [
+        key
+        for key in expected_bugs
+        if key not in unprepared_keys
+        and key not in broken_keys
+        and rows_by_bug.get(key, 0) == 0
+    ]
+    if no_rows:
+        print(
+            f"\nROW-COUNT FAILURE: {len(no_rows)} of {len(expected_bugs)} selected "
+            f"bug(s) wrote no row: {sorted(no_rows)}. A run must write at least one row "
+            f"per selected bug; the batch has {len(rows_by_bug)} bug(s) with rows. Do not "
+            "read this batch as complete.",
+            file=sys.stderr,
+            flush=True,
+        )
+    if failed or raised or unprepared or broken or no_rows:
+        return EXIT_BUG_FAILED
+    return 1 if any(outcome.code != 0 for outcome in outcomes) else EXIT_OK
 
 
 def cmd_queue(args: argparse.Namespace) -> int:
@@ -983,6 +2151,9 @@ def cmd_queue(args: argparse.Namespace) -> int:
         ),
         flush=True,
     )
+    # M3 items S1–S3 — `--no-cache` before the first job of this queue, in the
+    # parent, so every concurrent job's child inherits it.
+    honour_no_cache(args)
     # Item B1 — the same ONE effective environment as `run`: the caller's own with
     # the frozen `[env]` applied, used by the preflight and the spend cap so a
     # setting frozen in the file but not exported is not silently dropped.
@@ -992,12 +2163,37 @@ def cmd_queue(args: argparse.Namespace) -> int:
             preflight=partial(runner_mod.model_endpoint_preflight, env=invocation_env)
         )
     split = load_split(args.split.resolve())
+    # M3 item AA4 — `--pipeline` is the same command with the prepare stage folded
+    # in: it prepares each bug and starts that bug's rows the moment its prepare is
+    # final, instead of reading a batch `prepare` already finished. It needs no
+    # `prepare.json`, so it branches before `load_prepared` (which raises "no
+    # prepare.json in …" for a fresh directory) and writes one when it is done.
+    if args.pipeline:
+        return _queue_pipeline(
+            args,
+            split=split,
+            config_block=config_block,
+            frozen_env=frozen_env,
+            invocation_env=invocation_env,
+            fixed_rounds_declaration=frozen.fixed_rounds(),
+            attempts_declaration=frozen.attempts(),
+        )
     batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
     bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
     batch = runner_mod.load_prepared(
         batch_dir=batch_dir, split=split, bugsinpy_root=bugsinpy_root
     )
-    window_warning = runner_mod.context_window_warning(batch)
+    # Item T3 — the same refusal as `run`, for the same reason: a queue shares one
+    # configuration with its preparation or it is two experiments in one directory.
+    config_mismatch = runner_mod.prepared_config_mismatch(batch.config_block, config_block)
+    if config_mismatch and not args.allow_override:
+        raise runner_mod.RunnerError(config_mismatch)
+    # Item T5 — the same effective environment `run` compares against, for the same
+    # reason: the queue's children resolve their window from the frozen `[env]`, so a
+    # variable merely exported in this shell must not read as a divergence.
+    window_warning = runner_mod.context_window_warning(
+        batch, environ=invocation_env
+    )
     if window_warning:
         print(f"WARNING: {window_warning}", file=sys.stderr, flush=True)
     waves = parse_waves(args.waves)
@@ -1021,6 +2217,23 @@ def cmd_queue(args: argparse.Namespace) -> int:
             "once its rows' cost has reached this.",
             flush=True,
         )
+    # Phase 3 — the harness-only pause, a second threshold below the cap. At it the
+    # queue writes STOP and stops claiming; deleting STOP and re-running the same
+    # command continues towards the cap. Not in the frozen configuration, so it
+    # carries no config_hash and changes nothing about any row.
+    pause_usd = pause_spend_usd_from_env(invocation_env)
+    if pause_usd is not None:
+        print(
+            f"[spend] VANTA_PAUSE_SPEND_USD=${pause_usd:g}: the queue writes STOP and "
+            "stops claiming once its rows' cost has reached this (delete STOP and "
+            "re-run to continue).",
+            flush=True,
+        )
+
+    # M3 item S6 — the ONE scheduler of this queue, shared by every worker and
+    # threaded down into each per-bug `run_batch`; `--jobs 1` changes nothing.
+    budget = row_budget(args, invocation_env, flag="--jobs")
+    sampler = None if args.plan else _start_host_sampler(batch_dir, budget)
 
     code, outcomes = runner_mod.run_queue(
         batch_dir=batch_dir,
@@ -1035,24 +2248,41 @@ def cmd_queue(args: argparse.Namespace) -> int:
         max_attempts=args.max_attempts,
         fixed_rounds=args.fixed_rounds,
         fixed_rounds_declaration=frozen.fixed_rounds(),
+        attempts_declaration=frozen.attempts(),
         disk_mb=args.disk_mb,
         show_hints=args.show_hints,
+        # The `--issues-dir` this invocation named, or `None` for the committed
+        # default. With `--pipeline` the prepare stage froze into it; the queue
+        # refuses a bug, by name, whose report it may read is missing there.
+        issues_dir=issues_dir_flag(args),
         plan_only=args.plan,
         max_spend_usd=max_spend_usd,
+        pause_usd=pause_usd,
+        # M3 item T4 — Phase 3's claim order (wave × seed × bug). Off by default,
+        # so the dev queue claims exactly what it always did.
+        seed_major=args.seed_major,
         # Bound to the effective environment (item B1), as in `run`.
         preflight=partial(runner_mod.model_endpoint_preflight, env=invocation_env),
         config_block=config_block,
+        prep_config_block=batch.config_block,
         frozen_env=frozen_env,
         arm_spellings=arm_spellings,
+        budget=budget,
     )
     if args.plan:
         return EXIT_OK
+
+    # M3 item S6 — stop sampling before the report is derived, so the batch's own
+    # host samples are complete and consistent with the rows.
+    host_samples = _stop_host_sampler(sampler)
 
     # Same tail as `run`: the report is the manifest on disk, so a resumed queue
     # summarises the whole batch and not the part this invocation happened to run.
     records = manifest_mod.Manifest(batch_dir).effective_records()
     if records:
-        labels_path, payload = runner_mod.write_batch_report(batch_dir, records)
+        labels_path, payload = runner_mod.write_batch_report(
+            batch_dir, records, host_samples=host_samples
+        )
         print()
         print(runner_mod.render_digest(payload))
         print()
@@ -1680,6 +2910,73 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the selected plan from the committed split and exit",
     )
     prep.add_argument("--traceback", action="store_true", help="print tracebacks")
+    prep.add_argument(
+        "--allow-override",
+        action="store_true",
+        help=(
+            "prepare even though the environment contradicts configs/v1-m3.toml "
+            "(item 19/Q3). Without it, a `VANTA_` variable the file freezes to a "
+            "different value — or freezes to `unset` and the caller set — refuses "
+            "prepare before the first checkout, because the gate would be sized "
+            "against a window the run will not use. The waiver and the values it "
+            "waived are recorded in `prepare.json` (`config_override`, "
+            "`config_overrides`), so such a batch still cannot be pooled with one "
+            "that did not need it."
+        ),
+    )
+    prep.add_argument(
+        "--no-cache",
+        action="store_true",
+        help=(
+            "force a FRESH suite run instead of serving it from the M3 suite cache "
+            "(items S1–S3), so a cached result can be checked against a fresh one on "
+            "demand. The flag does not make the cache invisible: the entry is still "
+            "read, the row records that it WOULD have hit (`off:no_cache`), and the "
+            "fresh payload then replaces the entry it could not use."
+        ),
+    )
+    prep.add_argument(
+        "--prepare-jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "the maximum number of prepared-suite runs in flight at once (M3 item S5, "
+            "default 1). Same meaning as `run --jobs` and `queue --jobs`: the memory "
+            "and core budget can admit fewer, never more. Each bug's three independent "
+            "derivations (buggy / oracle / fixed) are submitted together and overlap up "
+            "to N at a time; the two runs of one pair are always two separate VMs and "
+            "overlap only when N allows it. N is capped at host cores − 2, and each run "
+            "holds its own recorded memory (vm_memory_mb) plus one core. Default 1: one "
+            "run at a time, today's behaviour. A concurrent prepare records what it used "
+            "on prepare.json and on every bug row (`scheduler`), because a measurement "
+            "made beside another one is a different experiment from a serial one."
+        ),
+    )
+    prep.add_argument(
+        "--peak-vms",
+        type=int,
+        default=budget_mod.DEFAULT_PEAK_VMS,
+        metavar="N",
+        help=(
+            "the scheduler's conservative charge for a ROW, used by `run`/`queue`; "
+            "prepare charges each suite run its own memory instead, so this only sizes "
+            f"the shared budget knob (default {budget_mod.DEFAULT_PEAK_VMS})."
+        ),
+    )
+    prep.add_argument(
+        "--issues-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "where prepare freezes (and reads) the frozen issue reports. Flag absent "
+            "is the committed `plans/bugsinpy_issues`, byte-for-byte today's path. A "
+            "held-out split points this at a gitignored directory (e.g. "
+            "`plans/private/bugsinpy_issues`) so its report text is frozen and "
+            "hashable without being published (§2.4.2)."
+        ),
+    )
     prep.set_defaults(func=cmd_prepare)
 
     bake = sub.add_parser(
@@ -1751,6 +3048,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     bake.set_defaults(func=cmd_bake)
+
+    stamp = sub.add_parser(
+        "stamp-existing",
+        help=(
+            "give every checkpoint baked before M3 item U3 its identity, without "
+            "re-baking it, so the suite cache can key on it"
+        ),
+    )
+    stamp.set_defaults(func=cmd_stamp_existing)
 
     run = sub.add_parser(
         "run",
@@ -1843,6 +3149,56 @@ def build_parser() -> argparse.ArgumentParser:
             "compared by name to, the default run."
         ),
     )
+    run.add_argument(
+        "--no-cache",
+        action="store_true",
+        help=(
+            "force a FRESH suite run instead of serving it from the M3 suite cache "
+            "(items S1–S3), so a cached result can be checked against a fresh one on "
+            "demand. The flag does not make the cache invisible: the entry is still "
+            "read, the row records that it WOULD have hit (`off:no_cache`, with "
+            "`would_hit` in the row's own `cache` list), and the fresh payload then "
+            "replaces the entry it could not use."
+        ),
+    )
+    run.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help=(
+            "the maximum number of rows in flight at once across all bugs (default 1). "
+            "Same meaning as `queue --jobs` and `prepare --prepare-jobs`: the memory "
+            "and core budget can admit fewer, never more. `--jobs 1` is today's "
+            "behaviour exactly. Requires VANTA_LLM_BACKEND=openai to exceed 1 (§14.33)."
+        ),
+    )
+    run.add_argument(
+        "--peak-vms",
+        type=int,
+        default=budget_mod.DEFAULT_PEAK_VMS,
+        metavar="N",
+        help=(
+            "the scheduler's conservative charge for a row: assume up to N of its "
+            f"microVMs run at once (default {budget_mod.DEFAULT_PEAK_VMS}), so a row is "
+            "charged --peak-vms × its VM memory. Accounting only — no VM's memory or "
+            "vCPUs change; each row records the peak it actually reached so this can be "
+            "tuned from real runs."
+        ),
+    )
+    run.add_argument(
+        "--issues-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "where the frozen issue reports are read from. Flag absent is the "
+            "committed `plans/bugsinpy_issues`, byte-for-byte today's path. A held-out "
+            "split points this at its gitignored freeze directory (e.g. "
+            "`plans/private/bugsinpy_issues`). When given the directory is REQUIRED: a "
+            "report missing there refuses the bug by name — the run never falls back to "
+            "the default folder and never re-fetches a report live (§2.4)."
+        ),
+    )
     run.set_defaults(func=cmd_run)
 
     queue = sub.add_parser(
@@ -1860,6 +3216,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="the batch directory `prepare` created — the resume cursor lives there",
     )
     queue.add_argument(
+        "--pipeline",
+        action="store_true",
+        help=(
+            "M3 item AA4 — prepare and run in ONE invocation: each selected bug is "
+            "prepared, and the moment its prepare is final and frozen its rows start, "
+            "while the other bugs of its wave are still preparing. Waves stay "
+            "sequential. One scheduler and one spend cap govern the whole pipeline, "
+            "and the batch's prepare.json is written when the last wave is prepared. "
+            "Off by default: without it a queue reads a batch `prepare` already "
+            "finished, exactly as before."
+        ),
+    )
+    queue.add_argument(
         "--only",
         action="append",
         default=[],
@@ -1869,12 +3238,14 @@ def build_parser() -> argparse.ArgumentParser:
     queue.add_argument("--waves", default="", help="comma-separated wave numbers")
     queue.add_argument(
         "--arms",
-        default="",
+        action="append",
+        default=[],
         metavar="SPELLING,...",
         help=(
-            "the arm spellings to run, comma- or space-separated. Default: every arm "
-            "the split declares. A spelling the split does not declare is refused — "
-            "the split is the protocol and this flag is only a selection (§12.2.5)"
+            "the arm spellings to run, comma- or space-separated (repeatable; each "
+            "value accumulates). Default: every arm the split declares. A spelling "
+            "the split does not declare is refused — the split is the protocol and "
+            "this flag is only a selection (§12.2.5)"
         ),
     )
     queue.add_argument(
@@ -1884,6 +3255,19 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "the seeds to run, comma- or space-separated. Default: every seed the "
             "split declares; a value the split does not declare is refused"
+        ),
+    )
+    queue.add_argument(
+        "--seed-major",
+        action="store_true",
+        help=(
+            "Phase 3 — claim every bug's seed 0 before any bug's seed 1 (order "
+            "wave × seed × bug), so a pause or a stop leaves a whole seed column "
+            "done instead of a diagonal through it. Changes only the claim order, "
+            "not which rows run: a resumed batch writes the same rows either way. "
+            "With --pipeline the wave is prepared in full before its first row is "
+            "claimed, because seed 0 has to cover every bug. Off by default, so a "
+            "dev run is unchanged."
         ),
     )
     queue.add_argument(
@@ -1919,9 +3303,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help=(
-            "how many bugs of one wave to run at once (default 1). Each bug boots its "
-            "own VM, so this is bounded by memory: a pandas VM wants 8 GB. Waves stay "
-            "sequential — the gate is a statement about the earlier stages (§8.1)."
+            "the maximum number of rows in flight at once across all bugs (default 1). "
+            "Same meaning as `run --jobs` and `prepare --prepare-jobs`: the memory and "
+            "core budget can admit fewer, never more. Waves stay sequential — the gate "
+            "is a statement about the earlier stages (§8.1). Requires "
+            "VANTA_LLM_BACKEND=openai to exceed 1 (§14.33)."
+        ),
+    )
+    queue.add_argument(
+        "--peak-vms",
+        type=int,
+        default=budget_mod.DEFAULT_PEAK_VMS,
+        metavar="N",
+        help=(
+            "the scheduler's conservative charge for a row: assume up to N of its "
+            f"microVMs run at once (default {budget_mod.DEFAULT_PEAK_VMS}), so a row is "
+            "charged --peak-vms × its VM memory. Accounting only — no VM's memory or "
+            "vCPUs change; each row records the peak it actually reached so this can be "
+            "tuned from real runs."
         ),
     )
     queue.add_argument(
@@ -1954,6 +3353,94 @@ def build_parser() -> argparse.ArgumentParser:
             "default and off for every batch a verdict rests on; such rows take a "
             "`#hints` job key and cannot be resumed as, or compared by name to, a "
             "default run."
+        ),
+    )
+    queue.add_argument(
+        "--no-cache",
+        action="store_true",
+        help=(
+            "force a FRESH suite run instead of serving it from the M3 suite cache "
+            "(items S1–S3), so a cached result can be checked against a fresh one on "
+            "demand. The flag does not make the cache invisible: the entry is still "
+            "read, the row records that it WOULD have hit (`off:no_cache`, with "
+            "`would_hit` in the row's own `cache` list), and the fresh payload then "
+            "replaces the entry it could not use."
+        ),
+    )
+    # M3 item AA4 — the prepare-side flags, for `--pipeline`. They are exactly the
+    # ones `prepare` takes and mean the same thing; without `--pipeline` they are
+    # read by nothing, and a queue that reads a prepared batch needs none of them.
+    queue.add_argument(
+        "--prepare-jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "with --pipeline: the maximum number of prepared-suite runs in flight at "
+            "once (M3 item S5, default 1), the same meaning as `prepare "
+            "--prepare-jobs`. The prepare pool is N wide and the row pool is "
+            "`--jobs` wide; both draw on the ONE scheduler, whose size is the wider "
+            "of the two. Ignored without --pipeline, which prepares nothing."
+        ),
+    )
+    queue.add_argument(
+        "--refreeze",
+        action="append",
+        default=[],
+        metavar="PROJECT/BUG",
+        help=(
+            "with --pipeline: re-fetch and rewrite this bug's frozen issue report "
+            "(prepare's own flag, §2.4.3). Repeatable, and it selects only the bugs it "
+            "names, in full. Ignored without --pipeline."
+        ),
+    )
+    queue.add_argument(
+        "--n-ctx",
+        type=int,
+        default=None,
+        metavar="TOKENS",
+        help=(
+            "with --pipeline: the context window the context gate is sized against "
+            "(§1.6.1, prepare's own flag). Checked against VANTA_LLM_CONTEXT_TOKENS "
+            "and the server's /props n_ctx rather than overriding them. Ignored "
+            "without --pipeline."
+        ),
+    )
+    queue.add_argument(
+        "--reserves",
+        choices=("measure", "skip"),
+        default="measure",
+        help=(
+            "with --pipeline: what to do with role=reserve bugs — measure their "
+            "context only (default) or skip them (prepare's own flag). Ignored "
+            "without --pipeline."
+        ),
+    )
+    queue.add_argument(
+        "--measure-only",
+        action="store_true",
+        help=(
+            "with --pipeline: context-measure every selected bug without running a "
+            "suite or booting a VM (prepare's own flag, §1.6). Ignored without "
+            "--pipeline."
+        ),
+    )
+    queue.add_argument(
+        "--traceback", action="store_true", help="print tracebacks (with --pipeline)"
+    )
+    queue.add_argument(
+        "--issues-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "where the frozen issue reports are read from (and, with --pipeline, "
+            "frozen into). Flag absent is the committed `plans/bugsinpy_issues`, "
+            "byte-for-byte today's path. A held-out split points this at its gitignored "
+            "freeze directory (e.g. `plans/private/bugsinpy_issues`). When given the "
+            "directory is REQUIRED: a report missing there refuses the bug by name — the "
+            "run never falls back to the default folder and never re-fetches a report "
+            "live (§2.4)."
         ),
     )
     queue.set_defaults(func=cmd_queue)

@@ -42171,6 +42171,65 @@ class TestTheInvocationEnvironment:
         assert seen[1] == seen[0]
         assert seen[1]["VANTA_MAX_SPEND_USD"] == "5"
 
+    def test_the_phase_three_budget_override_is_recorded_and_keeps_the_hash(
+        self, tmp_path, monkeypatch
+    ):
+        """Phase 3 — `VANTA_MAX_SPEND_USD=120 --allow-override` is an operational
+        budget override, not a behavioural parameter.
+
+        The file freezes the cap to ``5`` while the shell exports ``120``, so the
+        run is refused unless ``--allow-override`` waives it. Waived, the batch
+        reads the caller's 120 — the cap is *this invocation's* budget — and every
+        row records ``config_override`` true with the file's **unchanged**
+        ``config_hash`` and the waived contradiction. Nothing behavioural moved, so
+        the rows still pool under the configuration they claim.
+        """
+        # Every other frozen setting stays absent, so the cap is the only
+        # contradiction and the recorded list has exactly one entry.
+        for name in frozen_mod.load().frozen():
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("VANTA_MAX_SPEND_USD", "120")
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(
+            run_mod,
+            "load_split",
+            lambda path: SimpleNamespace(bugsinpy_root="runs/bugsinpy", seeds=[0]),
+        )
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+        batch = SimpleNamespace(
+            preps=[], entries={}, n_ctx=262144, batch_dir=tmp_path, config_block=None
+        )
+        monkeypatch.setattr(runner_mod, "load_prepared", lambda **kwargs: batch)
+        monkeypatch.setattr(
+            runner_mod, "context_window_warning", lambda b, *, environ=None: None
+        )
+        monkeypatch.setattr(run_mod, "select_preps", lambda preps, **kwargs: [])
+        monkeypatch.setattr(runner_mod, "require_vanta_bin", lambda path: path)
+        monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: None)
+        monkeypatch.setattr(
+            runner_mod, "model_endpoint_preflight", lambda *, env=None, probe=None: None
+        )
+        captured: dict = {}
+
+        def fake_run_batch(**kwargs):
+            captured.update(kwargs)
+            return run_mod.EXIT_OK, []
+
+        monkeypatch.setattr(runner_mod, "run_batch", fake_run_batch)
+
+        code = run_mod.main(["run", "--batch", str(tmp_path), "--allow-override"])
+
+        assert code == run_mod.EXIT_OK
+        assert captured["max_spend_usd"] == 120.0, (
+            "the waived cap is the caller's 120, not the file's frozen 5"
+        )
+        block = captured["config_block"]
+        assert block["config_override"] is True
+        assert block["config_overrides"] == ["VANTA_MAX_SPEND_USD=5!=120"]
+        assert block["config_hash"] == frozen_mod.load().sha256, (
+            "the frozen file is untouched: the override is operational, not a hash"
+        )
+
     def test_the_queue_uses_the_same_effective_environment(self, tmp_path, monkeypatch):
         """The ``queue`` half: the same preamble, so the same fix and the same test."""
         for name in frozen_mod.load().frozen():

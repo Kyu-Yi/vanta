@@ -25209,6 +25209,54 @@ class TestBuildTreesInPlace:
             "inside a tree"
         )
 
+    def test_a_build_file_is_written_atomically_never_torn(
+        self, tmp_path, monkeypatch
+    ):
+        """The build file is written to a temp name, then ``os.replace``d.
+
+        [VANTA-WHY] Two concurrent prepares of the same project — the three trees'
+        builds under ``--prepare-jobs``, or a second invocation overlapping the
+        first — can both write this file, and a reader or the VM that mounted the
+        batch catching a plain ``write_text`` mid-flight imports a half-written
+        file and reports a build failure that never happened. The guarantee is one
+        rename: a reader sees either the previous file or the whole new one.
+        """
+        monkeypatch.setattr(suite_mod, "build_tree_in_place", lambda **kwargs: None)
+        self._rule(monkeypatch, needed=True)
+
+        batch = tmp_path / "batch"
+        batch.mkdir()
+        content = "[libs]\nsystem_freetype = True\n"
+        seen: list = []
+        real_replace = os.replace
+
+        def spy(src, dst):
+            src = Path(src)
+            dst = Path(dst)
+            # At the swap, the temp file already holds every byte, beside the
+            # target so the rename cannot cross a filesystem.
+            seen.append((src.parent, src.name, dst.name, src.read_text(encoding="utf-8")))
+            real_replace(src, dst)
+
+        monkeypatch.setattr(prepare_mod.os, "replace", spy)
+
+        prepare_mod.build_trees_in_place(
+            self._prep(tmp_path, build_files={"vanta-build.cfg": content}),
+            checkpoint="chk",
+            batch_dir=batch,
+            repo=tmp_path / "clone",
+        )
+
+        assert len(seen) == 1
+        tmp_dir, tmp_name, dst_name, tmp_bytes = seen[0]
+        assert tmp_dir == batch and dst_name == "vanta-build.cfg"
+        assert tmp_name.startswith("vanta-build.cfg.") and tmp_name.endswith(".tmp")
+        assert tmp_bytes == content
+        assert (batch / "vanta-build.cfg").read_text(encoding="utf-8") == content
+        assert sorted(entry.name for entry in batch.iterdir()) == ["vanta-build.cfg"], (
+            "the temp name is renamed away, never left behind"
+        )
+
     def test_a_bug_that_needs_no_build_records_why_it_was_not_built(
         self, tmp_path, monkeypatch
     ):

@@ -20,7 +20,9 @@ Every suite run happens inside Shuru — ``prepare`` is not exempt from C3.
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1167,6 +1169,27 @@ VANTA_TREE_INHERITANCE = "copied from oracle_tree (built in place)"
 """What :data:`BUILD_TREES`' record says about the tree the Creator is given."""
 
 
+def write_build_file_atomic(path: Path, content: str) -> None:
+    """Write one build file so a concurrent reader never sees a partial file.
+
+    [VANTA-WHY] The same bytes under the same name, written the long way round:
+    a unique temp file beside the target, then one ``os.replace``. A build file
+    lives in the batch directory, which two concurrent prepares of the same
+    project — the three trees' builds run at once under ``--prepare-jobs``, and a
+    second invocation can overlap them — may both write. A plain
+    ``write_text`` truncates first and fills after, so a reader or a VM that
+    mounted the batch in that window can import a half-written file and report a
+    build failure that is really a torn read. ``os.replace`` on the same
+    filesystem is atomic, so a reader sees either the previous file or the whole
+    new one, never an in-between. The temp name carries ``(pid, thread)`` so two
+    writers cannot collide on it, and the file's name, bytes and the ``carry``
+    the caller derives from ``build_files`` are unchanged.
+    """
+    tmp = path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def setup_args_for(pythonpath: Optional[str]) -> tuple[str, ...]:
     """The ``setup.py`` command that makes a tree importable where its suite looks.
 
@@ -1256,7 +1279,7 @@ def build_trees_in_place(
         # because the whole batch is mounted. The name is a bare file name (§3.4, the
         # split's own validation), so it cannot be a path to somewhere else.
         for name, content in sorted(prep.build_files.items()):
-            (batch_dir / name).write_text(content, encoding="utf-8")
+            write_build_file_atomic(batch_dir / name, content)
     setup_args = setup_args_for(prep.bug.pythonpath)
     command = f"python setup.py {' '.join(setup_args)}"
     # [VANTA-WHY] M3 item V8 — the build file lives in the batch directory, which the

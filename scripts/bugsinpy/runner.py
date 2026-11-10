@@ -161,6 +161,24 @@ SPEND_CAP_NAME = "spend.json"
 # exists after only some batches, while the log exists for every capped batch.
 SPEND_LOG_NAME = "spend_log.json"
 
+# Phase 3 — the **harness-only** pause threshold (``VANTA_PAUSE_SPEND_USD``): a
+# second stop *below* §14.29's cap, so a run can be looked at before it is
+# allowed to spend the rest of its budget. It is not in the frozen configuration
+# and not a behavioural parameter — it changes nothing about any row, only
+# whether the queue claims the next one — so it carries no ``config_hash``.
+#
+# ``pause.json`` is both the record of the stop (the shape ``spend.json`` uses)
+# and the *one-shot* marker: its presence means "this batch has already paused",
+# which is what lets "delete STOP and re-run the same command" continue towards
+# the cap instead of pausing again on its very first claim.
+SPEND_PAUSE_NAME = "pause.json"
+
+# The first line :func:`_record_spend_pause` writes into the STOP file. The pause
+# creates STOP itself, so the file's mere presence cannot say whether an operator
+# asked for the stop or the budget did; :func:`_stop_reason` reads this line to
+# tell them apart. A STOP an operator creates carries their own note (or nothing).
+PAUSE_STOP_LINE = "PAUSED by VANTA_PAUSE_SPEND_USD"
+
 SESSION_LINE = re.compile(r"▌ Session:\s*(\S+)")
 SUMMARY_PAIR = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(\S+)")
 
@@ -3619,6 +3637,119 @@ def _record_spend_cap(
     )
 
 
+def _pause_due(batch_dir: Path, manifest: Manifest, pause_usd: Optional[float]) -> bool:
+    """Phase 3 — whether the batch should pause before its next claim.
+
+    ``pause_usd`` is ``None`` for a batch that did not ask to pause, and the
+    pause is then never due. Otherwise it is due when the recorded spend has
+    reached the threshold **and** this batch has not paused before. The
+    comparison is :func:`_at_or_over_cap`'s — the one micro-dollar test H2/H7
+    define — so the pause and the cap can never disagree about which side of a
+    boundary the batch is on.
+
+    ``pause.json`` is the durable record that the batch has already paused once,
+    and its presence is what makes the pause **one-shot**: without it, a resume
+    over a batch already at or past the threshold would pause again on its very
+    first claim and could never spend the cap it was resumed to spend. With it,
+    deleting STOP and re-running continues.
+    """
+    if pause_usd is None:
+        return False
+    if (Path(batch_dir) / SPEND_PAUSE_NAME).exists():
+        return False
+    return _at_or_over_cap(manifest, pause_usd)
+
+
+def _record_spend_pause(
+    batch_dir: Path, pause_usd: float, spent_usd: float, job: Job
+) -> None:
+    """Pause at the batch's pause threshold, and write down why (Phase 3).
+
+    The pause is the cap's sibling one step earlier and stops the same way: the
+    row that crossed it is already complete and on disk — the pause refuses the
+    *next* claim, never an in-flight one — so no partial row is written and
+    "finish the current row" is structural rather than a promise. It is
+    **harness-only**: not in the frozen configuration, not a behavioural
+    parameter, and it changes nothing about any row. It exists so a run can be
+    inspected at the pause threshold before it is allowed to spend to the cap.
+
+    Two files, because two readers need different things:
+
+    * ``pause.json`` — the record, in the shape :func:`_record_spend_cap` uses,
+      plus ``pause_usd``. It is also the one-shot marker
+      (:func:`_pause_due`): its presence means this batch has already paused, so
+      the resume continues towards the cap instead of pausing again.
+    * ``STOP`` — item 13's stop file, so "delete STOP and re-run the same
+      command" is the resume and every stop-file check in the runner and the
+      queue already honours it.
+
+    ``pause.json`` is written first, because it is the disarm marker: a crash
+    between the two writes then leaves the batch resumable rather than re-pausing
+    forever. The row that crossed the threshold is complete either way.
+    """
+    path = Path(batch_dir) / SPEND_PAUSE_NAME
+    payload = {
+        "schema": 1,
+        "reason": "pause",
+        "pause_usd": pause_usd,
+        "spent_usd": round(spent_usd, 6),
+        "stopped_utc": utc_now(),
+        "first_unstarted_key": job.key,
+    }
+    # The temp name carries the writer for the same reason `_record_spend_cap`'s
+    # does (G1): several workers reach the threshold together, so a fixed
+    # `<name>.tmp` would have one `os.replace` win and the next raise on a file
+    # already gone. `(pid, thread)` cannot collide, and `os.replace` is atomic.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.tmp")
+    tmp.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    os.replace(tmp, path)
+    # Item 13's stop file, created here so the resume gesture is the one the queue
+    # already documents. Its first line is the marker `_stop_reason` reads to tell
+    # a pause from an operator's own stop.
+    stop_path = Path(batch_dir) / STOP_NAME
+    stop_path.parent.mkdir(parents=True, exist_ok=True)
+    stop_path.write_text(
+        f"{PAUSE_STOP_LINE}\n"
+        f"  spent ${spent_usd:.6f} >= ${pause_usd:.6f}; delete this file and re-run "
+        "the same command to continue.\n",
+        encoding="utf-8",
+    )
+    print(
+        f"\n=== PAUSED: ${spent_usd:.6f} >= ${pause_usd:.6f} "
+        f"(VANTA_PAUSE_SPEND_USD) ===",
+        flush=True,
+    )
+    print(
+        f"  refusing to start {job.key}: the row that crossed the threshold is "
+        "complete, every later job is unstarted.",
+        flush=True,
+    )
+    print(f"  reason recorded in {path}", flush=True)
+    print(f"  stop file written: {stop_path}", flush=True)
+    print(
+        f"  delete {stop_path} and re-run the same command to continue; spend is "
+        "counted from this batch's rows, so the cap still holds.",
+        flush=True,
+    )
+
+
+def _stop_reason(stop_file: Path) -> str:
+    """``"pause"`` when the stop file is the pause's own, else ``"stop_file"``.
+
+    The pause writes STOP itself, so the file's presence cannot say why the batch
+    stopped; its first line can. An operator-made STOP — empty, or carrying their
+    own note — reads as ``"stop_file"``, which is what it is, so a stop the
+    operator asked for is never reported as a budget event.
+    """
+    try:
+        text = Path(stop_file).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "stop_file"
+    return "pause" if text.lstrip().startswith(PAUSE_STOP_LINE) else "stop_file"
+
+
 def _max_recorded_cost(manifest: Manifest) -> Optional[float]:
     """The largest ``llm.cost_usd`` among the rows on disk, or ``None`` if none.
 
@@ -3875,6 +4006,7 @@ def run_batch(
     show_hints: bool = False,
     plan_only: bool = False,
     max_spend_usd: Optional[float] = None,
+    pause_usd: Optional[float] = None,
     spend_gate: Optional[SpendGate] = None,
     preflight: Optional[Callable[[], Optional[str]]] = None,
     config_block: Optional[dict[str, Any]] = None,
@@ -3914,6 +4046,14 @@ def run_batch(
     checked BETWEEN jobs, against the cost of the rows already on disk: a job that would push
     the batch past the cap is not started, and the count it is compared against includes rows
     an earlier invocation of the same batch wrote, so a resume cannot double-spend.
+
+    ``pause_usd`` is Phase 3's harness-only pause (``VANTA_PAUSE_SPEND_USD``), ``None`` for
+    no pause, and a second threshold *below* the cap. It stops a claim exactly as the stop
+    file does — before the job starts, never an in-flight one — but it is the budget that
+    trips it: at or over the threshold the batch writes ``pause.json`` and STOP
+    (:func:`_record_spend_pause`) and returns 1. It is one-shot per batch — ``pause.json``'s
+    presence disarms it — so deleting STOP and re-running continues towards the cap rather
+    than pausing again. It changes nothing about any row's behaviour.
 
     ``spend_gate`` is G1's shared reservation, or ``None``. ``run_queue`` builds ONE gate for
     the whole queue and passes it to every per-bug call, so the workers of one batch share one
@@ -4114,6 +4254,7 @@ def run_batch(
                     checkpoint_pythons=checkpoint_pythons,
                     spend_gate=spend_gate,
                     stop_file=stop_file,
+                    pause_usd=pause_usd,
                     preflight=preflight,
                 )
                 result.records.extend(phase_records)
@@ -4121,6 +4262,11 @@ def run_batch(
                 if status == "stop_file":
                     return stopped()
                 if status == "spend_cap":
+                    return 1, results
+                # Phase 3 — the pooled worker already wrote STOP and `pause.json`
+                # and printed PAUSED (`_record_spend_pause`), so here the batch
+                # simply stops, like the cap and for the same reason.
+                if status == "pause":
                     return 1, results
                 continue
             for job in jobs:
@@ -4137,6 +4283,16 @@ def run_batch(
                 # `running`. Deleting the file resumes from this key.
                 if stop_file is not None and Path(stop_file).exists():
                     return stopped()
+                # Phase 3 — the pause, a second threshold below the cap. Checked
+                # between jobs like the stop file and for the same reason; it
+                # writes STOP and `pause.json`, so the resume is the stop file's
+                # own gesture. `_pause_due` is one-shot (the marker disarms it),
+                # so a resumed batch continues towards the cap.
+                if _pause_due(batch_dir, manifest, pause_usd):
+                    _record_spend_pause(
+                        batch_dir, float(pause_usd), _spent_so_far(manifest), job
+                    )
+                    return 1, results
                 reservation: Optional[int] = None
                 # H7 — the `try` opens *before* `acquire`, not at the job.
                 # Between the return of a successful `acquire` and the old
@@ -4177,6 +4333,18 @@ def run_batch(
                         # reservation that `stopped()` returns past.
                         if stop_file is not None and Path(stop_file).exists():
                             return stopped()
+                        # Phase 3 — and the pause, for the same H3 reason: the
+                        # spend can cross the pause threshold while this worker
+                        # sleeps in `acquire`. Returning here releases the
+                        # reservation through the `finally` below.
+                        if _pause_due(batch_dir, manifest, pause_usd):
+                            _record_spend_pause(
+                                batch_dir,
+                                float(pause_usd),
+                                _spent_so_far(manifest),
+                                job,
+                            )
+                            return 1, results
                     # Item 14 — before the row, not after it. Asked here rather
                     # than inside `run_job` because the refusal has to leave no
                     # trace at all: `run_job`'s first act is to mark the key
@@ -4417,6 +4585,7 @@ def _run_jobs_concurrently(
     checkpoint_pythons: dict[str, str],
     spend_gate: Optional["SpendGate"],
     stop_file: Optional[Path],
+    pause_usd: Optional[float],
     preflight: Optional[Callable[[], Optional[str]]],
 ) -> tuple[str, list[dict[str, Any]], int]:
     """Run one phase's jobs on a pool, and report how the phase ended.
@@ -4436,6 +4605,10 @@ def _run_jobs_concurrently(
     * item 13's stop file, checked before the claim and — H3 — again after the
       spend gate's ``acquire`` returns, because the file can appear while a worker
       sleeps;
+    * Phase 3's pause (:func:`_pause_due`), checked at the same two points and for
+      the same reason, with a ``pause_hit`` event so a worker that did not fire it
+      still stops instead of slipping through in the window between ``pause.json``
+      and STOP;
     * G1's :class:`SpendGate`, with H7's ``try`` opening before ``acquire`` so a
       raise cannot leave a reservation nobody will release;
     * item 14's endpoint preflight, asked once per row that is about to start;
@@ -4444,9 +4617,10 @@ def _run_jobs_concurrently(
       interleave.
 
     Returns ``(status, records, failed)`` where ``status`` is ``""``, or
-    ``"stop_file"`` / ``"spend_cap"`` for the two conditions the caller turns into
-    a stop; ``records`` come back in JOB order and not completion order, so a
-    phase's rows read the way they would have read serially. A preflight refusal —
+    ``"stop_file"`` / ``"spend_cap"`` / ``"pause"`` for the three conditions the
+    caller turns into a stop; ``records`` come back in JOB order and not
+    completion order, so a phase's rows read the way they would have read
+    serially. A preflight refusal —
     or any other raise inside a row — is re-raised from the lowest-index row that
     raised, once the pool has drained, and it OUTRANKS a ``"stop_file"`` /
     ``"spend_cap"`` status found on a different row (M3 item V3): an exception is
@@ -4454,11 +4628,12 @@ def _run_jobs_concurrently(
     """
     count = len(jobs)
     # `slots[i]` is what happened to job i: None until a worker reaches it, then
-    # ("record"|"failed"|"skip"|"stopped"|"spend"|"halted"|"error", value).
+    # ("record"|"failed"|"skip"|"stopped"|"spend"|"pause"|"halted"|"error", value).
     slots: list[Optional[tuple[str, Any]]] = [None] * count
     guard = threading.Lock()
     halt = threading.Event()
     spend_cap_hit = threading.Event()
+    pause_hit = threading.Event()
 
     # The resume cursor, read in job order before anything is submitted — the same
     # read the serial loop made, at the same point in the order. It goes through
@@ -4475,6 +4650,30 @@ def _run_jobs_concurrently(
     def stop_file_present() -> bool:
         return stop_file is not None and Path(stop_file).exists()
 
+    def pause_now(index: int, job: "Job", row_manifest: Manifest) -> bool:
+        """Fire or honour Phase 3's pause; ``True`` when this claim must stop.
+
+        Fires at most once per phase. The first worker to see the threshold due
+        records it (STOP + ``pause.json`` + the PAUSED line) under ``guard``; every
+        worker after that stops on ``pause_hit`` alone, which closes the window in
+        which a worker that had not yet seen the file could slip past and claim a
+        row the pause exists to prevent. A batch that already paused (the marker
+        is on disk) never fires here — :func:`_pause_due` is disarmed — so a
+        resume continues towards the cap.
+        """
+        if not (_pause_due(batch_dir, row_manifest, pause_usd) or pause_hit.is_set()):
+            return False
+        with guard:
+            first = not pause_hit.is_set()
+            pause_hit.set()
+            halt.set()
+            slots[index] = ("pause", None)
+        if first:
+            _record_spend_pause(
+                batch_dir, float(pause_usd), _spent_so_far(row_manifest), job
+            )
+        return True
+
     def worker(index: int, job: "Job") -> None:
         if halt.is_set():
             slots[index] = ("halted", None)
@@ -4485,6 +4684,8 @@ def _run_jobs_concurrently(
         if stop_file_present():
             halt.set()
             slots[index] = ("stopped", None)
+            return
+        if pause_now(index, job, row_manifest):
             return
         reservation: Optional[int] = None
         try:
@@ -4511,6 +4712,8 @@ def _run_jobs_concurrently(
                     halt.set()
                     slots[index] = ("stopped", None)
                     return
+                if pause_now(index, job, row_manifest):
+                    return
             if preflight is not None:
                 require_model_endpoint(preflight=preflight, before=job.key)
             charge_mb = budget.row_charge_mb(job.prep.vm_memory_mb)
@@ -4521,6 +4724,9 @@ def _run_jobs_concurrently(
                 # appeared while this row waited for memory still stops it.
                 if spend_cap_hit.is_set():
                     slots[index] = ("spend", None)
+                    return
+                if pause_hit.is_set():
+                    slots[index] = ("pause", None)
                     return
                 if stop_file_present():
                     halt.set()
@@ -4582,6 +4788,9 @@ def _run_jobs_concurrently(
             break
         if kind == "spend":
             status = "spend_cap"
+            break
+        if kind == "pause":
+            status = "pause"
             break
     # Third pass — the phase's rows, in job order.
     records: list[dict[str, Any]] = []
@@ -5536,8 +5745,10 @@ class QueueOutcome:
     """Jobs that left no usable session — the same count ``run_batch`` reports."""
     reason: str = ""
     """``""`` when the task finished everything it scheduled. Otherwise why it
-    stopped early: ``stop_file``, ``spend_cap``, ``gate`` or ``task_failed``
-    (the harness raised on this bug alone)."""
+    stopped early: ``stop_file``, ``pause``, ``spend_cap``, ``gate`` or
+    ``task_failed`` (the harness raised on this bug alone). ``pause`` is Phase
+    3's threshold, told apart from an operator's ``stop_file`` by the marker
+    :func:`_record_spend_pause` writes into STOP (:func:`_stop_reason`)."""
 
 
 def queue_stop_path(batch_dir: Path) -> Path:
@@ -5640,6 +5851,7 @@ def run_queue(
     show_hints: bool = False,
     plan_only: bool = False,
     max_spend_usd: Optional[float] = None,
+    pause_usd: Optional[float] = None,
     preflight: Optional[Callable[[], Optional[str]]] = None,
     config_block: Optional[dict[str, Any]] = None,
     prep_config_block: Optional[dict[str, Any]] = None,
@@ -5699,6 +5911,7 @@ def run_queue(
             show_hints=show_hints,
             plan_only=plan_only,
             max_spend_usd=max_spend_usd,
+            pause_usd=pause_usd,
             preflight=preflight,
             config_block=config_block,
             prep_config_block=prep_config_block,
@@ -5807,12 +6020,12 @@ def _run_queue(**kwargs: Any) -> tuple[int, list[QueueOutcome]]:
         outcomes.extend(wave_outcomes)
         # §8.1 — the gate is a statement about the earlier stages, so a wave whose
         # gate failed stops the next wave exactly as it does in `run_batch`. A
-        # deliberate stop (the file, the cap) does too, for a different reason: the
-        # operator or the budget said so.
+        # deliberate stop (the file, the pause, the cap) does too, for a different
+        # reason: the operator or the budget said so.
         stoppers = [
             outcome
             for outcome in wave_outcomes
-            if outcome.reason in ("stop_file", "spend_cap", "gate")
+            if outcome.reason in ("stop_file", "pause", "spend_cap", "gate")
         ]
         if stoppers:
             print(
@@ -5899,6 +6112,11 @@ def _run_task(
             show_hints=kwargs["show_hints"],
             plan_only=False,
             max_spend_usd=kwargs["max_spend_usd"],
+            # Phase 3's pause, read from the invocation and carried to every bug.
+            # `.get` because a caller that drives `_run_queue` with its own kwargs
+            # (a test) need not name it; absent means no pause, which is the
+            # behaviour every batch had before this item.
+            pause_usd=kwargs.get("pause_usd"),
             # G1 — the one gate `_run_queue` built for the whole batch, so every
             # worker of this wave reserves from the same budget.
             spend_gate=kwargs["spend_gate"],
@@ -5931,7 +6149,11 @@ def _run_task(
     reason = ""
     if code != 0:
         if stop_file.exists():
-            reason = "stop_file"
+            # The pause writes STOP itself, so its presence alone cannot say
+            # whether an operator asked for the stop or the budget did. The
+            # marker line tells them apart; an operator's own STOP reads as
+            # `stop_file`.
+            reason = _stop_reason(stop_file)
         elif kwargs["max_spend_usd"] is not None and _at_or_over_cap(
             # H7 — the reason this task stopped has to be the gate's own verdict.
             # `_at_or_over_cap` is the one micro-dollar comparison the gate makes

@@ -1176,6 +1176,39 @@ def max_spend_usd_from_env(env: Mapping[str, str]) -> Optional[float]:
     return cap
 
 
+def pause_spend_usd_from_env(env: Mapping[str, str]) -> Optional[float]:
+    """Phase 3 — ``VANTA_PAUSE_SPEND_USD``: the batch's pause, or ``None`` for none.
+
+    The pause is the cap's sibling one step earlier: a second, **harness-only**
+    threshold *below* ``VANTA_MAX_SPEND_USD`` at which the queue stops claiming
+    rows and writes STOP, so a run can be inspected before it is allowed to spend
+    the rest of its budget. It is read here for the same reason the cap is — it
+    belongs to the *invocation*, not to ``run_batch``, so a test that drives the
+    batch loop is not paused by whatever the developer exported.
+
+    This is deliberately **not** a frozen ``[env]`` key (§14.29's cap is), and it
+    is **not** a behavioural parameter: it changes nothing about any row, only
+    whether the next one is claimed, so it carries no ``config_hash``. Unset or
+    empty means no pause, which is how every batch before Phase 3 ran. A value
+    that is not a positive number is refused rather than ignored, exactly as the
+    cap is — a typo in a safety net must not quietly remove the net.
+    """
+    raw = (env.get("VANTA_PAUSE_SPEND_USD") or "").strip()
+    if not raw:
+        return None
+    try:
+        pause = float(raw)
+    except ValueError:
+        raise runner_mod.RunnerError(
+            f"VANTA_PAUSE_SPEND_USD='{raw}' is not a number; unset it for no pause."
+        )
+    if not pause > 0:
+        raise runner_mod.RunnerError(
+            f"VANTA_PAUSE_SPEND_USD='{raw}' must be > 0; unset it for no pause."
+        )
+    return pause
+
+
 def row_budget(
     args: argparse.Namespace, env: Mapping[str, str], *, flag: str
 ) -> budget_mod.Budget:
@@ -1365,6 +1398,18 @@ def cmd_run(args: argparse.Namespace) -> int:
             "the first job that would start once its rows' cost has reached this.",
             flush=True,
         )
+    # Phase 3 — the harness-only pause, a second threshold below the cap. Read and
+    # announced beside the cap; it stops the batch the same way, at STOP, so the
+    # resume is "delete STOP and re-run". Not in the frozen configuration, so it
+    # carries no config_hash and changes nothing about any row.
+    pause_usd = pause_spend_usd_from_env(invocation_env)
+    if pause_usd is not None:
+        print(
+            f"[spend] VANTA_PAUSE_SPEND_USD=${pause_usd:g}: the batch writes STOP and "
+            "stops before the first job that would start once its rows' cost has "
+            "reached this (delete STOP and re-run to continue).",
+            flush=True,
+        )
 
     # M3 item S6 — the ONE scheduler of this run. `--jobs 1` returns quietly and
     # changes nothing; above one it is announced here, before the first VM. The
@@ -1393,6 +1438,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         issues_dir=issues_dir_flag(args),
         plan_only=args.plan,
         max_spend_usd=max_spend_usd,
+        pause_usd=pause_usd,
         # Item 14's per-row half. `--plan` returns from `run_batch` before the loop,
         # so passing the probe unconditionally cannot make a plan need an endpoint.
         # Bound to the effective environment (item B1) so the per-row probe asks the
@@ -1675,6 +1721,18 @@ def _queue_pipeline(
             "once its rows' cost has reached this.",
             flush=True,
         )
+    # Phase 3 — the harness-only pause, a second threshold below the cap: at it the
+    # queue writes STOP and stops claiming, and re-running after deleting STOP
+    # continues. Read from the effective environment like the cap, so a phase-3
+    # batch can set it in the invocation rather than in the frozen file.
+    pause_usd = pause_spend_usd_from_env(invocation_env)
+    if pause_usd is not None:
+        print(
+            f"[spend] VANTA_PAUSE_SPEND_USD=${pause_usd:g}: the queue writes STOP and "
+            "stops claiming once its rows' cost has reached this (delete STOP and "
+            "re-run to continue).",
+            flush=True,
+        )
     # The queue's own refusals, made once here instead of once per bug — the same
     # five `_run_queue` makes before it prints the schedule.
     spellings = runner_mod._select_arms(split, arm_spellings)
@@ -1717,6 +1775,7 @@ def _queue_pipeline(
         # pipelined bug reads the same frozen report its prepare stage read.
         issues_dir=issues_dir_flag(args),
         max_spend_usd=max_spend_usd,
+        pause_usd=pause_usd,
         spend_gate=spend_gate,
         preflight=partial(runner_mod.model_endpoint_preflight, env=invocation_env),
         config_block=config_block,
@@ -2085,6 +2144,18 @@ def cmd_queue(args: argparse.Namespace) -> int:
             "once its rows' cost has reached this.",
             flush=True,
         )
+    # Phase 3 — the harness-only pause, a second threshold below the cap. At it the
+    # queue writes STOP and stops claiming; deleting STOP and re-running the same
+    # command continues towards the cap. Not in the frozen configuration, so it
+    # carries no config_hash and changes nothing about any row.
+    pause_usd = pause_spend_usd_from_env(invocation_env)
+    if pause_usd is not None:
+        print(
+            f"[spend] VANTA_PAUSE_SPEND_USD=${pause_usd:g}: the queue writes STOP and "
+            "stops claiming once its rows' cost has reached this (delete STOP and "
+            "re-run to continue).",
+            flush=True,
+        )
 
     # M3 item S6 — the ONE scheduler of this queue, shared by every worker and
     # threaded down into each per-bug `run_batch`; `--jobs 1` changes nothing.
@@ -2113,6 +2184,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
         issues_dir=issues_dir_flag(args),
         plan_only=args.plan,
         max_spend_usd=max_spend_usd,
+        pause_usd=pause_usd,
         # Bound to the effective environment (item B1), as in `run`.
         preflight=partial(runner_mod.model_endpoint_preflight, env=invocation_env),
         config_block=config_block,

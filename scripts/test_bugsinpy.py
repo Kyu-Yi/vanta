@@ -29388,6 +29388,32 @@ class TestSpendCapFromTheEnvironment:
             run_mod.max_spend_usd_from_env({"VANTA_MAX_SPEND_USD": raw})
 
 
+class TestPauseSpendFromTheEnvironment:
+    """Phase 3 — `VANTA_PAUSE_SPEND_USD`, the cap's sibling read at the invocation.
+
+    Read by the CLI for the same reason the cap is: a test that drives the batch
+    loop must not pause because the developer happened to export a value. It is
+    **harness-only** — not in `configs/v1-m3.toml`, so it carries no `config_hash`
+    and is not a behavioural parameter — and a typo is refused rather than read as
+    "no pause", because that silent direction would let a run spend to the cap
+    after the operator asked to stop short of it.
+    """
+
+    def test_unset_or_empty_means_no_pause(self):
+        assert run_mod.pause_spend_usd_from_env({}) is None
+        assert run_mod.pause_spend_usd_from_env({"VANTA_PAUSE_SPEND_USD": ""}) is None
+        assert run_mod.pause_spend_usd_from_env({"VANTA_PAUSE_SPEND_USD": "  "}) is None
+
+    def test_a_number_comes_back_as_a_float(self):
+        assert run_mod.pause_spend_usd_from_env({"VANTA_PAUSE_SPEND_USD": "90"}) == 90.0
+        assert run_mod.pause_spend_usd_from_env({"VANTA_PAUSE_SPEND_USD": " 89.5 "}) == 89.5
+
+    @pytest.mark.parametrize("raw", ["ninety", "0", "-1", "nan-ish"])
+    def test_a_typo_in_the_pause_is_refused_not_ignored(self, raw):
+        with pytest.raises(runner_mod.RunnerError, match="VANTA_PAUSE_SPEND_USD"):
+            run_mod.pause_spend_usd_from_env({"VANTA_PAUSE_SPEND_USD": raw})
+
+
 def _gate_row(
     *,
     bug: str = "Demo/1",
@@ -32540,7 +32566,7 @@ class TestRunBatchLoop:
         return preps, entries, split, calls, tmp_path / "batch"
 
     def _run(self, preps, entries, split, batch_dir, *, show_hints=False, max_spend_usd=None,
-             preflight=None, max_attempts=4):
+             pause_usd=None, preflight=None, max_attempts=4):
         return runner_mod.run_batch(
             batch_dir=batch_dir,
             batch_id="b1",
@@ -32554,6 +32580,7 @@ class TestRunBatchLoop:
             disk_mb=8192,
             show_hints=show_hints,
             max_spend_usd=max_spend_usd,
+            pause_usd=pause_usd,
             preflight=preflight,
         )
 
@@ -32707,6 +32734,85 @@ class TestRunBatchLoop:
         assert len(capped_calls) == len(ref_calls), (
             "an unpriced batch must run exactly the jobs it runs without a cap"
         )
+
+    # -- Phase 3, the pause -------------------------------------------------
+    def test_the_pause_stops_before_the_next_claim_and_resumes_exactly_once(
+        self, tmp_path, monkeypatch
+    ):
+        """Phase 3 — the pause is the cap's sibling one step earlier, and one-shot.
+
+        At the threshold the batch stops claiming, the row that crossed it is
+        already complete, STOP is written so the resume is the stop file's own
+        gesture ("delete STOP and re-run"), and `pause.json` records why. The
+        record is also the disarm marker: without it a resume over a batch still
+        at the threshold would pause again on its first claim and could never
+        spend the cap it was resumed to spend. So the assertions are that the
+        first run stops with exactly the one row written and both files on disk,
+        and that deleting STOP and re-running the same command finishes the batch
+        and writes no second row.
+        """
+        monkeypatch.setattr(
+            runner_mod, "git_revision", lambda *a, **k: runner_mod.Revision("h" * 40, False)
+        )
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            runner_mod, "run_job", self._cost_stub(tmp_path, calls, cost_usd=0.75)
+        )
+
+        code, _results = self._run(preps, entries, split, batch_dir, pause_usd=0.5)
+
+        assert len(calls) == 1, [job.label() for job in calls]
+        assert code == 1, "a paused batch must not report success"
+
+        stop = batch_dir / runner_mod.STOP_NAME
+        assert stop.exists(), "the pause writes STOP, so delete-and-re-run is the resume"
+        assert stop.read_text(encoding="utf-8").lstrip().startswith(
+            runner_mod.PAUSE_STOP_LINE
+        ), "the marker line is what tells a pause from an operator's own stop"
+
+        pause = json.loads(
+            (batch_dir / runner_mod.SPEND_PAUSE_NAME).read_text(encoding="utf-8")
+        )
+        assert pause["reason"] == "pause"
+        assert pause["pause_usd"] == 0.5
+        assert pause["spent_usd"] == 0.75, "the row that crossed the threshold is counted"
+        assert pause["first_unstarted_key"] != calls[0].key
+
+        manifest = manifest_mod.Manifest(batch_dir)
+        assert not manifest.is_done(pause["first_unstarted_key"]), (
+            "the refused job must keep no `done` key, or the pause would look complete"
+        )
+
+        # The one-shot resume: delete STOP and re-run the SAME command (same
+        # `pause_usd`), and the pause does not fire again — `pause.json` disarms it
+        # — so the batch continues to the end instead of stopping on its first claim.
+        stop.unlink()
+        before = len(calls)
+        code2, _ = self._run(preps, entries, split, batch_dir, pause_usd=0.5)
+        assert code2 == 0, "the resumed batch completes"
+        assert not stop.exists(), "the pause is one-shot: it must not write STOP again"
+        assert len(calls) > before, "the resume must start the refused job"
+        keys = [row["key"] for row in manifest.records()]
+        assert len(keys) == len(set(keys)), "a resume must not re-run a finished row"
+
+    def test_a_pause_never_fires_on_a_batch_that_did_not_ask_for_one(
+        self, tmp_path, monkeypatch
+    ):
+        """The pause is opt-in: with no `pause_usd` no batch ever writes STOP."""
+        monkeypatch.setattr(
+            runner_mod, "git_revision", lambda *a, **k: runner_mod.Revision("h" * 40, False)
+        )
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            runner_mod, "run_job", self._cost_stub(tmp_path, calls, cost_usd=0.75)
+        )
+
+        code, _ = self._run(preps, entries, split, batch_dir)
+
+        assert code == 0
+        assert calls, "the batch ran"
+        assert not (batch_dir / runner_mod.STOP_NAME).exists()
+        assert not (batch_dir / runner_mod.SPEND_PAUSE_NAME).exists()
 
     def test_the_hints_ablation_reaches_every_job_and_its_key(self, tmp_path, monkeypatch):
         """§2.4.4: ``--show-hints`` is part of the job *and* of its cursor key, off by default.
@@ -33170,6 +33276,7 @@ class TestRunBatchLoop:
                     checkpoint_pythons={"chk": "3.8.20"},
                     spend_gate=None,
                     stop_file=stop_file,
+                    pause_usd=None,
                     preflight=None,
                 )
         finally:
@@ -33321,6 +33428,7 @@ class TestQueue:
         waves=(1,),
         arm_spellings=None,
         max_spend_usd=None,
+        pause_usd=None,
     ):
         return runner_mod.run_queue(
             batch_dir=batch_dir,
@@ -33335,6 +33443,7 @@ class TestQueue:
             max_attempts=None,
             disk_mb=8192,
             max_spend_usd=max_spend_usd,
+            pause_usd=pause_usd,
             arm_spellings=arm_spellings,
         )
 
@@ -33516,6 +33625,95 @@ class TestQueue:
         )
         assert len(set(keys)) == 6, "3 bugs × 2 seeds, all reached across the two runs"
         assert {job.key for job in resumed_calls} == set(keys) - set(first_keys)
+
+    # -- Phase 3, the pause -----------------------------------------------
+    def test_the_pause_stops_the_queue_and_the_resume_finishes_it(
+        self, tmp_path, monkeypatch
+    ):
+        """The queue's pause: a stop it raises itself, told apart from an operator's.
+
+        The pause is checked before the *next* claim, so the row already written
+        stays complete; it writes STOP, so the resume is the stop file's own
+        gesture; `pause.json` is the disarm marker, so the re-run finishes the
+        queue instead of pausing on its first claim; and the outcome says `pause`
+        rather than `stop_file`, so the batch's own budget event is never reported
+        as an operator's stop.
+        """
+        batch_dir = tmp_path / "batch"
+        preps, entries, split, _calls = self._prepare(
+            monkeypatch, tmp_path, count=3, cost_usd=0.6
+        )
+
+        code, outcomes = self._run(preps, entries, split, batch_dir, jobs=1, pause_usd=0.5)
+        assert code == 1, "a paused queue must not report success"
+        assert "pause" in [outcome.reason for outcome in outcomes], (
+            "the pause's own STOP must read as `pause`, not an operator's `stop_file`"
+        )
+        stop = runner_mod.queue_stop_path(batch_dir)
+        assert stop.exists()
+        assert len(manifest_mod.Manifest(batch_dir).records()) == 1, (
+            "the pause leaves exactly the row that crossed the threshold"
+        )
+        pause = json.loads(
+            (batch_dir / runner_mod.SPEND_PAUSE_NAME).read_text(encoding="utf-8")
+        )
+        assert pause["reason"] == "pause"
+        assert pause["spent_usd"] == 0.6
+
+        stop.unlink()
+        code2, outcomes2 = self._run(
+            preps, entries, split, batch_dir, jobs=1, pause_usd=0.5
+        )
+        assert code2 == 0, "the resumed queue completes"
+        assert [outcome.reason for outcome in outcomes2] == ["", "", ""]
+        assert not stop.exists(), "the pause is one-shot: it must not write STOP again"
+        keys = [record["key"] for record in manifest_mod.Manifest(batch_dir).records()]
+        assert len(keys) == len(set(keys)) == 3, (
+            "a resume must finish the unstarted bugs and re-run no finished one"
+        )
+
+    def test_the_cap_counts_the_spend_across_the_pause_not_from_zero(
+        self, tmp_path, monkeypatch
+    ):
+        """The resume's spend comes from the batch's rows, so the cap still holds.
+
+        First run: one bug at $0.60 with pause $0.50 and cap $1.00 → the pause
+        fires with $0.60 already spent. Delete STOP and re-run the same command:
+        the second bug is admitted on the *remaining* $0.40 (the batch has not
+        forgotten the $0.60), it spends its own $0.60, and the third bug is refused
+        at the cap with $1.20 on the record. A resume that counted from zero would
+        have admitted the third bug and overshot the cap.
+        """
+        batch_dir = tmp_path / "batch"
+        preps, entries, split, _calls = self._prepare(
+            monkeypatch, tmp_path, count=3, cost_usd=0.6
+        )
+
+        code, outcomes = self._run(
+            preps, entries, split, batch_dir, jobs=1, max_spend_usd=1.0, pause_usd=0.5
+        )
+        assert code == 1
+        assert "pause" in [outcome.reason for outcome in outcomes]
+        assert not (batch_dir / runner_mod.SPEND_CAP_NAME).exists(), "the pause came first"
+
+        runner_mod.queue_stop_path(batch_dir).unlink()
+        code2, outcomes2 = self._run(
+            preps, entries, split, batch_dir, jobs=1, max_spend_usd=1.0, pause_usd=0.5
+        )
+        assert code2 == 1
+        assert "spend_cap" in [outcome.reason for outcome in outcomes2], (
+            "the cap stops the bug after the pause"
+        )
+        spend = json.loads(
+            (batch_dir / runner_mod.SPEND_CAP_NAME).read_text(encoding="utf-8")
+        )
+        assert spend["reason"] == "spend_cap"
+        assert spend["spent_usd"] == 1.2, (
+            "the $0.60 spent before the pause is still on the batch's record"
+        )
+        assert len(manifest_mod.Manifest(batch_dir).records()) == 2, (
+            "the third bug is refused before it writes a row"
+        )
 
     # -- the shared spend cap ---------------------------------------------
     def test_the_spend_cap_is_read_from_the_manifest_not_one_worker_s_counter(

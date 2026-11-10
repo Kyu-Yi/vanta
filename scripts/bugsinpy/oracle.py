@@ -327,6 +327,7 @@ def grade(
         disk_mb=disk_mb,
         drop_test_hunks=True,
         memory_mb=prep.vm_memory_mb,
+        budget=budget,
         timeout_secs=APPLY_TIMEOUT_SECS,
     )
     result.apply_ok = apply_ok

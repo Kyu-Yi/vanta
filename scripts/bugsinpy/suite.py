@@ -2155,6 +2155,7 @@ def git_apply_patch(
     disk_mb: int,
     drop_test_hunks: bool,
     memory_mb: Optional[int] = None,
+    budget: Optional[budget_mod.Budget] = None,
     timeout_secs: int = 300,
 ) -> tuple[bool, str, str]:
     """Apply a patch inside the VM. Strict — no fuzzy fallback (§5.2).
@@ -2172,6 +2173,11 @@ def git_apply_patch(
     see ``git apply``'s exit status and whether the run timed out, so the class is
     decided here and carried, rather than re-guessed from ``detail``'s text by
     every reader.
+
+    ``budget`` (M3 item Y1) is the invocation's one scheduler: the apply's VM is
+    one VM, so it holds one slot for as long as its :class:`VmRoot` is live exactly
+    as a suite run does. Without a budget — a test, ``pool``, ``mutants``, a
+    serial caller — it boots as it always did.
     """
     body = patch_path.read_text(encoding="utf-8")
     if drop_test_hunks:
@@ -2186,7 +2192,8 @@ def git_apply_patch(
     staged = batch_dir / staged_rel
     staged.parent.mkdir(parents=True, exist_ok=True)
     staged.write_text(body, encoding="utf-8")
-    with VmRoot(
+    gate = budget.slot(memory_mb=memory_mb) if budget is not None else nullcontext()
+    with gate, VmRoot(
         batch_dir=batch_dir, tree_rel=tree_rel, carry=(staged_rel,)
     ) as root:
         result = shuru.run(

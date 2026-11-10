@@ -26400,12 +26400,12 @@ class TestGateVmsHoldTheBudgetSlot:
 
     ``Budget`` counts suite runs (``suite._run_one_vm``); everything else a
     ``prepare`` boots — a tree's build, the collect gate, the import probe, the
-    collect-flip's two reports — was outside it, so ``--prepare-jobs`` capped
-    fewer VMs than were actually live. Each of those four functions now holds one
-    slot of the invocation's budget for the life of its VM, exactly as a suite run
-    does. The tests below watch the budget *from inside the boot*, which is the
-    only moment the claim is about: the slot is held while ``shuru.run`` is up and
-    released when it returns.
+    collect-flip's two reports, and the oracle's ``git apply`` — was outside it, so
+    ``--prepare-jobs`` capped fewer VMs than were actually live. Each of those five
+    functions now holds one slot of the invocation's budget for the life of its VM,
+    exactly as a suite run does. The tests below watch the budget *from inside the
+    boot*, which is the only moment the claim is about: the slot is held while
+    ``shuru.run`` is up and released when it returns.
     """
 
     @staticmethod
@@ -26471,9 +26471,16 @@ class TestGateVmsHoldTheBudgetSlot:
             test_cmd=["python", "-m", "pytest", "tests"], disk_mb=1024,
             memory_mb=8192, budget=budget,
         )
+        patch = tmp_path / "cand.patch"
+        patch.write_text("--- a/demo.py\n+++ b/demo.py\n", encoding="utf-8")
+        suite_mod.git_apply_patch(
+            checkpoint="chk", batch_dir=here, tree_rel="w/Demo_1/oracle_tree",
+            patch_path=patch, disk_mb=1024, drop_test_hunks=False,
+            memory_mb=1024, budget=budget,
+        )
 
         # Each VM asked for exactly its own charge, one core and its own memory.
-        assert taken == [(1, 4096), (1, 2048), (1, 1024), (1, 8192)]
+        assert taken == [(1, 4096), (1, 2048), (1, 1024), (1, 8192), (1, 1024)]
         # And each released it, so the budget was empty again for the next boot.
         assert live == []
         assert budget.peak_cores == 1
@@ -27122,6 +27129,9 @@ class TestOracleGrade:
             budget=budget,
         )
         assert [run["budget"] for run in wired["runs"]] == [budget, budget]
+        assert wired["apply"]["budget"] is budget, (
+            "the apply's VM holds a slot of the same budget while it boots"
+        )
 
     def test_a_grading_with_no_budget_stays_the_serial_pairs_it_was(self, wired, tmp_path):
         """The default leaf keeps every other caller — a test, ``pool``,
@@ -27129,6 +27139,7 @@ class TestOracleGrade:
         paths are unchanged and only the batch's own scheduler overlaps anything."""
         self._grade(wired, tmp_path)
         assert [run["budget"] for run in wired["runs"]] == [None, None]
+        assert wired["apply"]["budget"] is None
 
     def test_a_collect_flip_oracle_is_graded_with_no_declared_fail_to_pass(
         self, wired, tmp_path

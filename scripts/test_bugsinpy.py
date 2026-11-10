@@ -35018,6 +35018,162 @@ class TestPipelineQueue:
         ]
         assert max(wave_one) < events.index(("run", "C/3"))
 
+    # -- item T4: `--pipeline` honours `--seed-major` ----------------------
+    def test_seed_major_under_the_pipeline_prepares_the_wave_then_claims_seed_by_seed(
+        self, tmp_path, monkeypatch
+    ):
+        """Phase 3 runs ``queue --pipeline --seed-major``: the whole wave is
+        prepared first (seed 0 has to cover every bug before seed 1 starts), and
+        the rows are then claimed one seed at a time — every bug's seed 0, then
+        every bug's seed 1. Without the flag each bug's rows start the moment its
+        own prepare finishes, which is the point of the pipeline.
+
+        Only the claim order moves: the rows written are still one per
+        ``(bug, seed)``, claimed through the same ``runner._run_task`` unit.
+        """
+        split = _PipelineSplit(
+            [_pipeline_entry("A", 1), _pipeline_entry("B", 2), _pipeline_entry("C", 3)],
+            seeds=(0, 1),
+        )
+        events: list = []
+        claims: list = []
+
+        def run(*, wave, prep, stop_file, **kwargs):
+            claims.append((kwargs["seeds"][0], prep.key))
+            events.append(("run", prep.key))
+            return runner_mod.QueueOutcome(wave=wave, bug=prep.key, code=0)
+
+        code, _batch, events, _capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--seed-major", "--prepare-jobs", "3"),
+            run=run,
+            events=events,
+        )
+        assert code == run_mod.EXIT_OK
+        runs = [index for index, event in enumerate(events) if event[0] == "run"]
+        prepares = [
+            index for index, event in enumerate(events) if event[0] == "prepare"
+        ]
+        assert max(prepares) < min(runs), (
+            "with --seed-major no row is claimed until EVERY bug of the wave is "
+            "prepared: seed 0 has to cover the whole wave before seed 1 starts"
+        )
+        assert claims == [
+            (0, "A/1"), (0, "B/2"), (0, "C/3"),
+            (1, "A/1"), (1, "B/2"), (1, "C/3"),
+        ], "all bugs for seed 0, then all bugs for seed 1"
+
+    def test_without_seed_major_the_pipeline_claims_each_bug_in_one_go(
+        self, tmp_path, monkeypatch
+    ):
+        """The pipeline's own shape is unchanged when the flag is absent: one row
+        stage per bug covering all of the split's seeds, started as soon as that
+        bug's prepare finishes — no seed column, and no waiting for the wave."""
+        split = _PipelineSplit(
+            [_pipeline_entry("A", 1), _pipeline_entry("B", 2)], seeds=(0, 1)
+        )
+        scopes: list = []
+
+        def run(*, wave, prep, stop_file, **kwargs):
+            scopes.append((prep.key, tuple(kwargs["seeds"])))
+            return runner_mod.QueueOutcome(wave=wave, bug=prep.key, code=0)
+
+        code, _batch, _events, _capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--prepare-jobs", "2"),
+            run=run,
+        )
+        assert code == run_mod.EXIT_OK
+        assert sorted(scopes) == [("A/1", (0, 1)), ("B/2", (0, 1))], (
+            "without --seed-major a bug's rows run in one task over all seeds"
+        )
+
+    def test_a_seed_major_pipeline_pause_leaves_a_whole_seed_column_and_resumes(
+        self, tmp_path, monkeypatch
+    ):
+        """Item T4 under the pipeline: the pause lands on a seed boundary.
+
+        Seed 0's three bugs are prepared and claimed first, so a pause after that
+        column leaves it complete and no bug's seed 1 is claimed. Deleting STOP and
+        re-running the same command claims only seed 1, and no ``(bug, seed)`` is
+        claimed twice. ``queue --pipeline --seed-major`` is the Phase 3 command, so
+        this is the shape that has to hold.
+
+        The spend/pause machinery itself (`pause.json` as the one-shot marker,
+        STOP as the resume gesture) is `runner`'s and is exercised in ``TestQueue``;
+        what is on trial here is that the pipeline's seed-major claim loop stops at
+        the boundary and resumes from it.
+        """
+        batch_dir = tmp_path / "batch"
+        split = _PipelineSplit(
+            [_pipeline_entry("A", 1), _pipeline_entry("B", 2), _pipeline_entry("C", 3)],
+            seeds=(0, 1),
+        )
+        state = {"done": set(), "spent": 0.0}
+        ran: list = []
+
+        def make_run():
+            def run(*, wave, prep, stop_file, **kwargs):
+                seed = kwargs["seeds"][0]
+                if stop_file.exists():
+                    return runner_mod.QueueOutcome(
+                        wave=wave, bug=prep.key, code=1, reason="stop_file"
+                    )
+                if (seed, prep.key) in state["done"]:
+                    return runner_mod.QueueOutcome(wave=wave, bug=prep.key, code=0)
+                pause = runner_mod.SPEND_PAUSE_NAME
+                if not (batch_dir / pause).exists() and state["spent"] >= 0.5:
+                    # `_record_spend_pause`, in miniature: the disarm marker first,
+                    # then the stop file whose first line marks it as the pause's.
+                    (batch_dir / pause).write_text("{}\n", encoding="utf-8")
+                    stop_file.parent.mkdir(parents=True, exist_ok=True)
+                    stop_file.write_text(
+                        f"{runner_mod.PAUSE_STOP_LINE}\n", encoding="utf-8"
+                    )
+                    return runner_mod.QueueOutcome(
+                        wave=wave, bug=prep.key, code=1, reason="pause"
+                    )
+                state["done"].add((seed, prep.key))
+                state["spent"] += 0.2
+                ran.append((seed, prep.key))
+                return runner_mod.QueueOutcome(wave=wave, bug=prep.key, code=0)
+
+            return run
+
+        code, _batch, _events, _capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--seed-major", "--prepare-jobs", "3", "--jobs", "1"),
+            run=make_run(),
+        )
+        assert code == 1, "a paused pipeline must not report success"
+        assert ran == [(0, "A/1"), (0, "B/2"), (0, "C/3")], (
+            "the pause must leave the whole seed-0 column, not a diagonal"
+        )
+        assert runner_mod.queue_stop_path(batch_dir).exists()
+        assert not any(seed == 1 for seed, _key in ran), "seed 1 was never claimed"
+
+        runner_mod.queue_stop_path(batch_dir).unlink()
+        code2, _batch, _events, _capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--seed-major", "--prepare-jobs", "3", "--jobs", "1"),
+            run=make_run(),
+        )
+        assert code2 == run_mod.EXIT_OK, "the resumed pipeline completes"
+        assert ran[3:] == [(1, "A/1"), (1, "B/2"), (1, "C/3")], (
+            "the resume claims only seed 1"
+        )
+        assert len(ran) == len(set(ran)) == 6, (
+            "3 bugs × 2 seeds, each claimed exactly once across the two runs"
+        )
+
     # -- the record the command leaves -------------------------------------
     def test_the_batch_writes_prepare_json_once_for_the_whole_pipeline(
         self, tmp_path, monkeypatch

@@ -1599,6 +1599,13 @@ def _queue_pipeline(
         it is the record of.
       * ``--only``/``--waves``/``--reserves``/``--measure-only``/``--refreeze``
         select bugs exactly as they do in ``prepare``.
+
+    One thing the caller CAN change: ``--seed-major`` (Phase 3). With it a wave's rows
+    are claimed one seed at a time — every bug's seed 0, then every bug's seed 1, … —
+    which requires the whole wave to be prepared before the first row is claimed, so
+    the per-bug pipelining of the ROW stage gives way to a seed column at a time. The
+    prepare stage is unchanged (every bug of the wave is prepared at once) and the
+    rows written are still one per ``(bug, seed)``; only the claim order moves.
     """
     # The same two refusals `prepare` makes, in `prepare`'s own order and for the
     # same reasons: the flags are prepare flags and `--pipeline` runs the prepare.
@@ -1713,6 +1720,12 @@ def _queue_pipeline(
     )
 
     seeds = _parse_seeds(args.seeds) or split.seeds
+    # Phase 3 — `--seed-major` applies to the pipeline too. With it a wave's rows are
+    # claimed one seed at a time (every bug's seed 0, then every bug's seed 1, …) so a
+    # pause leaves a whole seed column done; without it each bug's rows start the
+    # moment its own prepare finishes, which is the point of `--pipeline`. Read here
+    # rather than dropped, so `--pipeline` and `--seed-major` never silently disagree.
+    seed_major = bool(args.seed_major)
     arm_spellings = _parse_arms(args.arms)
     max_spend_usd = max_spend_usd_from_env(invocation_env)
     if max_spend_usd is not None:
@@ -1795,8 +1808,10 @@ def _queue_pipeline(
             f"; one scheduler, cores={budget.cores}/{budget.cap_cores} "
             f"memory={'unbounded' if budget.cap_memory_mb is None else f'{budget.cap_memory_mb} MB'}"
         )
+    shape = "wave × seed × bug" if seed_major else "wave × bug"
+    task_count = len(selected) * (len(seeds) if seed_major else 1)
     print(
-        f"[queue] {len(selected)} task(s) = wave × bug, up to {args.jobs} rows at once, "
+        f"[queue] {task_count} task(s) = {shape}, up to {args.jobs} rows at once, "
         f"prepare up to {args.prepare_jobs}{tail}; stop file {stop_file}",
         flush=True,
     )
@@ -1883,6 +1898,14 @@ def _queue_pipeline(
                             flush=True,
                         )
                         continue
+                    if seed_major:
+                        # Phase 3 — with `--seed-major` no row is claimed until EVERY
+                        # bug of the wave is prepared (the seed-major block below):
+                        # seed 0 has to cover every bug before seed 1 starts, and that
+                        # is only claimable once all of them are ready. The prepare
+                        # stage itself is unchanged — every bug of the wave is still
+                        # prepared at once.
+                        continue
                     if stop_file.exists():
                         print(
                             f"  [queue] {stop_file} appeared: not claiming "
@@ -1903,15 +1926,65 @@ def _queue_pipeline(
                     preps.append(prepared[index])
                 for index in sorted(wave_broken):
                     broken.append(wave_broken[index])
-                for future in row_futures:
-                    wave_outcomes.append(future.result())
+                if seed_major:
+                    # Phase 3 — `_run_queue`'s own seed-major shape, applied to the bugs
+                    # this wave has just prepared: one scope per seed, each scope claimed
+                    # to completion before the next begins, so every bug's seed 0 is
+                    # claimed before any bug's seed 1 and a pause leaves a WHOLE seed
+                    # column done. `seeds` is narrowed to the scope exactly as
+                    # `_run_queue` narrows it, so the row written is the row the wave
+                    # would have written and only the claim order moved.
+                    for scope in [[seed] for seed in seeds]:
+                        if stop_file.exists():
+                            print(
+                                f"  [queue] {stop_file} appeared: not claiming "
+                                f"seed {scope[0]}.",
+                                flush=True,
+                            )
+                            break
+                        scope_futures = []
+                        for index in sorted(prepared):
+                            prep = prepared[index]
+                            if not prep.runnable:
+                                continue
+                            if stop_file.exists():
+                                print(
+                                    f"  [queue] {stop_file} appeared: not claiming "
+                                    f"{prep.key} at seed {scope[0]}.",
+                                    flush=True,
+                                )
+                                break
+                            scope_futures.append(
+                                row_pool.submit(
+                                    runner_mod._run_task,
+                                    wave=wave,
+                                    prep=prep,
+                                    stop_file=stop_file,
+                                    **dict(run_kwargs, seeds=list(scope)),
+                                )
+                            )
+                        scope_outcomes = [
+                            future.result() for future in scope_futures
+                        ]
+                        wave_outcomes.extend(scope_outcomes)
+                        if any(
+                            outcome.reason
+                            in ("stop_file", "pause", "spend_cap", "gate")
+                            for outcome in scope_outcomes
+                        ):
+                            break
+                else:
+                    for future in row_futures:
+                        wave_outcomes.append(future.result())
             outcomes.extend(wave_outcomes)
             # §8.1 — the same gate `_run_queue` applies: a wave whose gate failed,
-            # or that was stopped deliberately, stops the next wave.
+            # or that was stopped deliberately, stops the next wave. `pause` is in
+            # the list because `_stop_reason` spells the pause's own STOP that way,
+            # and a pause must stop the next wave exactly as an operator's STOP does.
             stoppers = [
                 outcome
                 for outcome in wave_outcomes
-                if outcome.reason in ("stop_file", "spend_cap", "gate")
+                if outcome.reason in ("stop_file", "pause", "spend_cap", "gate")
             ]
             if stoppers:
                 print(
@@ -3192,7 +3265,9 @@ def build_parser() -> argparse.ArgumentParser:
             "wave × seed × bug), so a pause or a stop leaves a whole seed column "
             "done instead of a diagonal through it. Changes only the claim order, "
             "not which rows run: a resumed batch writes the same rows either way. "
-            "Off by default, so a dev run is unchanged."
+            "With --pipeline the wave is prepared in full before its first row is "
+            "claimed, because seed 0 has to cover every bug. Off by default, so a "
+            "dev run is unchanged."
         ),
     )
     queue.add_argument(

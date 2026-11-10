@@ -4806,7 +4806,15 @@ pub async fn run(
                 // requested id, which would hide a provider serving a different
                 // snapshot than the one asked for. Appended last so every key an
                 // older row carried keeps its position.
-                usage.served_model.as_deref().unwrap_or("unset"),
+                //
+                // [VANTA-WHY] T2 — encoded space-free like every other free-text
+                // value on this row (`served_model_version_value` already encodes
+                // the collapsed form). A served id carrying a space would
+                // otherwise end the value early and could inject a `key=value`
+                // the row never wrote; the encoding leaves an ordinary id and the
+                // `unset` sentinel byte-for-byte, so every row already on disk
+                // keeps its meaning.
+                encode_summary_value(usage.served_model.as_deref().unwrap_or("unset")),
             ),
             timestamp: now_iso(),
             benchmark_instance: None,

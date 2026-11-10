@@ -5852,6 +5852,7 @@ def run_queue(
     plan_only: bool = False,
     max_spend_usd: Optional[float] = None,
     pause_usd: Optional[float] = None,
+    seed_major: bool = False,
     preflight: Optional[Callable[[], Optional[str]]] = None,
     config_block: Optional[dict[str, Any]] = None,
     prep_config_block: Optional[dict[str, Any]] = None,
@@ -5885,6 +5886,13 @@ def run_queue(
     therefore only the row cap: the memory and core budget can admit fewer rows
     than ``jobs`` at once, never more, and the same scheduler governs ``prepare``,
     ``run`` and the queue.
+
+    [VANTA-WHY] Phase 3 — ``seed_major`` reorders the claim sequence from
+    ``wave × bug`` to ``wave × seed × bug``: every bug's seed 0 is claimed before
+    any bug's seed 1. It changes only WHEN a row is claimed, never the row — each
+    task is still one bug handed to :func:`run_batch` with a single seed — so a
+    paused batch leaves a whole seed column done rather than a diagonal through
+    it. ``False`` (the default) is byte-for-byte the queue every dev run used.
     """
     if jobs < 1:
         raise RunnerError(f"--jobs must be at least 1, not {jobs}.")
@@ -5912,6 +5920,7 @@ def run_queue(
             plan_only=plan_only,
             max_spend_usd=max_spend_usd,
             pause_usd=pause_usd,
+            seed_major=seed_major,
             preflight=preflight,
             config_block=config_block,
             prep_config_block=prep_config_block,
@@ -5982,8 +5991,17 @@ def _run_queue(**kwargs: Any) -> tuple[int, list[QueueOutcome]]:
             f"; one scheduler, cores={budget.cores}/{budget.cap_cores} "
             f"memory={'unbounded' if budget.cap_memory_mb is None else f'{budget.cap_memory_mb} MB'}"
         )
+    # [VANTA-WHY] Phase 3 — with `--seed-major` the claim sequence is
+    # `wave × seed × bug`, so every bug's seed 0 is claimed before any bug's seed 1;
+    # a pause or a decision that lands mid-batch then leaves a COMPLETE seed column
+    # rather than a diagonal through it. Without the flag the shape is the
+    # `wave × bug` it always was, and every dev run is byte-for-byte unchanged.
+    seed_major = bool(kwargs.get("seed_major"))
+    scoped_seeds = list(kwargs["seeds"])
+    task_count = len(tasks) * (len(scoped_seeds) if seed_major else 1)
+    shape = "wave × seed × bug" if seed_major else "wave × bug"
     print(
-        f"[queue] {len(tasks)} task(s) = wave × bug, up to {jobs} at once{tail}; "
+        f"[queue] {task_count} task(s) = {shape}, up to {jobs} at once{tail}; "
         f"stop file {stop_file}",
         flush=True,
     )
@@ -6005,36 +6023,47 @@ def _run_queue(**kwargs: Any) -> tuple[int, list[QueueOutcome]]:
         wave_preps = by_wave.get(wave)
         if not wave_preps:
             continue
-        print(
-            f"\n=== wave {wave}: {len(wave_preps)} bug(s), up to "
-            f"{min(jobs, len(wave_preps))} at once ===",
-            flush=True,
-        )
-        wave_outcomes = _run_wave_tasks(
-            wave=wave,
-            bugs=wave_preps,
-            workers=jobs,
-            stop_file=stop_file,
-            **kwargs,
-        )
-        outcomes.extend(wave_outcomes)
-        # §8.1 — the gate is a statement about the earlier stages, so a wave whose
-        # gate failed stops the next wave exactly as it does in `run_batch`. A
-        # deliberate stop (the file, the pause, the cap) does too, for a different
-        # reason: the operator or the budget said so.
-        stoppers = [
-            outcome
-            for outcome in wave_outcomes
-            if outcome.reason in ("stop_file", "pause", "spend_cap", "gate")
-        ]
-        if stoppers:
+        # The seed scopes this wave is claimed in: one pass over every seed (the
+        # dev shape), or one pass per seed in `seeds` order (`--seed-major`). Each
+        # pass is `_run_wave_tasks` with `seeds` narrowed to that scope, so a row is
+        # literally the row the wave would have run and only the claim order moved.
+        scopes = [[seed] for seed in scoped_seeds] if seed_major else [scoped_seeds]
+        for scope in scopes:
+            label = f" wave {wave}"
+            if seed_major:
+                label += f" seed {scope[0]}"
             print(
-                f"\n=== queue stopped in wave {wave}: "
-                + ", ".join(f"{o.bug} ({o.reason})" for o in stoppers)
-                + " ===",
+                f"\n==={label}: {len(wave_preps)} bug(s), up to "
+                f"{min(jobs, len(wave_preps))} at once ===",
                 flush=True,
             )
-            break
+            wave_outcomes = _run_wave_tasks(
+                wave=wave,
+                bugs=wave_preps,
+                workers=jobs,
+                stop_file=stop_file,
+                **dict(kwargs, seeds=list(scope)),
+            )
+            outcomes.extend(wave_outcomes)
+            # §8.1 — the gate is a statement about the earlier stages, so a wave
+            # whose gate failed stops the next wave exactly as it does in
+            # `run_batch`. A deliberate stop (the file, the pause, the cap) does
+            # too, for a different reason: the operator or the budget said so.
+            stoppers = [
+                outcome
+                for outcome in wave_outcomes
+                if outcome.reason in ("stop_file", "pause", "spend_cap", "gate")
+            ]
+            if stoppers:
+                print(
+                    f"\n=== queue stopped in wave {wave}: "
+                    + ", ".join(f"{o.bug} ({o.reason})" for o in stoppers)
+                    + " ===",
+                    flush=True,
+                )
+                return (
+                    1 if any(outcome.code != 0 for outcome in outcomes) else 0
+                ), outcomes
     return (1 if any(outcome.code != 0 for outcome in outcomes) else 0), outcomes
 
 

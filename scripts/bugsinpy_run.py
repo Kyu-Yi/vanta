@@ -2185,6 +2185,9 @@ def cmd_queue(args: argparse.Namespace) -> int:
         plan_only=args.plan,
         max_spend_usd=max_spend_usd,
         pause_usd=pause_usd,
+        # M3 item T4 — Phase 3's claim order (wave × seed × bug). Off by default,
+        # so the dev queue claims exactly what it always did.
+        seed_major=args.seed_major,
         # Bound to the effective environment (item B1), as in `run`.
         preflight=partial(runner_mod.model_endpoint_preflight, env=invocation_env),
         config_block=config_block,
@@ -3179,6 +3182,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "the seeds to run, comma- or space-separated. Default: every seed the "
             "split declares; a value the split does not declare is refused"
+        ),
+    )
+    queue.add_argument(
+        "--seed-major",
+        action="store_true",
+        help=(
+            "Phase 3 — claim every bug's seed 0 before any bug's seed 1 (order "
+            "wave × seed × bug), so a pause or a stop leaves a whole seed column "
+            "done instead of a diagonal through it. Changes only the claim order, "
+            "not which rows run: a resumed batch writes the same rows either way. "
+            "Off by default, so a dev run is unchanged."
         ),
     )
     queue.add_argument(

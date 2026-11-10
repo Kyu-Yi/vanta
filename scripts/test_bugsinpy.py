@@ -33510,6 +33510,7 @@ class TestQueue:
         arm_spellings=None,
         max_spend_usd=None,
         pause_usd=None,
+        seed_major=False,
     ):
         return runner_mod.run_queue(
             batch_dir=batch_dir,
@@ -33525,6 +33526,7 @@ class TestQueue:
             disk_mb=8192,
             max_spend_usd=max_spend_usd,
             pause_usd=pause_usd,
+            seed_major=seed_major,
             arm_spellings=arm_spellings,
         )
 
@@ -33794,6 +33796,110 @@ class TestQueue:
         )
         assert len(manifest_mod.Manifest(batch_dir).records()) == 2, (
             "the third bug is refused before it writes a row"
+        )
+
+    # -- item T4, the seed-major claim order ------------------------------
+    def test_seed_major_claims_a_whole_seed_column_before_the_next(
+        self, tmp_path, monkeypatch
+    ):
+        """Phase 3's ordering: every bug's seed 0 precedes any bug's seed 1.
+
+        The claim sequence becomes ``wave × seed × bug`` so a pause or an operator's
+        stop leaves a COMPLETE seed column rather than a diagonal through it. Only
+        the order in which rows are claimed moves — the rows written are still one
+        per (bug, seed), and the default stays ``wave × bug``.
+        """
+        preps, entries, split, calls = self._prepare(
+            monkeypatch, tmp_path, count=3, seeds=(0, 1)
+        )
+        code, outcomes = self._run(
+            preps,
+            entries,
+            split,
+            tmp_path / "batch",
+            jobs=1,
+            seeds=[0, 1],
+            seed_major=True,
+        )
+        assert code == 0
+        assert [outcome.reason for outcome in outcomes] == [""] * 6
+        assert [job.seed for job in calls] == [0, 0, 0, 1, 1, 1], (
+            "with --seed-major all of seed 0 is claimed before seed 1 begins"
+        )
+        assert {job.bug for job in calls} == {p.key for p in preps}, (
+            "the flag reorders claims; it must not change which bugs run"
+        )
+        assert len(manifest_mod.Manifest(tmp_path / "batch").records()) == 6
+
+        # The default is the queue every dev run used: still `wave × bug`, so a
+        # single bug's seeds are adjacent rather than a whole column at a time.
+        default_preps, default_entries, default_split, default_calls = self._prepare(
+            monkeypatch, tmp_path, count=3, seeds=(0, 1)
+        )
+        self._run(
+            default_preps,
+            default_entries,
+            default_split,
+            tmp_path / "batch-default",
+            jobs=1,
+            seeds=[0, 1],
+        )
+        assert [job.seed for job in default_calls] == [0, 1, 0, 1, 0, 1], (
+            "without the flag each bug's seeds stay adjacent — unchanged"
+        )
+
+    def test_a_pause_under_seed_major_leaves_a_whole_seed_column_and_resumes(
+        self, tmp_path, monkeypatch
+    ):
+        """Item T4's point: the pause lands on a seed boundary, not a diagonal.
+
+        With ``--seed-major`` seed 0's three bugs are claimed, and their rows
+        written, before any bug's seed 1. A pause at that boundary therefore leaves
+        seed 0 complete; deleting STOP and re-running writes only seed 1, and no key
+        is written twice. The $0.20 rows against a $0.50 threshold cross the pause
+        exactly at the boundary (three rows = $0.60).
+        """
+        batch_dir = tmp_path / "batch"
+        preps, entries, split, _calls = self._prepare(
+            monkeypatch, tmp_path, count=3, seeds=(0, 1), cost_usd=0.2
+        )
+        code, outcomes = self._run(
+            preps,
+            entries,
+            split,
+            batch_dir,
+            jobs=1,
+            seeds=[0, 1],
+            pause_usd=0.5,
+            seed_major=True,
+        )
+        assert code == 1, "a paused queue must not report success"
+        assert "pause" in [outcome.reason for outcome in outcomes]
+        rows = manifest_mod.Manifest(batch_dir).records()
+        assert sorted(row["seed"] for row in rows) == [0, 0, 0], (
+            "the pause must leave the whole seed-0 column, not a diagonal"
+        )
+        assert len(rows) == 3, "and only that column — seed 1 was never claimed"
+
+        runner_mod.queue_stop_path(batch_dir).unlink()
+        code2, outcomes2 = self._run(
+            preps,
+            entries,
+            split,
+            batch_dir,
+            jobs=1,
+            seeds=[0, 1],
+            pause_usd=0.5,
+            seed_major=True,
+        )
+        assert code2 == 0, "the resumed queue completes"
+        assert [outcome.reason for outcome in outcomes2] == [""] * 6, (
+            "seed 0's rows are skipped as done and seed 1's three run — six claims, "
+            "no stop"
+        )
+        keys = [record["key"] for record in manifest_mod.Manifest(batch_dir).records()]
+        assert len(keys) == len(set(keys)) == 6, (
+            "3 bugs × 2 seeds, all reached across the two runs and none written twice"
         )
 
     # -- the shared spend cap ---------------------------------------------

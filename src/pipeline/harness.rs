@@ -1041,27 +1041,34 @@ pub fn native_vacuous_reason(
         side("original", original),
         side("patched", patched),
     );
-    if original.timed_out || patched.timed_out {
-        let which = match (original.timed_out, patched.timed_out) {
-            (true, true) => "both sides",
-            (true, false) => "the original side",
-            _ => "the patch side",
-        };
+    // [VANTA-WHY] v1-m3.1 F6 — the CAUSE of an original-side vacuity comes from the
+    // ORIGINAL side alone: a kill when `original.timed_out`, otherwise a collection
+    // error. A PATCHED-side timeout is never the cause — the patched side's kill is
+    // the patch's own cost (a failed attempt) — so it is reported SEPARATELY, and
+    // cannot be mistaken for why the gate is vacuous.
+    let patched_note = if patched.timed_out {
+        format!(
+            " Separately: the PATCHED side hit the run's {cap_secs}s wall-clock cap and was killed \
+             (patched timed_out=true) — that is the patch's own cost, not the cause of this vacuity."
+        )
+    } else {
+        String::new()
+    };
+    if original.timed_out {
         return format!(
             "native_timeout=true expected_tests={expected_tests} native_timeout_secs={cap_secs} — \
-             {which} of the in-session native suite hit the run's {cap_secs}s wall-clock cap and was \
-             killed, so the native gate could not run and is NOT evidence of zero regressions. Under \
-             v1-m3.1 the cap is 10× the bug's own prepare measurement (never below 1200 s), so a kill \
-             is not a cap to raise: an ORIGINAL side that cannot finish in it is this run failing to \
-             reproduce its own prepare measurement — an environment fault — and a patched side that \
-             cannot is the patch's cost, a failed attempt rather than this infra reason. {sides}",
+             the original side of the in-session native suite hit the run's {cap_secs}s wall-clock cap \
+             and was killed, so the native gate could not run and is NOT evidence of zero regressions. \
+             Under v1-m3.1 the cap is 10× the bug's own prepare measurement (never below 1200 s), so a \
+             kill is not a cap to raise: an ORIGINAL side that cannot finish in it is this run failing \
+             to reproduce its own prepare measurement — an environment fault. {sides}{patched_note}",
         );
     }
     format!(
         "native_vacuous=true expected_tests={expected_tests} — the row's own prepare recorded \
          {expected_tests} native test(s) for this bug, but the ORIGINAL side of the in-session suite \
          collected nothing, so the base tree could not be graded and the native gate could not run; \
-         this is NOT evidence of zero regressions: {sides}",
+         this is NOT evidence of zero regressions: {sides}{patched_note}",
     )
 }
 
@@ -3681,6 +3688,50 @@ mod tests {
         assert!(
             native_gate_vacuous(88642, &killed),
             "the guard's force is unchanged: an empty original is still vacuous"
+        );
+    }
+
+    /// [VANTA-WHY] v1-m3.1 F6 — the CAUSE is taken from the ORIGINAL side ALONE.
+    /// Here the original RAN and failed to collect (a collection error) while the
+    /// PATCHED side was killed by the cap. The old code asked
+    /// `original.timed_out || patched.timed_out`, so a patched-side kill alone
+    /// produced the `native_timeout` reason naming a cap the ORIGINAL side never
+    /// hit — pointing the operator at the wrong file. The cause here is the
+    /// original's collection error (`native_vacuous`), and the patched kill is
+    /// reported SEPARATELY as the patch's own cost.
+    #[test]
+    fn native_vacuous_reason_blames_the_original_side_not_a_patched_timeout() {
+        let mut original = vacuity_report(&[], true, Some(2));
+        original.stderr_tail = "native report collected 0 tests (report exitcode=2 \
+             failed_collectors=1 first_failed_collector=pandas/tests/io/test_x.py)"
+            .to_string();
+        let mut patched = vacuity_report(&[], false, None);
+        patched.timed_out = true;
+        patched.stderr_tail = "shuru exec TIMEOUT after 600s".to_string();
+
+        let reason = native_vacuous_reason(88642, 600, &original, &patched);
+
+        assert!(
+            reason.contains("native_vacuous=true"),
+            "the cause is the original side's collection error: {reason}"
+        );
+        assert!(
+            !reason.contains("native_timeout=true"),
+            "a PATCHED-side kill is not the cause, so the timeout reason must not fire: {reason}"
+        );
+        assert!(
+            reason.contains("failed_collectors=1")
+                && reason.contains("first_failed_collector=pandas/tests/io/test_x.py"),
+            "the cause is the module that broke the ORIGINAL collection: {reason}"
+        );
+        assert!(
+            reason.contains("Separately:") && reason.contains("patched timed_out=true")
+                && reason.contains("not the cause of this vacuity"),
+            "the patched kill must be named separately as the patch's own cost: {reason}"
+        );
+        assert!(
+            native_gate_vacuous(88642, &original),
+            "native_gate_vacuous is unchanged: an empty original is vacuous"
         );
     }
 

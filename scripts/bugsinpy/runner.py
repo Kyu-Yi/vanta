@@ -2885,6 +2885,14 @@ def build_record(
         # whose suite genuinely collected nothing. `native_secs` is `None` on a row
         # prepared before D1 or on a measure-only row; `native_timeout_secs` is then
         # the historical 120 s.
+        #
+        # [VANTA-WHY] Finding C (PR #4 review) — `native_timeout` is the CONFIGURED
+        # cap killing a side, never a DEADLINE-CLAMPED kill: the clamp cut the cap
+        # below `native_timeout_secs`, so the kill is the clock's doing and the row
+        # records it as `native_gate_clamped` instead. The flag still implies
+        # `native_vacuous` (it is set only for a vacuous gate), so every consumer
+        # below is unaffected; only the value on a clamped row changes, from the
+        # older `true` to `false`.
         "native_secs": prep.native_secs,
         "native_timeout_secs": _int(summary.get("native_timeout_secs")),
         "native_timeout": _bool(summary.get("native_timeout")),

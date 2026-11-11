@@ -863,6 +863,26 @@ fn native_vacuous_is_infrastructure(gate_clamped: bool, original_timed_out: bool
     native_vacuous_exit(gate_clamped, original_timed_out) != GovernorDecision::NeedsReview
 }
 
+/// Does a VACUOUS native gate set the run-level TIMEOUT flag (`run.summary`'s
+/// `native_timeout`)?
+///
+/// [VANTA-WHY] Finding C (PR #4 review) — the flag names one thing: a side was
+/// KILLED by the CONFIGURED cap (`native_cap`), so the vacuity's cause is the
+/// cap and not a tree that collected nothing. A kill by the DEADLINE CLAMP
+/// lowered the cap below the configured one, so it is the run's CLOCK killing
+/// the side, not the cap the run was configured with; that case must NOT set
+/// this flag (it is recorded by `native_gate_clamped` instead). It is still set
+/// only for a VACUOUS gate, so `native_timeout=true` continues to imply
+/// `native_vacuous=true` — the contract every consumer of the field relies on.
+fn native_timeout_flag(
+    native_vacuous: bool,
+    gate_clamped: bool,
+    original_timed_out: bool,
+    patched_timed_out: bool,
+) -> bool {
+    native_vacuous && !gate_clamped && (original_timed_out || patched_timed_out)
+}
+
 /// Did the native gate end as an INFRASTRUCTURE fault because a side could not be
 /// SET UP or transported (Finding A, PR #4 review)?
 ///
@@ -2073,6 +2093,15 @@ pub async fn run(
     // the two emptinesses have opposite remedies: raise the derived cap, or fix
     // the tree's import. A `true` here never changes the label — the run is
     // `InfraFailure` either way — it only records WHICH infra fault it was.
+    //
+    // [VANTA-WHY] Finding C (PR #4 review) — `native_timeout` means an in-session
+    // native run hit the CONFIGURED cap `native_cap` (either side). A kill by the
+    // DEADLINE CLAMP is NOT this flag: the clamp lowered the cap below the one the
+    // run was configured with, so the kill is the deadline's doing and is recorded
+    // by `native_gate_clamped` instead. Without the exclusion a clamped kill would
+    // set `native_timeout=true` and report a cap that the suite never actually ran
+    // under. The flag still implies `native_vacuous_seen` (it is set only when the
+    // gate is vacuous), which is what every consumer below relies on.
     let mut native_timeout_seen = false;
     // [VANTA-WHY] v1-m3.1 (§4) — the last attempt's PER-SIDE in-session wall time
     // and kill flag, carried out of the loop onto `run.summary` so the §8.1 reading
@@ -3921,7 +3950,19 @@ pub async fn run(
         // that collected nothing. Only meaningful when the gate is actually
         // vacuous; a timed-out side on a non-vacuous gate would mean the suite
         // still measured something, which the flag does not claim.
-        native_timeout_seen |= native_vacuous && (native_original.timed_out || native_patched.timed_out);
+        //
+        // [VANTA-WHY] Finding C (PR #4 review) — a kill by the DEADLINE CLAMP is
+        // excluded (`!gate_clamped`): the clamp cut the cap below the CONFIGURED
+        // `native_cap`, so the kill is the clock's doing and must not be reported
+        // as a configured-cap timeout. The clamp is recorded by
+        // `native_gate_clamped` instead, and the original side it killed takes the
+        // `budget_exhausted`/`NeedsReview` exit below — not the timeout label.
+        native_timeout_seen |= native_timeout_flag(
+            native_vacuous,
+            gate_clamped,
+            native_original.timed_out,
+            native_patched.timed_out,
+        );
         // [VANTA-WHY] v1-m3.1 (§4) — the per-side seconds and kill flags leave the
         // attempt here. The `*_secs` take the last Some seen (a `None` — an
         // unmeasured report — never erases an earlier measurement); the
@@ -5709,6 +5750,11 @@ pub async fn run(
             // `native_vacuous` so an older row's reader sees the same fields in
             // the same order; `native_timeout=true` always implies
             // `native_vacuous=true` and never changes the label.
+            //
+            // [VANTA-WHY] Finding C (PR #4 review) — the kill must be by the
+            // CONFIGURED cap. A side cut by the DEADLINE CLAMP is excluded here
+            // and recorded by `native_gate_clamped` instead, so `native_timeout`
+            // never names a cap the suite did not actually run under.
             native_cap,
             native_timeout_seen,
             // [VANTA-WHY] M3 item S1 — how many of this run's native gate calls
@@ -5969,6 +6015,10 @@ pub async fn run(
             // `native_timeout` beside it means a side was KILLED by that cap rather
             // than a tree that failed to import — opposite fixes, so the row must
             // not have to guess which one it got.
+            //
+            // [VANTA-WHY] Finding C (PR #4 review) — the kill must be by the
+            // CONFIGURED cap. A side cut by the DEADLINE CLAMP is excluded and
+            // recorded by `native_gate_clamped` on the row instead.
             "native_timeout_secs": config.native_timeout_secs,
             "native_timeout": native_timeout_seen,
             // [VANTA-WHY] v1-m3.1 (§4) — the per-side in-session wall time, the
@@ -7762,7 +7812,7 @@ mod tests {
         is_judge_site,
         ledger_text,
         modified_test_config_records, native_gate_cap, native_setup_failure, native_vacuous_exit,
-        native_vacuous_is_infrastructure, new_files_from_patch,
+        native_vacuous_is_infrastructure, native_timeout_flag, new_files_from_patch,
         open_fixed_round_record,
         patch_attempt_id_for_patch,
         prompt_over_budget_reason,
@@ -9963,6 +10013,60 @@ mod tests {
                     native_vacuous_exit(gate_clamped, original_timed_out)
                         != GovernorDecision::NeedsReview,
                 );
+            }
+        }
+    }
+
+    // [VANTA-WHY] Finding C (PR #4 review) — `native_timeout` (run.summary's
+    // `native_timeout`) must name a kill by the CONFIGURED cap, never a kill by the
+    // deadline clamp. The clamped kill is recorded by `native_gate_clamped` instead,
+    // and the row reads `native_timeout=false, native_vacuous=false,
+    // native_gate_clamped=true` — the exact triple the review asked for.
+    #[test]
+    fn a_clamped_kill_records_the_clamp_not_a_native_timeout() {
+        // The clamp case: 3000 s left under a 7250 s cap IS a clamp, and a side
+        // killed by it was killed by the CLOCK, not the configured cap.
+        let gate_cap = native_gate_cap(7250, Some(3000)).expect("time remains, so the gate runs");
+        let gate_clamped = gate_cap < 7250;
+        assert!(gate_clamped, "3000 s left under a 7250 s cap is a clamp");
+        assert!(
+            !native_timeout_flag(true, gate_clamped, true, false),
+            "a clamped kill of the original side must NOT set native_timeout"
+        );
+        assert!(
+            !native_timeout_flag(true, gate_clamped, false, true),
+            "a clamped kill of the patched side must NOT set native_timeout either"
+        );
+
+        // An UNCLAMPED vacuous gate killed by the configured cap DOES set it, on
+        // EITHER side — the flag's one documented meaning.
+        assert!(native_timeout_flag(true, false, true, false));
+        assert!(native_timeout_flag(true, false, false, true));
+        // A vacuous gate that was not killed (a tree that collected nothing) and a
+        // non-vacuous gate never set it; and `native_timeout=true` keeps implying
+        // `native_vacuous=true` for every combination.
+        assert!(!native_timeout_flag(true, false, false, false));
+        assert!(!native_timeout_flag(false, false, true, true));
+        for native_vacuous in [false, true] {
+            for gate_clamped in [false, true] {
+                for original_timed_out in [false, true] {
+                    for patched_timed_out in [false, true] {
+                        let flag = native_timeout_flag(
+                            native_vacuous,
+                            gate_clamped,
+                            original_timed_out,
+                            patched_timed_out,
+                        );
+                        assert!(
+                            !flag || native_vacuous,
+                            "native_timeout must always imply native_vacuous"
+                        );
+                        assert!(
+                            !flag || !gate_clamped,
+                            "a clamped kill must never set native_timeout"
+                        );
+                    }
+                }
             }
         }
     }

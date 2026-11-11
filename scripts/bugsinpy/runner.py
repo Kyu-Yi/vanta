@@ -2899,6 +2899,14 @@ def build_record(
         "native_original_timed_out": _bool(summary.get("native_original_timed_out")),
         "native_patched_timed_out": _bool(summary.get("native_patched_timed_out")),
         "native_session_cap_secs": _int(summary.get("native_session_cap_secs")),
+        # [VANTA-WHY] v1-m3.1 F5 — the cap the run's LAST native gate ACTUALLY ran
+        # under, after the deadline clamp lowered it. `native_session_cap_secs`
+        # above keeps its own meaning (the resolved/configured cap, the rule); this
+        # is what a clamped timeout must be attributed to, so a reader can see a
+        # `native_original_timed_out` beside the shorter limit that produced it.
+        # `None` (the driver prints `unset`) when no gate ran, and for a row older
+        # than the field.
+        "native_gate_effective_cap_secs": _int(summary.get("native_gate_effective_cap_secs")),
         # [VANTA-WHY] v1-m3.1 F3 — whether the run's LAST native gate ran under a
         # cap the deadline clamp lowered. Read back from `run.summary` so a
         # `budget_exhausted`/`NeedsReview` row whose ORIGINAL side was cut by the

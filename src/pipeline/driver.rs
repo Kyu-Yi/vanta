@@ -2073,6 +2073,13 @@ pub async fn run(
     // distinction is invisible: a clamped `budget_exhausted` row would look like a
     // machine fault that could not grade the base tree.
     let mut native_gate_clamped = false;
+    // [VANTA-WHY] v1-m3.1 F5 — the cap the LAST native gate ACTUALLY ran under,
+    // after the deadline clamp. `native_session_cap_secs` keeps its documented
+    // meaning (the resolved/configured cap, the rule); this field is what the
+    // suite was really given, so a clamped timeout can be attributed to the limit
+    // it ran under rather than to the longer one the run was configured with.
+    // `None` (`unset` on the row) when no gate ran at all.
+    let mut native_gate_effective_cap_secs: Option<u64> = None;
     // [VANTA-WHY] M3 item S1 — every native gate call's cache note, per attempt
     // and per side, so the reuse is auditable from the run's own artifacts: which
     // results were served from an earlier row, under which key, and from whose
@@ -3714,6 +3721,10 @@ pub async fn run(
         // `run.summary` (`native_gate_clamped`), so a reader can tell a clamped
         // gate from an unclamped one without comparing caps across rows.
         native_gate_clamped = gate_clamped;
+        // [VANTA-WHY] v1-m3.1 F5 — and the cap the gate ACTUALLY ran under
+        // (`native_gate_effective_cap_secs`), which the clamp may have lowered
+        // below the resolved `native_cap`. Last gate wins, like the per-side secs.
+        native_gate_effective_cap_secs = Some(gate_cap);
         let original_origin = format!("{}/a{}/original", session_id.as_str(), attempt + 1);
         let patched_origin = format!("{}/a{}/patched", session_id.as_str(), attempt + 1);
         let ((native_original, original_cache), (native_patched, patched_cache)) = tokio::join!(
@@ -5254,7 +5265,7 @@ pub async fn run(
              native_timeout_secs={} native_timeout={} native_cache_hits={} \
              native_original_secs={} native_patched_secs={} \
              native_original_timed_out={} native_patched_timed_out={} \
-             native_session_cap_secs={} native_gate_clamped={} \
+             native_session_cap_secs={} native_gate_effective_cap_secs={} native_gate_clamped={} \
              peak_sandboxes={} sandbox_backend={} model_version={}",
             attempts_run,
             fixed_at_attempt_1,
@@ -5592,6 +5603,14 @@ pub async fn run(
             native_original_timed_out,
             native_patched_timed_out,
             native_cap,
+            // [VANTA-WHY] v1-m3.1 F5 — the cap the LAST native gate actually ran
+            // under (after the deadline clamp), which is what a clamped timeout
+            // must be attributed to. `native_session_cap_secs` above keeps its own
+            // meaning (the resolved/configured cap, the rule). `unset` when no gate
+            // ran, so a reader sees a token, never a bare `None`.
+            native_gate_effective_cap_secs
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unset".to_string()),
             // [VANTA-WHY] v1-m3.1 F3 — whether the LAST native gate ran under a
             // clamp-lowered cap. `true` records the deadline clamp, which is how a
             // `budget_exhausted`/`NeedsReview` row whose ORIGINAL side was cut

@@ -1497,9 +1497,9 @@ def replay_row(
     # M3 item D1 / v1-m3.1 — a replay column runs the same *native* suite the live gate
     # ran (and, in the oracle view, ``hidden_command``) on a PATCHED tree, so its cap
     # must absorb the patch's own cost exactly as the gate's does: the shared 10×/1200
-    # rule (``native_session_timeout_secs``), NOT D1's 3×, which the luigi/23 probe
+    # rule (``native_session_timeout_secs``), NOT D1's 3×, which a dev probe
     # showed sat below a legitimate patch's own idle cost. The caller's value (1800) is
-    # the floor, so a short suite keeps its cap and a slow one gets room (pandas/6:
+    # the floor, so a short suite keeps its cap and a slow one gets room (a 725 s suite:
     # max(1800, 10 × 725) = 7250); ``native_secs`` is ``None`` on a row prepared before
     # D1, which keeps the cap the caller passed. Derived here rather than in
     # ``build_columns`` because this is the only place the suite is run.

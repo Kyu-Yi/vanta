@@ -6316,7 +6316,7 @@ class TestNativeSessionTimeoutDerivation:
     [VANTA-WHY] The D1 rule above (``max(120, 3 × measured)``) is the MEASUREMENT
     rule and stays where it is: its remaining callers run ONE tree. The gate runs
     TWO — the original and the patched tree — and the patched side is that suite
-    plus the patch. The luigi/23 probe measured a legitimate one-file
+    plus the patch. A dev probe measured a legitimate one-file
     ``luigi/scheduler.py`` change at ~3.6× the unpatched control (119/116 s vs
     33/31 s) with no load, so D1's 3× sat BELOW the patched suite's own cost and
     reported the patch as the harness's fault. These pin the new number, the new
@@ -6327,25 +6327,25 @@ class TestNativeSessionTimeoutDerivation:
         # pandas/1's native run is ~487 s (D1's own measurement); 10 × 487 clears
         # both the 1200 s floor and the patched side's own cost.
         assert suite_mod.native_session_timeout_secs(487.0, floor=1200) == 4870
-        # pandas/6 is the grader's case: its native run is ~725 s, and the oracle and
+        # The grader's slowest case is a 725 s suite, and the oracle and
         # replay call this rule at floor 1800, so both grade the patch under
         # max(1800, 10 × 725) = 7250 — clear of a 3.6× (2610 s) or 5× (3625 s) patch.
-        assert suite_mod.native_session_timeout_secs(725.0, floor=1800) == 7250, "pandas/6"
+        assert suite_mod.native_session_timeout_secs(725.0, floor=1800) == 7250, "a 725 s suite"
         assert suite_mod.native_session_timeout_secs(725.0, floor=1200) == 7250, (
             "the gate's own floor is below 10 × 725, so the measurement decides"
         )
 
     def test_a_short_suite_stays_at_the_1200_second_floor(self):
-        """fastapi/8 and luigi/23 are short suites, so 10 × is below the floor.
+        """Short suites, so 10 × is below the floor.
 
-        luigi/23's unpatched control ran 33 s (the probe's own measurement), so
-        ``10 × 33 = 330 < 1200`` and the floor is what ships. fastapi/8's native
+        A 33 s unpatched control (a dev probe's own measurement) gives
+        ``10 × 33 = 330 < 1200`` and the floor is what ships. A 10 s native
         suite is likewise sub-minute — the point of the example is that under the
         OLD rule such a suite was sent the 120 s cap, and the new floor is what
         that side now runs under.
         """
-        assert suite_mod.native_session_timeout_secs(33.0, floor=1200) == 1200, "luigi/23"
-        assert suite_mod.native_session_timeout_secs(10.0, floor=1200) == 1200, "fastapi/8"
+        assert suite_mod.native_session_timeout_secs(33.0, floor=1200) == 1200, "a 33 s suite"
+        assert suite_mod.native_session_timeout_secs(10.0, floor=1200) == 1200, "a 10 s suite"
         for measured in (5.0, 20.0, 59.0, 60.0):
             assert suite_mod.native_session_timeout_secs(measured, floor=1200) == 1200, (
                 f"a suite measured at {measured}s must not fall below the 1200 s floor"
@@ -28357,7 +28357,7 @@ class TestInvokeVantaCarriesTheNativeTimeout:
     no measurement (pre-D1, or a measure-only row) keeps the historical 120 s.
 
     [VANTA-WHY] v1-m3.1 (§8.3) — the GATE's rule is now ``max(1200, 10 × measured)``
-    over the same measurement, because the luigi/23 probe measured a legitimate
+    over the same measurement, because a dev probe measured a legitimate
     one-file patch at ~3.6× its unpatched control on an idle machine: D1's 3× sat
     below the patched side's own cost, so the cap, not the patch, ended the row.
     ``max(120, 3 × measured)`` remains the MEASUREMENT rule for the callers that run
@@ -39303,8 +39303,8 @@ class TestReplaySessionReuse:
         """v1-m3.1 §8.3 — a replay column grades the PATCHED tree, so it gets the gate rule.
 
         The column runs the same *native* suite the gate ran, plus the patch, so D1's
-        3× sat below a legitimate patch's own cost (luigi/23: 3.6×). The caller's 1800
-        is the floor: pandas/6's ~725 s measurement gives ``max(1800, 10 × 725) = 7250``
+        3× sat below a legitimate patch's own cost (a dev probe: 3.6×). The caller's
+        1800 is the floor: a 725 s measurement gives ``max(1800, 10 × 725) = 7250``
         and a short suite keeps the caller's cap.
         """
         for native_secs, expected in ((725.0, 7250), (33.0, replay_mod.DEFAULT_TIMEOUT_SECS)):

@@ -290,11 +290,11 @@ def grade(
     # in-session gate does (``patched_pair`` runs ``prep.test_cmd`` in full) on a
     # PATCHED tree, so the cap must absorb the patch's own cost exactly as the gate's
     # does: the shared 10×/1200 rule (``native_session_timeout_secs``), NOT D1's 3×,
-    # which the luigi/23 probe showed sat below a legitimate patch's own idle cost
+    # which a dev probe showed sat below a legitimate patch's own idle cost
     # (119/116 s vs 33/31 s). The floor is the caller's current value (1800), so a bug
-    # whose suite was measured fast keeps its cap and a slow one gets room (pandas/6:
-    # max(1800, 10 × 725) = 7250, which clears a 3.6× or 5× patch); the rule can only
-    # raise it.
+    # whose suite was measured fast keeps its cap and a slow one gets room (a 725 s
+    # suite: max(1800, 10 × 725) = 7250, which clears a 3.6× or 5× patch); the rule
+    # can only raise it.
     timeout_secs = suite_mod.native_session_timeout_secs(
         prep.native_secs, floor=timeout_secs
     )

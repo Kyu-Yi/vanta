@@ -2155,7 +2155,7 @@ def invoke_vanta(
     # (120 s), which pandas/1's ~487 s native run can never fit: the gate then killed both
     # runs, read as "collected nothing" and ended the row `native_vacuous` — an
     # `infra_failure` blamed on the tree for what was a fact about the CAP. D1's rule was
-    # `max(120, 3 × measured)`; it is now `max(1200, 10 × measured)`, because the luigi/23
+    # `max(120, 3 × measured)`; it is now `max(1200, 10 × measured)`, because a dev
     # probe measured a legitimate one-file patch at ~3.6× the unpatched suite on an idle
     # machine, above 3×. BOTH sides of the gate get this ONE value (see
     # `suite_mod.native_session_timeout_secs`): the original side is content-keyed in the

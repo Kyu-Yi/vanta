@@ -993,8 +993,8 @@ pub fn native_suite_collapsed(
 /// then absent from the patched report, so `native_regressions` names it (and
 /// `native_suite_collapsed` fires when the originals were not all passing). It is
 /// deliberately NOT read as vacuous here: that ended the run as `InfraFailure`
-/// and dropped the bug out of the attempt loop (fastapi/8, session 89ea1886,
-/// whose patch alone broke collection while the original ran 664 tests).
+/// and dropped the bug out of the attempt loop (an in-batch session, whose
+/// patch alone broke collection while the original ran its full suite).
 pub fn native_gate_vacuous(expected_tests: usize, original: &NativeSuiteReport) -> bool {
     expected_tests > 0 && original.collected_nothing()
 }
@@ -2500,14 +2500,14 @@ pub fn test_timeout_secs() -> u64 {
 ///
 /// [VANTA-WHY] The gate's two sides (original vs patched) run one repo suite under ONE
 /// cap, and that cap must absorb the patch's own cost as well as machine load. M3 item
-/// D1's rule (`max(120, 3 × prepare's measurement)`) did not: measured on luigi/23, a
-/// one-file `luigi/scheduler.py` patch costs ~3.6× the unpatched suite on an idle
+/// D1's rule (`max(120, 3 × prepare's measurement)`) did not: a dev probe measured a
+/// one-file `luigi/scheduler.py` patch at ~3.6× the unpatched suite on an idle
 /// machine (119/116 s vs 33/31 s), so the derived 120 s sat below the patched suite's
 /// own cost and the run's load pushed it past the kill. The floor is therefore 1200 s,
 /// and the harness's multiplier above it is 10× (`native_session_timeout_secs`).
 ///
 /// [VANTA-WHY] v1-m3.1 follow-up 7 — the floor was 600 s and is now 1200 s: 600 is only
-/// twice the luigi/23 patched side's idle cost, so under the batch's own load a
+/// twice that probe's patched side's idle cost, so under the batch's own load a
 /// legitimate patch there can still be killed, which is the failure the floor exists to
 /// prevent.
 ///
@@ -3534,7 +3534,7 @@ mod tests {
     ///
     /// [VANTA-WHY] v1-m3.1 (§8.1) — the key is the ORIGINAL side. A PATCHED side
     /// that collected nothing while the original ran is the patch's own failure,
-    /// which `native_regressions` already turns into a rejection (fastapi/8), so
+    /// which `native_regressions` already turns into a rejection, so
     /// it is NOT vacuous.
     #[test]
     fn native_gate_vacuous_fires_only_when_the_original_side_collected_nothing() {
@@ -3699,8 +3699,8 @@ mod tests {
     /// | ran      | ran     | no      | the broken  | the attempt's own     |
     ///
     /// Row 3 is the fix: an empty PATCHED side under a measuring original is the
-    /// patch's own failure (fastapi/8 — the patch broke collection while the
-    /// original ran 664 tests), and it reaches the Governor through
+    /// patch's own failure (the patch broke collection while the original ran its
+    /// full suite), and it reaches the Governor through
     /// `native_regressions` because no original test survives in an empty patched
     /// report. Rows 1–2 and 4 are mode-independent: the guard takes no
     /// `GovernorMode`, so Repair and Review answer them identically. The mode

@@ -118,11 +118,11 @@ pub struct RunConfig {
     /// The native gate runs the repo's own suite twice in-session — original tree vs
     /// patched tree, both under THIS one cap — and that suite is not always fast:
     /// pandas/1's takes ~487 s through prepare while the fixed 120 s cap killed BOTH
-    /// in-session runs, so the row died as a false "collected nothing" (measured
-    /// session, night3). The patched side is the suite PLUS the patch, so the cap has
-    /// to absorb the patch's own cost as well: luigi/23's one-file `luigi/scheduler.py`
+    /// in-session runs, so the row died as a false "collected nothing" (a dev run).
+    /// The patched side is the suite PLUS the patch, so the cap has
+    /// to absorb the patch's own cost as well: a one-file `luigi/scheduler.py`
     /// patch cost ~3.6× the unpatched suite on an idle machine (119/116 s vs 33/31 s),
-    /// above D1's 3× (probe: `plans/private/diag_luigi23.py`, 2026-11-12). A per-bug cap
+    /// above D1's 3× (a dev probe, 2026-11-12). A per-bug cap
     /// derived from a measured run is the only value that is both large enough for the
     /// bug and still bounded; the two sides share it because the cap is part of the
     /// suite-cache key (`suite_cache::native_key`, M3 item S1).
@@ -808,7 +808,7 @@ pub fn resolve_native_timeout_secs(requested: Option<u64>) -> Result<u64, String
 /// (v1-m3.1 §8.4).
 ///
 /// [VANTA-WHY] The gate runs AFTER the deadline check at the top of the attempt, so a
-/// row with a slow suite (pandas/6: 7250 s per side) can start the gate with less than
+/// row with a slow suite (a 725 s suite: 7250 s per side) can start the gate with less than
 /// 7250 s left and outlive `VANTA_DEADLINE_SECS` on its own. The harness then
 /// hard-kills the whole row at `RUN_TIMEOUT_SECS` before the next attempt top can
 /// honour the deadline, and a hard-killed row leaves no manifest entry — it is
@@ -1745,7 +1745,7 @@ pub async fn run(
     // `run.summary`), so "the patched side's native cap differs from the baseline's" is
     // impossible by construction. Read as written, the message invited the opposite
     // reading — that the native gate ran its two sides under two different caps — which
-    // §8.5 of `plans/private/v1m3.1-fix-design.md` removes.
+    // §8.5 of the v1-m3.1 design note removes.
     let baseline_test_timeout_secs = crate::pipeline::harness::test_timeout_secs();
     let patched_test_timeout_secs = crate::pipeline::harness::patched_test_timeout_secs();
     if baseline_test_timeout_secs != patched_test_timeout_secs {
@@ -2805,6 +2805,7 @@ pub async fn run(
                     // config option: `None` would otherwise fall through to the
                     // 120 s default inside `run_native_suite` and grade the
                     // candidate under a cap the gate never used.
+                    // Post-gate bound: 1 attempt ≤ max_call_secs (3600 s) + native_cap (7250 s) = 10850 s < 13800 s.
                     harness::run_native_suite(
                         &judge_patched_concat,
                         &test_cmd,
@@ -3650,8 +3651,8 @@ pub async fn run(
         // cross-arm reuse (item S1) it is measured for.
         // [VANTA-WHY] v1-m3.1 (§8.4/§8.5) — the gate is CLAMPED to the run's clock.
         // The attempt top checked the deadline, but this attempt has already spent
-        // time (Attacker, BATE, the patched run), so a slow row's gate (pandas/6: 7250 s
-        // per side) can start with less than 7250 s left and outlive `VANTA_DEADLINE_SECS`
+        // time (Attacker, BATE, the patched run), so a slow row's gate (a 725 s suite:
+        // 7250 s per side) can start with less than 7250 s left and outlive `VANTA_DEADLINE_SECS`
         // on its own. The harness would then hard-kill the whole row at
         // `RUN_TIMEOUT_SECS` before the next attempt top could honour the deadline, and a
         // hard-killed row writes no manifest entry — invisible to the wave-1 gate. BOTH
@@ -3738,9 +3739,9 @@ pub async fn run(
         // FAILED ATTEMPT, never `InfraFailure`. It reaches the Governor on its
         // own, because every original test is then absent from the patched report
         // (`native_regressions`, and `native_suite_collapsed`). Reading it as
-        // vacuous is what labelled fastapi/8 (session 89ea1886) `infra_failure`
+        // vacuous is what labelled an in-batch session `infra_failure`
         // and dropped the bug out of the attempt loop, though its patch alone
-        // broke collection while the original ran 664 tests — the pre-registration
+        // broke collection while the original ran its full suite — the pre-registration
         // counts a patch-caused import error as a `fail`, not censored.
         let native_expected = config.native_expected_tests.unwrap_or(0);
         let native_vacuous = harness::native_gate_vacuous(native_expected, &native_original);
@@ -8075,10 +8076,10 @@ mod tests {
     /// regression), and `attempt_verdict` rejects on it in any mode. In review
     /// mode that rejection IS the candidate's verdict — a recorded reject, not a
     /// censored `infra_failure`; in repair mode it is a round the Creator gets
-    /// back and retries. fastapi/8 (session 89ea1886) used to leave this path
+    /// back and retries. An in-batch session used to leave this path
     /// entirely and end the row `infra_failure`, dropping the bug out of the
     /// attempt loop, though its patch alone broke collection while the original
-    /// ran 664 tests.
+    /// ran its full suite.
     #[test]
     fn an_empty_patched_side_fails_the_attempt_in_both_modes() {
         for mode in [GovernorMode::Repair, GovernorMode::Review] {
@@ -9504,7 +9505,7 @@ mod tests {
     }
 
     // [VANTA-WHY] v1-m3.1 (§8.4) — the native gate's cap is CLAMPED to the time the
-    // run's clock has left, so a slow row's gate (pandas/6: 7250 s per side) cannot
+    // run's clock has left, so a slow row's gate (a 725 s suite: 7250 s per side) cannot
     // start with less than its cap on the clock and outlive `VANTA_DEADLINE_SECS` on
     // its own. `native_gate_cap` is the pure rule; the call site passes the ONE value
     // it returns to BOTH sides of the `tokio::join!`, so the two sides stay the same
@@ -9512,7 +9513,7 @@ mod tests {
     #[test]
     fn the_native_gate_cap_is_clamped_to_the_time_left_and_can_only_lower() {
         // Less time on the clock than the cap: the gate gets the time left —
-        // pandas/6's 7250 s resolved cap, with 3000 s left.
+        // a 725 s suite's 7250 s resolved cap, with 3000 s left.
         assert_eq!(native_gate_cap(7250, Some(3000)), Some(3000));
         assert_eq!(native_gate_cap(1200, Some(1199)), Some(1199));
         // At least the cap left: the FULL cap, unchanged. The clamp can only LOWER

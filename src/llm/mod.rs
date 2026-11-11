@@ -124,7 +124,7 @@ pub fn deadline_past() -> bool {
 /// or `None` when no deadline is armed.
 ///
 /// [VANTA-WHY] v1-m3.1 (§8.4) — the native gate's per-attempt cap is CLAMPED to the
-/// time the run has left (`min(native_cap, remaining)`), so a slow gate (pandas/6:
+/// time the run has left (`min(native_cap, remaining)`), so a slow gate (a 725 s suite:
 /// 7250 s per side) cannot start with less than its cap on the clock and outlive the
 /// deadline on its own. `deadline_past()` answers only the yes/no question; this
 /// answers "how many seconds are left". A deadline that has passed — or is within the

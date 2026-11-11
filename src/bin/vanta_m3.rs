@@ -105,7 +105,7 @@ struct CliArgs {
     /// The gate runs the repo's own suite twice in-session — the original tree and the
     /// patched tree, both under THIS one cap. pandas/1's suite takes ~487 s through
     /// prepare, so the fixed 120 s cap killed BOTH runs and the row died as a false
-    /// "collected nothing" (night3); luigi/23's one-file `luigi/scheduler.py` patch
+    /// "collected nothing" (an in-batch session); a one-file `luigi/scheduler.py` patch
     /// cost ~3.6× the unpatched suite (119/116 s vs 33/31 s), above D1's 3×. A per-bug
     /// cap is the only value both large enough for the bug and still bounded.
     native_timeout_secs: Option<u64>,

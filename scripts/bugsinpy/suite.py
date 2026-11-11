@@ -341,10 +341,10 @@ def native_timeout_secs(native_secs: Optional[float], *, floor: int) -> int:
     the development probe ``scripts/probe_xdist.py`` (floor 1800). ``oracle.py`` and
     ``replay.py`` USED to call it here (both at floor 1800), but they grade a PATCHED
     tree — and, in the oracle view, run the hidden nodeids — so a legitimate patch that
-    is ``3.6×`` the unpatched suite (the luigi/23 probe) exceeded their ``max(1800, 3 ×
+    is ``3.6×`` the unpatched suite (a dev probe) exceeded their ``max(1800, 3 ×
     native)`` cap and was censored. They now call :func:`native_session_timeout_secs`,
-    the same shared 10×/1200 rule the in-session GATE uses (§8.3 of
-    ``plans/private/v1m3.1-fix-design.md``), and keep the floor 1800. Keeping the two
+    the same shared 10×/1200 rule the in-session GATE uses (§8.3 of the v1-m3.1
+    design note), and keep the floor 1800. Keeping the two
     rules apart is what stops a raise meant for the gate from also raising the dev
     probe's cap.
 
@@ -361,7 +361,7 @@ NATIVE_SESSION_TIMEOUT_FLOOR_SECS = 1200
 """The in-session native GATE's cap floor — the smallest cap either side may run under.
 
 [VANTA-WHY] v1-m3.1 (§8.3). D1 derived the gate's cap as ``max(120, 3 × prepare's
-measured native seconds)``. The luigi/23 probe measured a LEGITIMATE patch at ~3.6× the
+measured native seconds)``. A dev probe measured a LEGITIMATE patch at ~3.6× the
 unpatched control (``luigi/scheduler.py``: 119/116 s against 33/31 s), so 3× is not a
 margin at all — the old cap sat below the patched suite's own idle-machine cost, and the
 run's load then pushed it past the kill. The gate's two sides therefore get a floor of
@@ -369,7 +369,7 @@ run's load then pushed it past the kill. The gate's two sides therefore get a fl
 the margin for a suite that is longer still.
 
 [VANTA-WHY] v1-m3.1 follow-up 7 — the floor was 600 s and is now 1200 s. A 600 s floor
-is only twice the luigi/23 patched side's idle cost; under the batch's own load a
+is only twice a dev probe's patched side's idle cost; under the batch's own load a
 legitimate patch there can still be killed, which is the same failure the floor exists
 to prevent. 20 minutes leaves that pair (and the sub-minute suites that sit on the
 floor) room to finish with the machine busy.
@@ -411,7 +411,7 @@ def native_session_timeout_secs(native_secs: Optional[float], *, floor: int) -> 
     The gate runs the ORIGINAL and the PATCHED tree, and the patched side is NOT the
     suite prepare measured: it is that suite plus the patch. The cap therefore has to
     absorb the patch's own cost as well as machine load, and D1's 3× does not — the
-    luigi/23 probe measured a one-file ``luigi/scheduler.py`` change at ~3.6× the
+    dev probe measured a one-file ``luigi/scheduler.py`` change at ~3.6× the
     unpatched suite (119/116 s vs 33/31 s) with no load at all. The rule is
     ``max(1200, 10 × measured)``.
 

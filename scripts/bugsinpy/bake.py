@@ -10686,14 +10686,13 @@ STDLIB_BACKPORTS: Mapping[str, StdlibBackport] = {
         since="3.4",
         evidence=(
             "§8.6 round 11: the date rule pins enum34==1.1.6 transitively for luigi/7, "
-            "one held-out luigi bug and luigi/5 (hypothesis==3.17.0/3.11.6/3.42.2 each "
-            "declare it bare), and luigi/7's and luigi/5's full prepare dies at pytest "
-            "start-up with 'TypeError: an integer is required (got type bytes)'. Two "
-            "further luigi bugs carry no enum34 (their hypotheses are older still, 3.6.1 "
-            "and 3.4.0) but fail an earlier gate (empty FAIL_TO_PASS) and never run, so "
-            "they are not evidence that the suite runs without it; the held-out bug above "
-            "carries enum34 and fails that same earlier gate. The frozen issue's own text "
-            "opens '# no mo enum 34'"
+            "luigi/8 and luigi/5 (hypothesis==3.17.0/3.11.6/3.42.2 each declare it bare), "
+            "and luigi/7's and luigi/5's full prepare dies at pytest start-up with "
+            "'TypeError: an integer is required (got type bytes)'. luigi/9 and luigi/12 "
+            "carry no enum34 (their hypotheses are older still, 3.6.1 and 3.4.0) but fail "
+            "an earlier gate (empty FAIL_TO_PASS) and never run, so they are not evidence "
+            "that the suite runs without it; luigi/8 carries enum34 and fails that same "
+            "earlier gate. The frozen issue's own text opens '# no mo enum 34'"
         ),
     ),
 }

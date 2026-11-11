@@ -1992,6 +1992,19 @@ pub async fn run(
     // the tree's import. A `true` here never changes the label — the run is
     // `InfraFailure` either way — it only records WHICH infra fault it was.
     let mut native_timeout_seen = false;
+    // [VANTA-WHY] v1-m3.1 (§4) — the last attempt's PER-SIDE in-session wall time
+    // and kill flag, carried out of the loop onto `run.summary` so the §8.1 reading
+    // is auditable from the artifact. `native_original_secs` is the original side's
+    // own seconds (a cache hit carries the served report's measurement, which is
+    // still a measurement of identical bytes — `native_cache` names the source
+    // row); `native_patched_secs` the patched side's. The `*_timed_out` flags are
+    // OR'd across attempts (like `native_timeout_seen`) so a kill on ANY attempt is
+    // not lost when a later attempt happens to finish; the `*_secs` values take the
+    // last Some seen.
+    let mut native_original_secs: Option<f64> = None;
+    let mut native_patched_secs: Option<f64> = None;
+    let mut native_original_timed_out = false;
+    let mut native_patched_timed_out = false;
     // [VANTA-WHY] M3 item S1 — every native gate call's cache note, per attempt
     // and per side, so the reuse is auditable from the run's own artifacts: which
     // results were served from an earlier row, under which key, and from whose
@@ -3654,6 +3667,18 @@ pub async fn run(
         // vacuous; a timed-out side on a non-vacuous gate would mean the suite
         // still measured something, which the flag does not claim.
         native_timeout_seen |= native_vacuous && (native_original.timed_out || native_patched.timed_out);
+        // [VANTA-WHY] v1-m3.1 (§4) — the per-side seconds and kill flags leave the
+        // attempt here. The `*_secs` take the last Some seen (a `None` — an
+        // unmeasured report — never erases an earlier measurement); the
+        // `*_timed_out` flags only ever set true.
+        if native_original.secs.is_some() {
+            native_original_secs = native_original.secs;
+        }
+        if native_patched.secs.is_some() {
+            native_patched_secs = native_patched.secs;
+        }
+        native_original_timed_out |= native_original.timed_out;
+        native_patched_timed_out |= native_patched.timed_out;
         let mut native_regressions =
             harness::native_regressions(&native_original.tests, &native_patched.tests);
         // [VANTA-WHY] A suite that ran N>0 tests on the original and collects
@@ -5081,6 +5106,9 @@ pub async fn run(
              n_ctx={} creator_effort={} creator_effort_mechanism={} \
              creator_prompt_tokens={}{}{}{} fixed_rounds={} native_vacuous={} \
              native_timeout_secs={} native_timeout={} native_cache_hits={} \
+             native_original_secs={} native_patched_secs={} \
+             native_original_timed_out={} native_patched_timed_out={} \
+             native_session_cap_secs={} \
              peak_sandboxes={} sandbox_backend={} model_version={}",
             attempts_run,
             fixed_at_attempt_1,
@@ -5404,6 +5432,20 @@ pub async fn run(
             // (nothing reads it), appended after `native_timeout` so an older
             // row's reader sees the same fields in the same order.
             native_cache_hits,
+            // [VANTA-WHY] v1-m3.1 (§4) — the per-side in-session seconds, the
+            // per-side kill flags and the cap those runs actually used. `unset`
+            // (never a bare `None`) for a side that produced no wall time, so a
+            // `key=value` reader sees a token, not a Rust Debug string. Appended
+            // after `native_cache_hits` so an older row's reader is unaffected.
+            native_original_secs
+                .map(|s| format!("{:.3}", s))
+                .unwrap_or_else(|| "unset".to_string()),
+            native_patched_secs
+                .map(|s| format!("{:.3}", s))
+                .unwrap_or_else(|| "unset".to_string()),
+            native_original_timed_out,
+            native_patched_timed_out,
+            native_cap,
             // [VANTA-WHY] M3 item S6 — the exact peak of simultaneous live
             // microVMs this run booted (`sandbox::peak_sandboxes`), space-free so
             // it survives the `key=value` reader. The scheduler charges a row
@@ -5630,6 +5672,16 @@ pub async fn run(
             // not have to guess which one it got.
             "native_timeout_secs": config.native_timeout_secs,
             "native_timeout": native_timeout_seen,
+            // [VANTA-WHY] v1-m3.1 (§4) — the per-side in-session wall time, the
+            // per-side kill flag and the cap those runs actually ran under, so the
+            // §8.1 reading and the number that produced it are both in the
+            // artifact. `None` = a side that produced no wall time. Appended after
+            // `native_timeout` so an older row's reader is unaffected.
+            "native_original_secs": native_original_secs,
+            "native_patched_secs": native_patched_secs,
+            "native_original_timed_out": native_original_timed_out,
+            "native_patched_timed_out": native_patched_timed_out,
+            "native_session_cap_secs": native_cap,
             // [VANTA-WHY] M3 item S1 — one entry per native gate call (attempt ×
             // side) recording whether the result was measured or served from the
             // suite cache, under which key, and from whose row. The reuse is

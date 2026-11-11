@@ -2018,6 +2018,23 @@ def _number(value: Optional[str]) -> Any:
     return int(parsed) if parsed.is_integer() and "." not in value else parsed
 
 
+def _secs(value: Optional[str]) -> Optional[float]:
+    """v1-m3.1 §4 — a per-side native wall time, or ``None`` when unmeasured.
+
+    Same contract as ``_cost`` (§14.29) and for the same reason: the driver prints
+    ``unset`` for a side that produced no wall time, and a reader that must not
+    confuse that with a number maps it to ``None``. Distinct from ``_number``,
+    which keeps a non-numeric token verbatim (a reader of a NATIVE SECONDS field
+    cannot do that, or ``unset`` would land on the row as the string ``"unset"``).
+    """
+    if value is None or value == "unset":
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
 def _cost(value: Optional[str]) -> Optional[float]:
     """§14.29 — a cost is a float or ``None``, never the string ``unset``.
 
@@ -2856,6 +2873,17 @@ def build_record(
         "native_secs": prep.native_secs,
         "native_timeout_secs": _int(summary.get("native_timeout_secs")),
         "native_timeout": _bool(summary.get("native_timeout")),
+        # [VANTA-WHY] v1-m3.1 §4 — the per-side in-session wall time, the per-side
+        # kill flag and the cap those runs actually ran under. Read back from
+        # `run.summary` so the §8.1 rule (original side empty ⇒ infra failure;
+        # original ran + patched empty ⇒ failed attempt) and the cap that produced
+        # them are both auditable from the row. `unset` → `None` for a side that
+        # produced no wall time; the cap is always present (a resolved number).
+        "native_original_secs": _secs(summary.get("native_original_secs")),
+        "native_patched_secs": _secs(summary.get("native_patched_secs")),
+        "native_original_timed_out": _bool(summary.get("native_original_timed_out")),
+        "native_patched_timed_out": _bool(summary.get("native_patched_timed_out")),
+        "native_session_cap_secs": _int(summary.get("native_session_cap_secs")),
         "oracle": oracle.as_dict(),
         "label": label_for(outcome.decision, oracle),
         # Item Q — the reason a label needs one. `unresolved` for a run whose final

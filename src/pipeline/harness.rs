@@ -282,6 +282,16 @@ pub struct NativeSuiteReport {
     /// the operator to the wrong file. Recorded here so `native_vacuous_reason`
     /// can name it as its own reason (`native_timeout`).
     pub timed_out: bool,
+    /// How long the suite took in-session (wall clock seconds), or `None` when
+    /// the run never produced a wall time.
+    ///
+    /// [VANTA-WHY] v1-m3.1 (§4) — the row needs the PER-SIDE in-session wall time,
+    /// not just the cap, so the §8.1 truth table and the cap it ran under are
+    /// auditable from the artifact. `ExecutionResult.wall_time_ms` is the only
+    /// in-session wall-time source, so the value is taken there and carried on the
+    /// report (which rides the suite cache), not re-derived by a reader afterwards.
+    /// `None` on `not_run` (no backend) and on every hand-built test report.
+    pub secs: Option<f64>,
     /// The test command's exit status, when it ran at all.
     pub exit_code: Option<i32>,
     /// The last few non-empty stderr lines, for a run-failure report.
@@ -384,6 +394,7 @@ impl NativeSuiteReport {
             failure_outputs: HashMap::new(),
             ran: false,
             timed_out: false,
+            secs: None,
             exit_code: None,
             stderr_tail: String::new(),
             collection: None,
@@ -404,6 +415,7 @@ impl NativeSuiteReport {
             failure_outputs: HashMap::new(),
             ran: false,
             timed_out: false,
+            secs: None,
             exit_code,
             stderr_tail,
             collection: None,
@@ -424,6 +436,7 @@ impl NativeSuiteReport {
             failure_outputs: HashMap::new(),
             ran: false,
             timed_out: true,
+            secs: None,
             exit_code,
             stderr_tail,
             collection: None,
@@ -672,18 +685,30 @@ fn report_is_measured(report: &NativeSuiteReport) -> bool {
 /// Parse a pytest JSON report into per-test outcomes.
 fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuiteReport {
     let tail = stderr_tail(&exec.stderr);
+    // [VANTA-WHY] v1-m3.1 (§4) — the one in-session wall time available, kept on
+    // every outcome (killed, failed, measured) so the row can carry the per-side
+    // seconds the §8.1 rule is read against. `parse_native_report` is the only
+    // place `exec` is in scope, so the helpers above hand back `secs: None` and it
+    // is set here.
+    let secs = Some(exec.wall_time_ms as f64 / 1000.0);
     if exec.timed_out {
         // [VANTA-WHY] M3 item D1 — a killed run is `timed_out_run`, not
         // `failed_run`: its emptiness is the cap's fault, and `native_vacuous_reason`
         // reports it as `native_timeout` with the cap named instead of a bare
         // "collected nothing".
-        return NativeSuiteReport::timed_out_run(exec.exit_code, tail);
+        let mut report = NativeSuiteReport::timed_out_run(exec.exit_code, tail);
+        report.secs = secs;
+        return report;
     }
     let Ok(text) = fs::read_to_string(report_path) else {
-        return NativeSuiteReport::failed_run(exec.exit_code, tail);
+        let mut report = NativeSuiteReport::failed_run(exec.exit_code, tail);
+        report.secs = secs;
+        return report;
     };
     let Ok(report) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return NativeSuiteReport::failed_run(exec.exit_code, tail);
+        let mut report = NativeSuiteReport::failed_run(exec.exit_code, tail);
+        report.secs = secs;
+        return report;
     };
     let mut tests = Vec::new();
     let mut failure_outputs: HashMap<String, String> = HashMap::new();
@@ -692,7 +717,9 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
     // neither shape is a FAILED run: `ran: true` with zero tests is the reading
     // that made a 0.2-pinned bug look like a tree with no tests.
     let Ok(entries) = report_tests(&report) else {
-        return NativeSuiteReport::failed_run(exec.exit_code, tail);
+        let mut report = NativeSuiteReport::failed_run(exec.exit_code, tail);
+        report.secs = secs;
+        return report;
     };
     for t in entries {
         let nodeid = t["nodeid"].as_str().unwrap_or_default().to_string();
@@ -743,6 +770,7 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
         // `native_suite.summary` can name the offending module for BOTH sides of
         // the gate, not only for the side whose note made it into the reason.
         failed.collection = CollectionFailure::of(&report);
+        failed.secs = secs;
         return failed;
     }
     NativeSuiteReport {
@@ -750,6 +778,7 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
         failure_outputs,
         ran: true,
         timed_out: false,
+        secs,
         exit_code: exec.exit_code,
         stderr_tail: tail,
         collection: CollectionFailure::of(&report),
@@ -2979,6 +3008,7 @@ mod tests {
             failure_outputs: HashMap::new(),
             ran: true,
             timed_out: false,
+            secs: None,
             exit_code: Some(0),
             stderr_tail: String::new(),
             collection: None,
@@ -3480,6 +3510,7 @@ mod tests {
             failure_outputs: HashMap::new(),
             ran,
             timed_out: false,
+            secs: None,
             exit_code,
             stderr_tail: String::new(),
             collection: None,

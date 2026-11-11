@@ -111,8 +111,8 @@ pub struct RunConfig {
     pub native_expected_tests: Option<usize>,
     /// [VANTA-WHY] M3 item D1 / v1-m3.1 — `--native-timeout-secs N`: the wall-clock cap
     /// for the in-session native suite, derived per bug from the run's own prepare
-    /// measurement (`max(600, 10 × measured)`, floor `max(600, test_timeout_secs())`).
-    /// `None` keeps the session floor (`harness::native_session_timeout_floor`, 600 s),
+    /// measurement (`max(1200, 10 × measured)`, floor `max(1200, test_timeout_secs())`).
+    /// `None` keeps the session floor (`harness::native_session_timeout_floor`, 1200 s),
     /// which is every hand-run invocation and every row whose prepare recorded no time.
     ///
     /// The native gate runs the repo's own suite twice in-session — original tree vs
@@ -780,7 +780,7 @@ fn resolve_arm(
 /// The in-session native wall-clock cap, from `--native-timeout-secs` or the default.
 ///
 /// [VANTA-WHY] M3 item E13 — the flag RAISES the cap for a slow bug; it must never
-/// LOWER it. [`harness::native_session_timeout_floor`] (600 s, or the environment's own
+/// LOWER it. [`harness::native_session_timeout_floor`] (1200 s, or the environment's own
 /// `VANTA_TEST_TIMEOUT_SECS` when that is larger) is the cap this run would otherwise
 /// use, and the Python side already passes its own session rule, so a value below that
 /// floor asks every suite to time out sooner than the default — the gate could no longer
@@ -2016,8 +2016,8 @@ pub async fn run(
     // [VANTA-WHY] M3 item D1 / v1-m3.1 — the wall-clock cap every in-session native
     // suite of this run uses. Declared once, here, so the gate, the judge's run and
     // the terminal `run.summary` all name the SAME number: `None` on the config keeps
-    // the session floor (`harness::native_session_timeout_floor`, 600 s), and a row
-    // whose prepare measured its native suite passes `max(600, 10 × measured)`.
+    // the session floor (`harness::native_session_timeout_floor`, 1200 s), and a row
+    // whose prepare measured its native suite passes `max(1200, 10 × measured)`.
     let native_cap = resolve_native_timeout_secs(config.native_timeout_secs)?;
     // [VANTA-WHY] Every NEW static finding this run's patch introduced, per
     // attempt, so evidence.json can name the finding that rejected a review
@@ -3574,7 +3574,7 @@ pub async fn run(
         }
         // [VANTA-WHY] M3 item D1 / v1-m3.1 — the suite runs under `native_cap`
         // (declared once for the run, above): the row's own prepare measurement
-        // decides it (`max(600, 10 × measured)`), and a row with no measurement
+        // decides it (`max(1200, 10 × measured)`), and a row with no measurement
         // keeps the session floor (`harness::native_session_timeout_floor`).
         // [VANTA-WHY] M3 item S1 — the two sides go through the content-keyed
         // cache. `native_original` is a function of the BUG (same original tree,
@@ -3598,7 +3598,7 @@ pub async fn run(
         // `native_cap` rather than the raw `config.native_timeout_secs`: passing
         // the raw option would let `None` fall through to
         // `harness::test_timeout_secs()` (120 s) inside `run_native_suite_cached`
-        // while the row recorded 600 — a cap the suite did not run under. The two
+        // while the row recorded 1200 — a cap the suite did not run under. The two
         // sides must also share the value, not merely both be raised: the cap is
         // part of the suite-cache key (`suite_cache::native_key`), so a per-side
         // cap would give the original side a new key on every row and destroy the
@@ -9348,7 +9348,7 @@ mod tests {
 
     // [VANTA-WHY] M3 item E13 / v1-m3.1 — `--native-timeout-secs` may only RAISE the
     // in-session native cap. Below the effective cap (the session floor,
-    // `harness::native_session_timeout_floor()`, 600 s or `VANTA_TEST_TIMEOUT_SECS` when
+    // `harness::native_session_timeout_floor()`, 1200 s or `VANTA_TEST_TIMEOUT_SECS` when
     // that is larger) the value would make every suite time out sooner than the default,
     // which is the opposite of what the flag exists for; refused where the cap is
     // resolved, naming the flag and the floor.

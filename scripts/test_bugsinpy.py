@@ -6311,7 +6311,7 @@ class TestNativeTimeoutDerivation:
 
 
 class TestNativeSessionTimeoutDerivation:
-    """v1-m3.1 §8.3 — the in-session GATE's cap, ``max(600, 10 × measured)``.
+    """v1-m3.1 §8.3 — the in-session GATE's cap, ``max(1200, 10 × measured)``.
 
     [VANTA-WHY] The D1 rule above (``max(120, 3 × measured)``) is the MEASUREMENT
     rule and stays where it is: its remaining callers run ONE tree. The gate runs
@@ -6325,37 +6325,38 @@ class TestNativeSessionTimeoutDerivation:
 
     def test_the_rule_is_ten_times_the_measured_run(self):
         # pandas/1's native run is ~487 s (D1's own measurement); 10 × 487 clears
-        # both the 600 s floor and the patched side's own cost.
-        assert suite_mod.native_session_timeout_secs(487.0, floor=600) == 4870
+        # both the 1200 s floor and the patched side's own cost.
+        assert suite_mod.native_session_timeout_secs(487.0, floor=1200) == 4870
 
-    def test_a_short_suite_stays_at_the_600_second_floor(self):
+    def test_a_short_suite_stays_at_the_1200_second_floor(self):
         """fastapi/8 and luigi/23 are short suites, so 10 × is below the floor.
 
         luigi/23's unpatched control ran 33 s (the probe's own measurement), so
-        ``10 × 33 = 330 < 600`` and the floor is what ships. fastapi/8's native
+        ``10 × 33 = 330 < 1200`` and the floor is what ships. fastapi/8's native
         suite is likewise sub-minute — the point of the example is that under the
         OLD rule such a suite was sent the 120 s cap, and the new floor is what
         that side now runs under.
         """
-        assert suite_mod.native_session_timeout_secs(33.0, floor=600) == 600, "luigi/23"
+        assert suite_mod.native_session_timeout_secs(33.0, floor=1200) == 1200, "luigi/23"
+        assert suite_mod.native_session_timeout_secs(10.0, floor=1200) == 1200, "fastapi/8"
         for measured in (5.0, 20.0, 59.0, 60.0):
-            assert suite_mod.native_session_timeout_secs(measured, floor=600) == 600, (
-                f"a suite measured at {measured}s must not fall below the 600 s floor"
+            assert suite_mod.native_session_timeout_secs(measured, floor=1200) == 1200, (
+                f"a suite measured at {measured}s must not fall below the 1200 s floor"
             )
 
-    def test_a_raised_environment_floor_wins_over_600(self):
+    def test_a_raised_environment_floor_wins_over_1200(self):
         """F4 — the floor is the run's EFFECTIVE ``VANTA_TEST_TIMEOUT_SECS``.
 
         ``resolve_native_timeout_secs`` refuses a ``--native-timeout-secs`` below
-        its own ``test_timeout_secs()``, so a bare 600 would be refused on a host
+        its own ``test_timeout_secs()``, so a bare 1200 would be refused on a host
         whose environment sets ``VANTA_TEST_TIMEOUT_SECS=1800`` and the job would
-        end ``infra_failure`` with no ``run.summary``. ``max(600, …)`` keeps the
+        end ``infra_failure`` with no ``run.summary``. ``max(1200, …)`` keeps the
         flag acceptable and never lowers an operator's own cap.
         """
-        assert suite_mod.native_session_timeout_floor({}) == 600
+        assert suite_mod.native_session_timeout_floor({}) == 1200
         env = {suite_mod.NATIVE_TIMEOUT_ENV: "1800"}
         floor = suite_mod.native_session_timeout_floor(env)
-        assert floor == 1800, "the environment's 1800 s cap is above the 600 s floor"
+        assert floor == 1800, "the environment's 1800 s cap is above the 1200 s floor"
         assert suite_mod.native_session_timeout_secs(10.0, floor=floor) == 1800, (
             "a short suite still runs under the raised floor"
         )
@@ -6363,13 +6364,16 @@ class TestNativeSessionTimeoutDerivation:
             "10 × the measurement still wins when it is the larger number"
         )
 
-    def test_a_sub_600_environment_floor_does_not_lower_the_gate(self):
+    def test_a_sub_1200_environment_floor_does_not_lower_the_gate(self):
+        assert suite_mod.native_session_timeout_floor(
+            {suite_mod.NATIVE_TIMEOUT_ENV: "600"}
+        ) == 1200, "the value the floor used to be does not lower it"
         assert suite_mod.native_session_timeout_floor(
             {suite_mod.NATIVE_TIMEOUT_ENV: "300"}
-        ) == 600, "the gate's own 600 s floor is not lowered by a smaller caller cap"
+        ) == 1200, "the gate's own 1200 s floor is not lowered by a smaller caller cap"
 
     def test_no_measurement_keeps_the_floor(self):
-        assert suite_mod.native_session_timeout_secs(None, floor=600) == 600
+        assert suite_mod.native_session_timeout_secs(None, floor=1200) == 1200
 
     def test_the_gate_rule_is_not_the_measurement_rule(self):
         """The two rules are one call apart, and must not be one function.
@@ -6382,7 +6386,7 @@ class TestNativeSessionTimeoutDerivation:
         assert suite_mod.native_timeout_secs(487.0, floor=floor) == 1461
         assert suite_mod.native_session_timeout_secs(487.0, floor=floor) == 4870
         assert suite_mod.NATIVE_SESSION_TIMEOUT_MULTIPLIER == 10
-        assert suite_mod.NATIVE_SESSION_TIMEOUT_FLOOR_SECS == 600
+        assert suite_mod.NATIVE_SESSION_TIMEOUT_FLOOR_SECS == 1200
 
 
 class TestSuiteCommand:
@@ -28345,7 +28349,7 @@ class TestInvokeVantaCarriesTheNativeTimeout:
     own measurement by the one shared rule (``max(120, 3 × measured)``); a row with
     no measurement (pre-D1, or a measure-only row) keeps the historical 120 s.
 
-    [VANTA-WHY] v1-m3.1 (§8.3) — the GATE's rule is now ``max(600, 10 × measured)``
+    [VANTA-WHY] v1-m3.1 (§8.3) — the GATE's rule is now ``max(1200, 10 × measured)``
     over the same measurement, because the luigi/23 probe measured a legitimate
     one-file patch at ~3.6× its unpatched control on an idle machine: D1's 3× sat
     below the patched side's own cost, so the cap, not the patch, ended the row.
@@ -28381,18 +28385,18 @@ class TestInvokeVantaCarriesTheNativeTimeout:
     def test_a_measured_bug_gets_ten_times_its_native_run(self, tmp_path, monkeypatch):
         text = self._run(tmp_path, monkeypatch, native_secs=487.0)
         assert "--native-timeout-secs 4870" in text, (
-            "pandas/1: max(600, 10 × 487) = 4870 s, room for the suite to finish"
+            "pandas/1: max(1200, 10 × 487) = 4870 s, room for the suite to finish"
         )
         assert text.index("--max-attempts 2") < text.index("--native-timeout-secs"), (
             "the flag is appended after the fixed arguments"
         )
 
-    def test_a_row_with_no_measurement_keeps_the_600_second_floor(
+    def test_a_row_with_no_measurement_keeps_the_1200_second_floor(
         self, tmp_path, monkeypatch
     ):
         text = self._run(tmp_path, monkeypatch)
-        assert "--native-timeout-secs 600" in text, (
-            "a pre-D1 or measure-only row holds the gate's 600 s floor, never a cap "
+        assert "--native-timeout-secs 1200" in text, (
+            "a pre-D1 or measure-only row holds the gate's 1200 s floor, never a cap "
             "derived from a missing number"
         )
 
@@ -28404,8 +28408,8 @@ class TestInvokeVantaCarriesTheNativeTimeout:
         effective cap: the binary exited before running, the row landed as
         ``infra_failure`` with no ``run.summary``, and every affected job was blamed for
         a discrepancy between two readings of one number. Under v1-m3.1 the floor is
-        ``max(600, that environment cap)``, so a raised environment still reaches the
-        flag and a lower one can never lower the gate below 600.
+        ``max(1200, that environment cap)``, so a raised environment still reaches the
+        flag and a lower one can never lower the gate below 1200.
         """
         env = {"PATH": "/usr/bin", suite_mod.NATIVE_TIMEOUT_ENV: "1800"}
         text = self._run(tmp_path, monkeypatch, env=env)
@@ -28419,10 +28423,10 @@ class TestInvokeVantaCarriesTheNativeTimeout:
         lower = self._run(
             tmp_path,
             monkeypatch,
-            env={"PATH": "/usr/bin", suite_mod.NATIVE_TIMEOUT_ENV: "300"},
+            env={"PATH": "/usr/bin", suite_mod.NATIVE_TIMEOUT_ENV: "600"},
         )
-        assert "--native-timeout-secs 600" in lower, (
-            "an environment cap below 600 must not lower the gate's own floor"
+        assert "--native-timeout-secs 1200" in lower, (
+            "an environment cap below 1200 must not lower the gate's own floor"
         )
 
     def test_the_cap_is_never_below_the_binarys_own_floor(self, tmp_path, monkeypatch):

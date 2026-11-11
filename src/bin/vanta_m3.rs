@@ -98,8 +98,8 @@ struct CliArgs {
     native_expected_tests: Option<usize>,
     /// M3 item D1 / v1-m3.1 — `--native-timeout-secs N`: the wall-clock cap for the
     /// in-session native suite, derived per bug from the row's own prepare
-    /// measurement (`max(600, 10 × measured)`). Absent keeps the session floor of
-    /// 600 s, or the environment's own `VANTA_TEST_TIMEOUT_SECS` when that is larger
+    /// measurement (`max(1200, 10 × measured)`). Absent keeps the session floor of
+    /// 1200 s, or the environment's own `VANTA_TEST_TIMEOUT_SECS` when that is larger
     /// (`harness::native_session_timeout_floor`).
     ///
     /// The gate runs the repo's own suite twice in-session — the original tree and the

@@ -2140,7 +2140,7 @@ def invoke_vanta(
     # (120 s), which pandas/1's ~487 s native run can never fit: the gate then killed both
     # runs, read as "collected nothing" and ended the row `native_vacuous` — an
     # `infra_failure` blamed on the tree for what was a fact about the CAP. D1's rule was
-    # `max(120, 3 × measured)`; it is now `max(600, 10 × measured)`, because the luigi/23
+    # `max(120, 3 × measured)`; it is now `max(1200, 10 × measured)`, because the luigi/23
     # probe measured a legitimate one-file patch at ~3.6× the unpatched suite on an idle
     # machine, above 3×. BOTH sides of the gate get this ONE value (see
     # `suite_mod.native_session_timeout_secs`): the original side is content-keyed in the
@@ -2149,7 +2149,7 @@ def invoke_vanta(
     # holds the floor. The cap the run actually used is recorded on the row from
     # `run.summary` (`native_timeout_secs`, `native_session_cap_secs`).
     # M3 item F4 — the floor is the run's EFFECTIVE environment's own cap, never below
-    # 600: `driver.rs::resolve_native_timeout_secs` refuses any `--native-timeout-secs`
+    # 1200: `driver.rs::resolve_native_timeout_secs` refuses any `--native-timeout-secs`
     # below `harness::test_timeout_secs()` for the SAME child environment (`env` here,
     # which already carries item 19's frozen `[env]`). Measuring against the fixed floor
     # while the operator raised `VANTA_TEST_TIMEOUT_SECS` sent a value the binary refused

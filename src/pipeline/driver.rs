@@ -6661,22 +6661,39 @@ fn build_creator_feedback(
             }
         } else {
             // [VANTA-WHY] Above the limit the list is bounded: a sorted sample of
-            // the first `REGRESSION_FEEDBACK_SAMPLE` nodeids, the true total, and
-            // how many are left to the evidence artifact (which keeps the COMPLETE
-            // list). Sorting makes the sample a stable prefix of the suite rather
-            // than whatever order the report parser happened to emit, so two runs
-            // that regress the same suite name the same 20.
+            // `REGRESSION_FEEDBACK_SAMPLE` nodeids, the true total, and how many are
+            // left to the evidence artifact (which keeps the COMPLETE list). Sorting
+            // makes the sample a stable prefix of the suite rather than whatever
+            // order the report parser happened to emit, so two runs that regress the
+            // same suite name the same 20.
+            //
+            // [VANTA-WHY] Finding D (PR #4 review) — the sample is taken in TWO
+            // groups, each sorted: nodeids the patched report actually recorded a
+            // `failure_output` for come FIRST, then the absent ones fill the
+            // remaining slots. A partially running patched suite (say 3 tests fail on
+            // assertion while 4,000 others are simply absent) would otherwise spend
+            // the whole sample on absent nodeids that sort before the failures,
+            // handing the Creator neither the one real assertion failure nor a
+            // collapsed suite's stderr. `with_output` preserves the suite order of the
+            // first group, `without_output` of the second.
             let mut sorted: Vec<&String> = native_regressions.iter().collect();
             sorted.sort();
-            for nodeid in sorted.iter().take(REGRESSION_FEEDBACK_SAMPLE) {
+            let (with_output, without_output): (Vec<&String>, Vec<&String>) = sorted
+                .into_iter()
+                .partition(|nodeid| native_patched.failure_output(nodeid).is_some());
+            for nodeid in with_output
+                .iter()
+                .chain(without_output.iter())
+                .take(REGRESSION_FEEDBACK_SAMPLE)
+            {
                 fb.push_str(&format!("  - {nodeid}\n"));
                 if let Some(output) = native_patched.failure_output(nodeid) {
                     fb.push_str(&format!("    failure: {output}\n"));
                 }
             }
             fb.push_str(&format!(
-                "  - {total} tests regressed; showing the first {REGRESSION_FEEDBACK_SAMPLE} \
-                 (sorted), {} more in the evidence artifact.\n",
+                "  - {total} tests regressed; showing {REGRESSION_FEEDBACK_SAMPLE} sampled \
+                 (failures first, then sorted), {} more in the evidence artifact.\n",
                 total - REGRESSION_FEEDBACK_SAMPLE
             ));
         }
@@ -10217,6 +10234,60 @@ mod tests {
         assert!(
             !fb.contains(&format!("  - {}\n", regressions[0])),
             "the unsorted report order must not decide the sample"
+        );
+    }
+
+    // [VANTA-WHY] Finding D (PR #4 review) — in the bounded sample a nodeid the
+    // patched report RECORDED a failure for must be named before the absent ones. A
+    // partially running patched suite can have thousands of absent nodeids that sort
+    // before its one real assertion failure; taking the plain first 20 gives the
+    // Creator neither the failure nor (if it did collect) the collapsed-suite stderr.
+    #[test]
+    fn a_lone_failing_nodeid_sorted_late_is_kept_in_the_bounded_sample() {
+        // 60 regressions — above REGRESSION_FEEDBACK_LIMIT — of which all but one are
+        // simply ABSENT from the patched report.
+        let regressions: Vec<String> = (0..60)
+            .map(|i| format!("pkg/test_{:03}.py::test_{:03}", i, i))
+            .collect();
+        let mut sorted: Vec<&String> = regressions.iter().collect();
+        sorted.sort();
+        let failing: String = sorted.last().expect("60 regressions").to_string();
+        // The one nodeid that actually failed sorts LAST, so the plain first-20 sample
+        // would drop it entirely.
+        assert!(
+            !sorted
+                .iter()
+                .take(REGRESSION_FEEDBACK_SAMPLE)
+                .any(|nodeid| **nodeid == failing),
+            "sanity: the failing nodeid is outside the naive first-20 sample"
+        );
+
+        let mut patched = clamped_report(&[], true, false);
+        patched
+            .failure_outputs
+            .insert(failing.clone(), "AssertionError: boom".to_string());
+
+        let fb = build_creator_feedback(&[], false, false, &regressions, &patched, &[], &[], &[]);
+
+        // Still bounded to the sample size.
+        let shown = fb.matches("\n  - pkg/test_").count();
+        assert_eq!(
+            shown, REGRESSION_FEEDBACK_SAMPLE,
+            "the sample stays bounded; got {shown}"
+        );
+        // The recorded failure is kept, output and all, even though it sorted last.
+        assert!(
+            fb.contains(&format!("  - {failing}\n")),
+            "the lone failing nodeid must survive the bounded sample:\n{fb}"
+        );
+        assert!(
+            fb.contains("    failure: AssertionError: boom\n"),
+            "its failure output must ride along:\n{fb}"
+        );
+        // The remaining slots are filled with the absent nodeids, in sorted order.
+        assert!(
+            fb.contains(&format!("  - {}\n", sorted[0])),
+            "the absent nodeids still fill the rest of the sample:\n{fb}"
         );
     }
 

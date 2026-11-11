@@ -118,15 +118,29 @@ still fires when the plugin moves on and a stale binary cannot silently measure 
 plugin older than the tree.
 """
 
-# §8.1's worst single run is ~30 min for a vanta repair; 3 h is a backstop, not an
-# estimate. A run that hits it is a failure to report, not a result to grade.
-RUN_TIMEOUT_SECS = 3 * 60 * 60
-# §14.15 — how far short of `RUN_TIMEOUT_SECS` Vanta's own deadline is set. The
-# margin has to cover the longest single LLM call the harness expects (5-10
-# minutes on sanic's 50-65k-token prompts), because the deadline is checked
-# BEFORE each call: the call already in flight when the clock runs out still
-# finishes. Ten minutes is that call, plus the terminal write.
-DEADLINE_MARGIN_SECS = 10 * 60
+# §8.1's worst single run is ~30 min for a vanta repair; the row backstop is
+# deliberately far larger than any estimate. It must clear `VANTA_DEADLINE_SECS` by
+# more than the longest step that can still START after the deadline check is
+# honoured (§14.15) — a model call already in flight, the post-gate In-Session
+# Attacker round and the terminal write — because the run notices the clock only
+# BETWEEN steps. Inside the gap Vanta writes `final_decision` + `run.summary`; past
+# it the harness SIGKILLs mid-call and the row is the `no run.summary` shape, which
+# leaves no manifest entry and re-runs identically on resume. 13800 s is that
+# backstop: the deadline below plus 3600 s.
+RUN_TIMEOUT_SECS = 13800
+# §14.15 — how far short of `RUN_TIMEOUT_SECS` Vanta's own deadline is set. This is
+# the row BACKSTOP, not merely one long call: the deadline is checked BETWEEN steps,
+# so work already in flight when it expires still runs to its end. 3600 s is that
+# backstop; the deadline it leaves (10200 s) is unchanged from every v1-m3 row, so
+# v1-m3 and v1-m3.1 rows share a clock and only the kill margin moved.
+DEADLINE_MARGIN_SECS = 60 * 60
+# The deadline the run is handed, named once so the env value below and the backstop
+# cannot drift apart. 13800 - 3600 = 10200, the value v1-m3 rows ran under.
+VANTA_DEADLINE_SECS = RUN_TIMEOUT_SECS - DEADLINE_MARGIN_SECS
+assert RUN_TIMEOUT_SECS > VANTA_DEADLINE_SECS + 1800, (
+    "the row backstop must clear the deadline by more than the longest "
+    "post-deadline in-attempt step, or a clean `budget_exhausted` write is SIGKILLed"
+)
 PROBE_TIMEOUT_SECS = 120
 ORACLE_TIMEOUT_SECS = 1800
 
@@ -739,13 +753,14 @@ def vanta_env(
     # Always set, including for seed 0: `VANTA_LLM_SEED=0` is a request to pin 0,
     # while an unset variable means "no seed key in the body" (§4.4, D4).
     env["VANTA_LLM_SEED"] = str(seed)
-    # §14.15 — Vanta's own deadline, set short of the timeout this module kills
-    # the process with. The margin is what makes the difference between the two
-    # outcomes: inside it Vanta notices the clock, stops between calls and writes
-    # `final_decision` + `run.summary`; past it the harness SIGKILLs mid-call and
-    # the row is the `no run.summary` shape the overnight batch produced. Ten
-    # minutes is one long sanic call, which is the unit the margin has to cover.
-    env["VANTA_DEADLINE_SECS"] = str(RUN_TIMEOUT_SECS - DEADLINE_MARGIN_SECS)
+    # §14.15 — Vanta's own deadline, set short of the timeout this module kills the
+    # process with. The backstop between them is what makes the difference between
+    # the two outcomes: inside it Vanta notices the clock, stops between steps and
+    # writes `final_decision` + `run.summary`; past it the harness SIGKILLs mid-call
+    # and the row is the `no run.summary` shape the overnight batch produced. Both
+    # numbers are module constants (`VANTA_DEADLINE_SECS`, `RUN_TIMEOUT_SECS`),
+    # asserted against each other at import so the gap cannot shrink silently.
+    env["VANTA_DEADLINE_SECS"] = str(VANTA_DEADLINE_SECS)
     # [VANTA-WHY] M3 items S1–S3 — the ONE suite cache directory, made absolute and
     # handed to every child. The harness process and the binary it spawns must look
     # in the same place or a hit in one is a miss in the other, and the binary's own

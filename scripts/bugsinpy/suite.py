@@ -511,7 +511,7 @@ def precompile_lines(
 EXIT_PLUGIN_NAME = "vanta_exit_plugin"
 """The import name of the plugin that ends pytest's interpreter.
 
-[VANTA-WHY] M3 §8.6 round 13, item 1. luigi/8, 9, 11 and 12 (round 12) start a
+[VANTA-WHY] M3 §8.6 round 13, item 1. Four luigi bugs (round 12) start a
 non-daemon worker thread in their own ``test/worker_test.py`` and never stop it,
 so ``python`` blocks in orderly interpreter shutdown *after* pytest has written
 its JSON report and printed its summary. The harness measures a run by the

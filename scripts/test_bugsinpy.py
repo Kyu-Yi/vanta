@@ -2057,7 +2057,7 @@ class TestStripHiddenTests:
         ast.parse(new)
 
     def test_a_removed_class_carrying_a_nested_class_gets_no_pass(self, tmp_path):
-        """pandas/90, pandas/158: a nested class's header is dropped with its outer.
+        """A nested class's header is dropped with its outer.
 
         The emptied-class rule used to insert a ``pass`` for the *nested* class too,
         at the nested body's deeper indent, while the class statement that block
@@ -5325,7 +5325,7 @@ class TestTheFreezeGatesTheText:
         ]
 
     def test_declared_test_files_splits_a_semicolon_joined_declaration(self):
-        """fastapi/11's ``bug.info`` names two files in one ``;``-joined token."""
+        """A ``bug.info`` that names two files in one ``;``-joined token."""
         both = bug_info(test_file="tests/test_a.py;tests/test_b.py")
         assert prepare_mod.declared_test_files(both) == [
             "tests/test_a.py",
@@ -6483,7 +6483,7 @@ def _alive(pid: int) -> bool:
 class TestExitPluginScript:
     """The run-time exit plugin that ends pytest's own interpreter (§8.6 round 13).
 
-    [VANTA-WHY] luigi/8, 9, 11 and 12 (round 12) start a non-daemon worker thread in
+    [VANTA-WHY] Four luigi bugs (round 12) start a non-daemon worker thread in
     their own ``test/worker_test.py`` and never stop it, so ``python`` blocked in
     interpreter shutdown *after* pytest had written its report and printed its
     summary. The harness measures a run by the markers the script prints after the
@@ -14112,7 +14112,7 @@ class TestBuildRequirementPins:
         assert bake_mod._declarer_pin_cutoff("ujson==9.9.9", releases) is None
 
     def test_the_declarers_own_release_date_widens_a_window_that_found_nothing(self):
-        """``fastapi/11``: the declaring pin landed after the bug, and its own date admits
+        """The declaring pin landed after the bug, and its own date admits
         the release its ``setup_requires`` asks for.
 
         [VANTA-WHY] ``ujson==3.0.0`` is a BugsInPy reference pin installed *as written*
@@ -14140,7 +14140,7 @@ class TestBuildRequirementPins:
         assert pins[0].build_requirement_of == "ujson==3.0.0"
 
     def test_a_window_widened_to_the_declaring_releases_own_date_is_recorded(self):
-        """``fastapi/11`` in the JSON: the fallback was used, and what anchored it.
+        """In the JSON: the fallback was used, and what anchored it.
 
         [VANTA-WHY] ``declared_by`` alone cannot say *which* rule placed the pin — a pin
         the bug's own date reaches and one only the declaring pin's own date reaches carry
@@ -14355,7 +14355,7 @@ class TestABuildRequirementNoPinCoversReachesTheLayer:
     def test_a_build_requirement_only_the_declarers_own_date_can_place(
         self, monkeypatch
     ):
-        """The ``fastapi/11`` shape end to end: the bug's date finds nothing and the
+        """The widened-window shape end to end: the bug's date finds nothing and the
         declaring pin's own release date admits the release its build asked for.
 
         [VANTA-WHY] ``ujson==3.0.0`` is a reference pin — admitted though it landed after
@@ -16398,7 +16398,7 @@ class TestTheAbsentNamePass:
         "mpl-toolkits-clifford==0.0.3",
         "numpy==1.18.4",
     )
-    """``pandas/7``'s shape at the retry: the unbuildable ``h5py`` is dropped and the two
+    """The retry's shape: the unbuildable ``h5py`` is dropped and the two
     pins that declare it, directly and through each other, move with it."""
 
     def _metadata_of(self, name: str, version: str):
@@ -16499,7 +16499,7 @@ class TestTheAbsentNamePass:
         assert "could not be read" in caught.value.why
 
     def test_the_closure_is_transitive_over_the_pins_it_moves(self):
-        """``pandas/7``: dropping ``h5py`` moves ``clifford`` moves ``mpl-toolkits-clifford``.
+        """Dropping ``h5py`` moves ``clifford`` moves ``mpl-toolkits-clifford``.
 
         Moving a dependent out of the main pass makes *its* name a name the main pass
         installs nothing for, so the walk runs to a fixpoint (D3): nothing left in the
@@ -17410,7 +17410,7 @@ class TestUnresolvablePins:
         bare), the interpreter makes it redundant, and its ``enum`` shadows the stdlib's.
 
         ``luigi/7`` and ``luigi/5`` die at pytest start-up with ``TypeError: an integer
-        is required (got type bytes)``. ``luigi/9`` and ``luigi/12`` carry no ``enum34``
+        is required (got type bytes)``. Two further luigi bugs carry no ``enum34``
         but fail an earlier gate (``empty FAIL_TO_PASS``) and never run, so they are not
         evidence that the suite runs without it.
         """
@@ -17491,7 +17491,7 @@ class TestUnresolvablePins:
         return classify
 
     def test_a_self_pin_built_from_an_unreviewed_sdist_is_dropped(self):
-        """``pandas/154``'s ``pandas==1.0.4``: the tree's own name, built from its sdist."""
+        """A self-pin naming the tree's own project, built from its sdist."""
         self_pin = self._self_pin("pandas", "pandas==1.0.4")
         kept = bake_mod.drop_self_pin(
             (self_pin,),
@@ -17502,11 +17502,12 @@ class TestUnresolvablePins:
         assert kept == []
 
     def test_a_self_pin_that_installs_from_a_wheel_is_kept(self):
-        """``fastapi/3``'s ``fastapi==0.55.1`` and ``scrapy/1``'s ``scrapy==2.1.0``.
+        """A wheel self-pin names the tree's own project — ``fastapi==0.55.1``,
+        ``scrapy==2.1.0``.
 
         A wheel self-pin is harmless — it installs the project over itself from a wheel —
         so the narrow rule leaves it alone, which is what keeps this drop a no-op for every
-        layer measured but ``pandas/154`` and ``pandas/160``.
+        layer measured but two pandas bugs.
         """
         self_pin = self._self_pin("fastapi", "fastapi==0.55.1")
         kept = bake_mod.drop_self_pin(
@@ -17709,7 +17710,7 @@ class TestUnresolvablePins:
         assert "no unconditional import of it is in" in found.reason
 
     def test_a_commit_without_the_failing_test_file_does_not_stand_in_with_its_tree(self):
-        """``pandas/66``: the buggy commit lacks the test file the fix carries.
+        """The buggy commit lacks the test file the fix carries.
 
         The only unconditional ``import pyarrow`` is in the buggy commit's
         ``demo/extra.py``, which the fix's test never reaches. Standing the buggy tree
@@ -18430,7 +18431,7 @@ def _resolve_with_drops(
     return fetched, layers, flagged
 
 
-_PANDAS_7_BUILD_LOG = (
+_UNBUILDABLE_PINS_BUILD_LOG = (
     "Collecting h5py==2.10.0\n"
     "  Building wheel for h5py (setup.py) ... error\n"
     "  ERROR: Failed building wheel for h5py\n"
@@ -18440,7 +18441,7 @@ _PANDAS_7_BUILD_LOG = (
     "ERROR: Could not build wheels for h5py, scikit-learn, which is required to\n"
     "install pyproject.toml-based projects\n"
 )
-"""The measured shape of ``pandas/7``'s first-pass build failure.
+"""The measured shape of a first-pass build failure.
 
 Both pins the layer holds fail inside the image (``h5py`` wants ``libhdf5.so``,
 ``scikit-learn`` wants a ``scipy`` pip never got), so pip's own summary line names
@@ -18476,7 +18477,7 @@ frame, the ``.eggs/setuptools_scm-10.3.4-py3.8.egg`` frame, the ``ImportError`` 
 ``egg_info`` summary line), not invented.
 """
 
-_PANDAS_66_BUILD_LOG = (
+_HASH_MISMATCH_BUILD_LOG = (
     "+ python -m pip install --no-cache-dir -c /tmp/constraints.txt "
     "--no-build-isolation --use-deprecated=legacy-resolver -r /tmp/req.txt\n"
     "WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, "
@@ -18496,7 +18497,7 @@ _PANDAS_66_BUILD_LOG = (
     "             Got        "
     "a126ab08efbd1508221af0aa54bdac70f782587567710a5d54e4a6c9c2795bb9\n"
 )
-"""``pandas/66``'s failure: a *download* whose bytes were not the ones the index names.
+"""A *download* whose bytes were not the ones the index names.
 
 The index's own link advertises ``db3121…`` (PyPI's recorded sdist hash) and the body
 that arrived hashed to ``a126ab08…``, one line under a ``RemoteDisconnected`` on a
@@ -18535,7 +18536,7 @@ class TestTheSafeguardsEntryPointQuestion:
     ``False`` — **read, and it registers nothing** — lets the drop proceed. Reading the
     last two as one answer is the failure this class exists against: measured on
     ``h5py==2.10.0``, whose 28 wheels carry no ``entry_points.txt`` at all, it protected
-    the very pin ``pandas/7``'s retry was to drop and turned the retry into a flag.
+    the very pin the retry was meant to drop and turned the retry into a flag.
     """
 
     def test_a_release_pypi_does_not_list_registers_nothing(self):
@@ -18724,7 +18725,7 @@ class TestTheRetryOnAnUnbuildablePin:
     The trigger is an **observed** build failure, never a static prediction, which is
     what leaves every already-baked layer untouched by construction: a retry runs only
     after a build has already failed, and the first-pass recipe is byte-identical. The
-    **R2(ii)** half (measured on ``pandas/7``) answers ``None`` for every failure it does
+    **R2(ii)** half (measured on a pandas bug) answers ``None`` for every failure it does
     not cover, drops only pins **outside the failing tests' closure** that the safeguard
     does not protect, records each drop in the layer metadata, and fails **closed** if
     the retry also fails. The **R1** half (rows 11–12, luigi's ``egg_info`` crash, the
@@ -18773,7 +18774,7 @@ class TestTheRetryOnAnUnbuildablePin:
             drops=(),
             rule=bake_mod.RETRY_RULE_TRANSIENT,
             why="re-fetched",
-            transient=bake_mod.transient_download_failure(_PANDAS_66_BUILD_LOG),
+            transient=bake_mod.transient_download_failure(_HASH_MISMATCH_BUILD_LOG),
         )
 
     def _declares_nothing(self, name: str, version: str):
@@ -18781,7 +18782,7 @@ class TestTheRetryOnAnUnbuildablePin:
         return ((), None)
 
     def _cascade_metadata(self, name: str, version: str):
-        """``pandas/7``'s retry: ``clifford`` declares the dropped ``h5py``, and
+        """A retry's cascade: ``clifford`` declares the dropped ``h5py``, and
         ``mpl-toolkits-clifford`` declares ``clifford``."""
         declared = {
             ("clifford", "1.3.1"): ("h5py",),
@@ -18815,8 +18816,8 @@ class TestTheRetryOnAnUnbuildablePin:
         )
         pins = self.INSTALLS if installs is None else installs
         return bake_mod.BugDeps(
-            entry={"project": "pandas", "bug_id": 7},
-            checkpoint="vanta-bi-pandas-7",
+            entry={"project": "Demo", "bug_id": 1},
+            checkpoint="vanta-bi-Demo-1",
             installs=pins,
             provenance=(
                 provenance
@@ -18835,7 +18836,7 @@ class TestTheRetryOnAnUnbuildablePin:
 
     # ---- reading the failing layer's own log -----------------------------
     def test_the_summary_line_names_the_pins_pip_failed_to_build(self):
-        assert bake_mod.failed_builds(_PANDAS_7_BUILD_LOG) == (
+        assert bake_mod.failed_builds(_UNBUILDABLE_PINS_BUILD_LOG) == (
             "h5py",
             "scikit-learn",
         )
@@ -18850,7 +18851,7 @@ class TestTheRetryOnAnUnbuildablePin:
         assert bake_mod.failed_builds(_LUIGI_30_BUILD_LOG) == ()
 
     def test_the_evidence_is_the_line_that_names_the_pin(self):
-        line = bake_mod.failed_build_line(_PANDAS_7_BUILD_LOG, "h5py")
+        line = bake_mod.failed_build_line(_UNBUILDABLE_PINS_BUILD_LOG, "h5py")
         assert line.startswith("build log line ")
         assert line.endswith("ERROR: Failed building wheel for h5py")
 
@@ -18861,7 +18862,7 @@ class TestTheRetryOnAnUnbuildablePin:
     # ---- retry_drops: the drop, and every ``None`` ------------------------
     def test_an_unbuildable_pin_outside_the_closure_is_dropped(self):
         drops = bake_mod.retry_drops(
-            _PANDAS_7_BUILD_LOG,
+            _UNBUILDABLE_PINS_BUILD_LOG,
             installs=self.INSTALLS,
             declared=self.DECLARED,
             audit=self._audit(),
@@ -18933,13 +18934,13 @@ class TestTheRetryOnAnUnbuildablePin:
 
     # ---- retry_plan: the recipe the second attempt runs ------------------
     def test_a_layer_without_retry_material_is_never_retried(self):
-        assert bake_mod.retry_plan(self._deps(retry=False), _PANDAS_7_BUILD_LOG) is None
+        assert bake_mod.retry_plan(self._deps(retry=False), _UNBUILDABLE_PINS_BUILD_LOG) is None
 
     def test_the_retry_recipe_is_the_first_pass_minus_exactly_the_dropped_pins(self):
         deps = self._deps(
             build_pins=("numpy==1.18.1",), early_pins=("numpy==1.18.1",)
         )
-        plan = bake_mod.retry_plan(deps, _PANDAS_7_BUILD_LOG)
+        plan = bake_mod.retry_plan(deps, _UNBUILDABLE_PINS_BUILD_LOG)
         assert plan is not None
         assert [drop.pin for drop in plan.drops] == ["h5py==2.10.0", "scikit-learn==0.22.1"]
         assert plan.script == bake_mod.requirements_recipe(
@@ -18966,7 +18967,7 @@ class TestTheRetryOnAnUnbuildablePin:
     )
 
     def test_a_moved_dependent_takes_its_own_dependents_with_it(self):
-        """``pandas/7``: the retry **moves**, it does not merely drop (D3).
+        """The retry **moves**, it does not merely drop (D3).
 
         Dropping ``h5py`` leaves ``clifford`` (which declares it) in the main pass, so
         ``clifford`` moves too — and ``mpl-toolkits-clifford`` (which declares
@@ -19004,7 +19005,7 @@ class TestTheRetryOnAnUnbuildablePin:
 
         A ``--no-deps`` pin's name is in ``/tmp/constraints.txt``, so a main-pass pin
         that only declares one gives pip no version to choose and leaks nothing. Measured
-        on ``pandas/7``: ``pytest==5.4.3`` declares ``hypothesis`` behind an ``extra``,
+        on a measured retry: ``pytest==5.4.3`` declares ``hypothesis`` behind an ``extra``,
         ``hypothesis`` is one of the layer's eight ``--no-deps`` pins, and the old seed —
         the dropped names **and** the ``--no-deps`` names — moved pytest out of the
         resolving pass, where the safeguard then refused the whole retry.
@@ -19043,8 +19044,8 @@ class TestTheRetryOnAnUnbuildablePin:
             "hypothesis==5.16.0\nclifford==1.3.1\nmpl-toolkits-clifford==0.0.3\n"
         )
 
-    def test_pandas_7_s_real_pins_move_nothing_new_under_the_narrowed_seed(self):
-        """``pandas/7``'s own retry: the eight ``--no-deps`` pins stay exactly as they
+    def test_the_real_pins_move_nothing_new_under_the_narrowed_seed(self):
+        """The measured retry: the eight ``--no-deps`` pins stay exactly as they
         are, ``clifford`` and ``mpl-toolkits-clifford`` re-close on the ``h5py`` they
         already declared, nothing joins the pass, and the retry is rendered — not
         refused. ``pytest`` stays in the resolving pass throughout."""
@@ -19143,7 +19144,7 @@ class TestTheRetryOnAnUnbuildablePin:
         deps = self._deps()
         bake_mod.write_deps(tmp_path, deps)
         before = bake_mod.load_deps(tmp_path, deps.checkpoint)
-        plan = bake_mod.retry_plan(deps, _PANDAS_7_BUILD_LOG)
+        plan = bake_mod.retry_plan(deps, _UNBUILDABLE_PINS_BUILD_LOG)
         bake_mod.record_retry(tmp_path, deps.checkpoint, plan)
         after = bake_mod.load_deps(tmp_path, deps.checkpoint)
         assert [record["pin"] for record in after["dropped"]] == [
@@ -19158,10 +19159,10 @@ class TestTheRetryOnAnUnbuildablePin:
         assert after["checkpoint_id"] != before["checkpoint_id"]
 
     # ---- R1: the early pins move before the build requirements -----------
-    def test_the_egg_info_detector_reads_luigi_30_and_not_pandas_7(self):
+    def test_the_egg_info_detector_reads_luigi_30_but_not_the_wheel_build_log(self):
         """R1's trigger, and the positive ``failed_builds`` documents as its negative."""
         assert bake_mod.failed_build_requirement_metadata(_LUIGI_30_BUILD_LOG) is True
-        assert bake_mod.failed_build_requirement_metadata(_PANDAS_7_BUILD_LOG) is False
+        assert bake_mod.failed_build_requirement_metadata(_UNBUILDABLE_PINS_BUILD_LOG) is False
         assert bake_mod.failed_build_requirement_metadata("") is False
 
     # ``pytest-runner`` is luigi/30's real build requirement and is *not* a build tool,
@@ -19231,7 +19232,7 @@ class TestTheRetryOnAnUnbuildablePin:
         assert [spelling for spelling, _ in evidence] == ["cffi", "cffi"]
 
     def test_a_log_that_names_no_fetch_has_no_evidence(self):
-        assert bake_mod.easy_install_fetch_evidence(_PANDAS_7_BUILD_LOG) == ()
+        assert bake_mod.easy_install_fetch_evidence(_UNBUILDABLE_PINS_BUILD_LOG) == ()
         assert bake_mod.easy_install_fetch_evidence("") == ()
 
     def test_the_hoist_is_the_early_pin_the_fetched_name_satisfies(self):
@@ -19321,8 +19322,8 @@ class TestTheRetryOnAnUnbuildablePin:
 
     # ---- R4: a download that did not match the hash the index named -------
     def test_the_mismatch_block_names_the_package_and_both_hashes(self):
-        """``pandas/66``'s shape: the index's own ``#sha256=`` link, the body arriving."""
-        transient = bake_mod.transient_download_failure(_PANDAS_66_BUILD_LOG)
+        """A mismatch block: the index's own ``#sha256=`` link, the body arriving."""
+        transient = bake_mod.transient_download_failure(_HASH_MISMATCH_BUILD_LOG)
         assert transient is not None
         assert transient.spec == "matplotlib==3.1.3"
         assert transient.expected.startswith("db3121f1")
@@ -19336,7 +19337,7 @@ class TestTheRetryOnAnUnbuildablePin:
     def test_a_log_with_no_mismatch_is_not_this_rule(self):
         """The three other logs reach their own rules: R2(ii) and R1 named nothing here."""
         assert bake_mod.transient_download_failure("") is None
-        assert bake_mod.transient_download_failure(_PANDAS_7_BUILD_LOG) is None
+        assert bake_mod.transient_download_failure(_UNBUILDABLE_PINS_BUILD_LOG) is None
         assert bake_mod.transient_download_failure(_LUIGI_30_BUILD_LOG) is None
 
     def test_a_mismatch_block_that_names_no_package_is_not_this_rule(self):
@@ -19350,7 +19351,7 @@ class TestTheRetryOnAnUnbuildablePin:
         """§8.6 R4 drops nothing, reorders nothing, and re-runs the identical recipe: the
         bytes were wrong, not the layer. ``--no-cache-dir`` is what makes it a re-fetch."""
         deps = self._deps()
-        plan = bake_mod.retry_plan(deps, _PANDAS_66_BUILD_LOG)
+        plan = bake_mod.retry_plan(deps, _HASH_MISMATCH_BUILD_LOG)
         assert plan is not None
         assert plan.rule == bake_mod.RETRY_RULE_TRANSIENT
         assert plan.drops == ()
@@ -19361,9 +19362,9 @@ class TestTheRetryOnAnUnbuildablePin:
 
     def test_each_rule_reads_its_own_log_and_not_the_others(self):
         """The order is R2(ii) then R1 then R4, and each log reaches exactly its own."""
-        pandas_66 = self._deps()
+        transient_deps = self._deps()
         assert (
-            bake_mod.retry_plan(pandas_66, _PANDAS_7_BUILD_LOG).rule
+            bake_mod.retry_plan(transient_deps, _UNBUILDABLE_PINS_BUILD_LOG).rule
             == bake_mod.RETRY_RULE_DROP
         )
         r1 = self._deps(build_pins=self._R1_BUILD, early_pins=self._R1_EARLY)
@@ -19372,7 +19373,7 @@ class TestTheRetryOnAnUnbuildablePin:
             == bake_mod.RETRY_RULE_EARLY
         )
         assert (
-            bake_mod.retry_plan(pandas_66, _PANDAS_66_BUILD_LOG).rule
+            bake_mod.retry_plan(transient_deps, _HASH_MISMATCH_BUILD_LOG).rule
             == bake_mod.RETRY_RULE_TRANSIENT
         )
 
@@ -19380,7 +19381,7 @@ class TestTheRetryOnAnUnbuildablePin:
         deps = self._deps()
         bake_mod.write_deps(tmp_path, deps)
         before = bake_mod.load_deps(tmp_path, deps.checkpoint)
-        plan = bake_mod.retry_plan(deps, _PANDAS_66_BUILD_LOG)
+        plan = bake_mod.retry_plan(deps, _HASH_MISMATCH_BUILD_LOG)
         bake_mod.record_retry(tmp_path, deps.checkpoint, plan)
         after = bake_mod.load_deps(tmp_path, deps.checkpoint)
         assert after["retry"]["rule"] == bake_mod.RETRY_RULE_TRANSIENT
@@ -19487,7 +19488,7 @@ class TestTheRetryOnAnUnbuildablePin:
         summary, projects, logged = self._retry_run(
             retry=retry,
             record_drops=lambda name, value: recorded.append((name, value)),
-            first_error=_PANDAS_7_BUILD_LOG,
+            first_error=_UNBUILDABLE_PINS_BUILD_LOG,
             second_ok=True,
         )
         attempts = [script for name, script in projects if name == "vanta-bi-Demo-1"]
@@ -19507,7 +19508,7 @@ class TestTheRetryOnAnUnbuildablePin:
             self._retry_run(
                 retry=retry,
                 record_drops=lambda name, value: recorded.append((name, value)),
-                first_error=_PANDAS_7_BUILD_LOG,
+                first_error=_UNBUILDABLE_PINS_BUILD_LOG,
                 second_ok=False,
             )
         assert recorded == [], "a layer whose retry failed has no drop to record"
@@ -19536,7 +19537,7 @@ class TestTheRetryOnAnUnbuildablePin:
             self._retry_run(
                 retry=retry,
                 record_drops=lambda name, value: recorded.append((name, value)),
-                first_error=_PANDAS_7_BUILD_LOG,
+                first_error=_UNBUILDABLE_PINS_BUILD_LOG,
                 second_ok=False,
                 projects=attempts,
             )
@@ -19556,7 +19557,7 @@ class TestTheRetryOnAnUnbuildablePin:
         with pytest.raises(bake_mod.BakeError) as excinfo:
             self._retry_run(
                 retry=retry,
-                first_error=_PANDAS_7_BUILD_LOG,
+                first_error=_UNBUILDABLE_PINS_BUILD_LOG,
                 second_ok=False,
                 logs_dir=tmp_path,
             )
@@ -19564,7 +19565,7 @@ class TestTheRetryOnAnUnbuildablePin:
         second = bake_mod.retry_log_path(tmp_path, "vanta-bi-Demo-1")
         assert first.is_file(), "the first pass's log is not overwritten"
         assert second.is_file(), "the retry's own output is written"
-        assert _PANDAS_7_BUILD_LOG in first.read_text(encoding="utf-8")
+        assert _UNBUILDABLE_PINS_BUILD_LOG in first.read_text(encoding="utf-8")
         assert "ERROR: retry blew up" in second.read_text(encoding="utf-8")
         message = str(excinfo.value)
         assert f"first-pass build log: {first}" in message
@@ -19575,7 +19576,7 @@ class TestTheRetryOnAnUnbuildablePin:
         plan = self._transient_plan()
         summary, projects, logged = self._retry_run(
             retry=lambda name, built: plan if name == "vanta-bi-Demo-1" else None,
-            first_error=_PANDAS_66_BUILD_LOG,
+            first_error=_HASH_MISMATCH_BUILD_LOG,
             second_ok=True,
         )
         attempts = [script for name, script in projects if name == "vanta-bi-Demo-1"]
@@ -19590,9 +19591,9 @@ class TestTheRetryOnAnUnbuildablePin:
         with pytest.raises(bake_mod.BakeError) as excinfo:
             self._retry_run(
                 retry=lambda name, built: plan if name == "vanta-bi-Demo-1" else None,
-                first_error=_PANDAS_66_BUILD_LOG,
+                first_error=_HASH_MISMATCH_BUILD_LOG,
                 second_ok=False,
-                second_error=_PANDAS_66_BUILD_LOG,
+                second_error=_HASH_MISMATCH_BUILD_LOG,
             )
         message = str(excinfo.value)
         assert "[FAILED] vanta-bi-Demo-1" in message
@@ -19606,7 +19607,7 @@ class TestTheRetryOnAnUnbuildablePin:
         with pytest.raises(bake_mod.BakeError):
             self._retry_run(
                 retry=None,
-                first_error=_PANDAS_7_BUILD_LOG,
+                first_error=_UNBUILDABLE_PINS_BUILD_LOG,
                 second_ok=True,
                 projects=projects,
             )
@@ -23945,8 +23946,8 @@ class TestSuitePythonpath:
     # The buggy commits the held-out split records (§8.6 round 10). Kept as literals
     # because the point of the test is that *these* commits, read from the mirror,
     # say what the canary needs — not that the split happens to agree with itself.
-    FASTAPI_11 = "bf229ad5d830eb5320f966d51a55e590e8d57008"
-    FASTAPI_3 = "869c7389e22dc9ad659940fa271da76c4f3ba3b1"
+    MOVED_COMMIT = "bf229ad5d830eb5320f966d51a55e590e8d57008"
+    SIBLING_COMMIT = "869c7389e22dc9ad659940fa271da76c4f3ba3b1"
 
     def test_the_project_s_own_export_is_read(self, monkeypatch):
         monkeypatch.setattr(
@@ -23983,7 +23984,7 @@ class TestSuitePythonpath:
         assert prepare_mod.suite_pythonpath(Path("/clones/luigi.git"), "c" * 40) is None
 
     def test_the_row_takes_the_commits_value_over_the_splits(self, monkeypatch):
-        """The stale recorded value does not win: fastapi/11's tree has no ``docs_src``."""
+        """The stale recorded value does not win: the tree has no ``docs_src``."""
         monkeypatch.setattr(
             tree_mod,
             "read_file_at",
@@ -23992,7 +23993,7 @@ class TestSuitePythonpath:
         env = prepare_mod._sandbox_env(
             {"sandbox_env": {"PYTHONPATH": "./docs_src"}},
             repo=Path("/clones/fastapi.git"),
-            commit=self.FASTAPI_11,
+            commit=self.MOVED_COMMIT,
         )
         assert env == {"PYTHONPATH": "./docs/src"}
 
@@ -24013,13 +24014,13 @@ class TestSuitePythonpath:
             lambda repo, commit, path: "export PYTHONPATH=./docs/src\n",
         )
         assert prepare_mod._sandbox_env(
-            {}, repo=Path("/clones/fastapi.git"), commit=self.FASTAPI_11
+            {}, repo=Path("/clones/fastapi.git"), commit=self.MOVED_COMMIT
         ) == {"PYTHONPATH": "./docs/src"}
 
-    def test_fastapi_11s_suite_run_sees_docs_src_on_the_path(self, monkeypatch, tmp_path):
+    def test_a_suite_run_sees_docs_src_on_the_path(self, monkeypatch, tmp_path):
         """The env that reaches the deps gate's collect is the commit's own ``./docs/src``.
 
-        [VANTA-WHY] The deps gate's collect is the run that failed on fastapi/11 — its
+        [VANTA-WHY] The deps gate's collect is the run that failed — its
         tutorial tests import the example apps out of the tree's docs directory — so
         that is the run this asserts. The row's ``sandbox_env`` is what every run of the
         row gets (``TestSandboxEnvReachesEveryRun``), and here it is built from the same
@@ -24033,7 +24034,7 @@ class TestSuitePythonpath:
         env = prepare_mod._sandbox_env(
             {"sandbox_env": {"PYTHONPATH": "./docs_src"}},
             repo=self.FASTAPI_REPO,
-            commit=self.FASTAPI_11,
+            commit=self.MOVED_COMMIT,
         )
         seen: dict = {}
         monkeypatch.setattr(
@@ -24045,11 +24046,11 @@ class TestSuitePythonpath:
             suite_mod,
             "import_probe",
             lambda **kwargs: seen.update(probe=kwargs)
-            or "/workspace/worktrees/fastapi_11/oracle_tree/fastapi/__init__.py",
+            or "/workspace/worktrees/fastapi_bug/oracle_tree/fastapi/__init__.py",
         )
         prepare_mod.check_deps(
             prep(
-                root=tmp_path / "batch" / "worktrees" / "fastapi_11",
+                root=tmp_path / "batch" / "worktrees" / "fastapi_bug",
                 sandbox_env=env,
             ),
             checkpoint="chk",
@@ -24060,17 +24061,17 @@ class TestSuitePythonpath:
         assert seen["probe"]["extra_env"] == {"PYTHONPATH": "./docs/src"}
 
     @needs_bare_repos
-    def test_fastapi_11s_own_commit_declares_docs_src(self):
+    def test_the_own_commit_declares_docs_src(self):
         """The canary's fact, read from the real mirror rather than a stub."""
         assert (
-            prepare_mod.suite_pythonpath(self.FASTAPI_REPO, self.FASTAPI_11) == "./docs/src"
+            prepare_mod.suite_pythonpath(self.FASTAPI_REPO, self.MOVED_COMMIT) == "./docs/src"
         )
 
     @needs_bare_repos
-    def test_fastapi_3s_own_commit_declares_docs_src(self):
-        """The other side of the move: /3's tree carries ``docs_src`` and it passes."""
+    def test_a_sibling_commit_declares_docs_src(self):
+        """The other side of the move: the sibling commit's tree carries ``docs_src``."""
         assert (
-            prepare_mod.suite_pythonpath(self.FASTAPI_REPO, self.FASTAPI_3) == "./docs_src"
+            prepare_mod.suite_pythonpath(self.FASTAPI_REPO, self.SIBLING_COMMIT) == "./docs_src"
         )
 
 
@@ -25255,7 +25256,7 @@ class TestBuildTreesInPlace:
         assert seen["env"]["CC"] == bake_mod.VANTA_CC_PATH
 
     def test_the_array_bounds_demotion_reaches_the_build(self, tmp_path, monkeypatch):
-        """M3 §8.6 round 12 (item 5) — ``pandas/6``'s C parser needs ``-Warray-bounds`` demoted.
+        """M3 §8.6 round 12 (item 5) — a C parser needs ``-Warray-bounds`` demoted.
 
         GCC 14 flags the out-of-range subscript in ``tokenizer.c`` and the tree's own
         ``-Werror`` fails the build on it. The demotion is appended at *prepare* time to

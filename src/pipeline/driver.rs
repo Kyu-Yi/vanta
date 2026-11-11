@@ -6337,6 +6337,20 @@ fn require_clean_target_repo_for_open_pr(target_repo_dirty: Option<bool>) -> Res
     }
 }
 
+/// Up to this many regressed nodeids are named in full in the Creator feedback.
+///
+/// [VANTA-WHY] A patched tree that collects NOTHING makes every nodeid the base
+/// tree passed a regression, so on a very large suite (pandas/1's ~88,642 tests)
+/// the regression list is the whole suite. Naming every one of them puts tens of
+/// thousands of nodeids into `prior_feedback`, the next Creator prompt then fails
+/// `prompt_over_budget_reason`, and the run ends as an `InfraFailure` instead of
+/// letting the Creator retry — the feedback meant to enable the retry is what
+/// kills it. At or below this many the message is byte-identical to the one the
+/// unbounded code produced; above it the list is bounded (see the sample size).
+const REGRESSION_FEEDBACK_LIMIT: usize = 50;
+/// How many nodeids the bounded (`> REGRESSION_FEEDBACK_LIMIT`) message names.
+const REGRESSION_FEEDBACK_SAMPLE: usize = 20;
+
 fn build_creator_feedback(
     failed: &[&TestEvidence],
     ruff_new: bool,
@@ -6394,11 +6408,50 @@ fn build_creator_feedback(
         );
     }
     if !native_regressions.is_empty() {
+        let total = native_regressions.len();
         fb.push_str("- The repository's own tests regressed (run with the ORIGINAL test files):\n");
-        for nodeid in native_regressions {
-            fb.push_str(&format!("  - {nodeid}\n"));
-            if let Some(output) = native_patched.failure_output(nodeid) {
-                fb.push_str(&format!("    failure: {output}\n"));
+        if total <= REGRESSION_FEEDBACK_LIMIT {
+            // Byte-identical to the unbounded message: at or below the limit every
+            // nodeid is named, in the suite's own order, with its failure output.
+            for nodeid in native_regressions {
+                fb.push_str(&format!("  - {nodeid}\n"));
+                if let Some(output) = native_patched.failure_output(nodeid) {
+                    fb.push_str(&format!("    failure: {output}\n"));
+                }
+            }
+        } else {
+            // [VANTA-WHY] Above the limit the list is bounded: a sorted sample of
+            // the first `REGRESSION_FEEDBACK_SAMPLE` nodeids, the true total, and
+            // how many are left to the evidence artifact (which keeps the COMPLETE
+            // list). Sorting makes the sample a stable prefix of the suite rather
+            // than whatever order the report parser happened to emit, so two runs
+            // that regress the same suite name the same 20.
+            let mut sorted: Vec<&String> = native_regressions.iter().collect();
+            sorted.sort();
+            for nodeid in sorted.iter().take(REGRESSION_FEEDBACK_SAMPLE) {
+                fb.push_str(&format!("  - {nodeid}\n"));
+                if let Some(output) = native_patched.failure_output(nodeid) {
+                    fb.push_str(&format!("    failure: {output}\n"));
+                }
+            }
+            fb.push_str(&format!(
+                "  - {total} tests regressed; showing the first {REGRESSION_FEEDBACK_SAMPLE} \
+                 (sorted), {} more in the evidence artifact.\n",
+                total - REGRESSION_FEEDBACK_SAMPLE
+            ));
+        }
+        // [VANTA-WHY] A patched side that collected nothing has no `failure_output`
+        // for any nodeid — the regressed nodeids are simply ABSENT from its report —
+        // so the regression list alone cannot say WHY the suite collapsed. The
+        // patched run's stderr tail is that diagnostic (import error, collection
+        // error, crash), so it is added whenever the patched side collected nothing,
+        // bounded to the same tail length the harness already uses.
+        if native_patched.collected_nothing() {
+            let tail = harness::stderr_tail(&native_patched.stderr_tail);
+            if !tail.is_empty() {
+                fb.push_str(&format!(
+                    "  The patched suite collected no tests; its stderr tail: {tail}\n"
+                ));
             }
         }
     }
@@ -7508,6 +7561,7 @@ mod tests {
         ApplyFailure,
         approval_invariant_status, attempt_verdict, bate_baseline_concat, benchmark_config_name,
         blocking_static_findings,
+        build_creator_feedback,
         build_fixed_round_pass_feedback,
         build_source_concat, cache_hit_rate_value, collapse_decision, creator_effort_text,
         creator_prompt_tokens_text,
@@ -7531,6 +7585,7 @@ mod tests {
         stable_patch_fingerprint, ARMS,
         INVARIANT_SATISFIED,
         JUDGE_ARM, NO_ADMITTED_TESTS, NO_REPRODUCTION_EVIDENCE,
+        REGRESSION_FEEDBACK_SAMPLE,
     };
     use crate::agents::attacker::GeneratedTest;
     use crate::config::{LlmBackend, LlmConfig};
@@ -9620,6 +9675,100 @@ mod tests {
         let regressions =
             crate::pipeline::harness::native_regressions(&original.tests, &patched.tests);
         assert_eq!(regressions, vec!["t/test_x.py::test_a".to_string()]);
+    }
+
+    // [VANTA-WHY] v1-m3.1 (§8.5, case a) — an empty patched report over a large
+    // suite must not blow the next Creator prompt. Every nodeid the original passed
+    // is a regression when the patched side collected NOTHING, so on a suite this
+    // size the unbounded list could not fit any window and the run would end as an
+    // `InfraFailure` instead of retrying. Bounded, the feedback stays tiny, carries
+    // the patched-side stderr tail (the ONLY diagnostic an empty report has, since
+    // absent nodeids carry no failure output), and names the true total.
+    #[test]
+    fn an_empty_patched_report_over_a_large_suite_stays_under_the_prompt_budget_and_carries_the_stderr_tail(
+    ) {
+        // The regression list a caller builds: the whole suite, in report order.
+        let mut regressions: Vec<String> = (0..88_642)
+            .map(|i| format!("pandas/tests/io/test_{:04}.py::test_case_{}", i % 2_000, i))
+            .collect();
+        // Deliberately shuffled, so the test proves the >limit branch SORTS rather
+        // than reprinting whatever order the report parser emitted.
+        regressions.reverse();
+
+        let mut patched = clamped_report(&[], false, false);
+        patched.stderr_tail =
+            "collector: ImportError: cannot import name 'numpy_helper' | native report collected 0 tests"
+                .to_string();
+
+        let fb = build_creator_feedback(&[], false, false, &regressions, &patched, &[], &[], &[]);
+
+        // (1) Under the prompt budget. Priced exactly as the call site prices it —
+        // the file-selection budget, the frame, and the fixed output/overhead
+        // reserves — the whole prompt still fits the configured 262144-token window.
+        let prompt = 163_584 + crate::context::estimate_tokens(fb.len()) + 3_000;
+        assert!(
+            prompt_over_budget_reason(prompt, crate::context::OUTPUT_RESERVE_TOKENS, 262_144)
+                .is_none(),
+            "bounded feedback must fit the window; feedback was {} bytes ({prompt} est. tokens)",
+            fb.len()
+        );
+        // (2) Carries the patched-side stderr tail, the only cause an empty report has.
+        assert!(
+            fb.contains("cannot import name 'numpy_helper'"),
+            "the patched suite's stderr tail must be in the feedback:\n{fb}"
+        );
+        // (3) Bounded to the sample and naming the true total plus the remainder.
+        let shown = fb.matches("\n  - pandas/tests/io/").count();
+        assert_eq!(
+            shown, REGRESSION_FEEDBACK_SAMPLE,
+            "only the bounded sample is named; got {shown}"
+        );
+        assert!(fb.contains("88642 tests regressed"), "{fb}");
+        assert!(fb.contains("more in the evidence artifact"), "{fb}");
+        // The sample is the FIRST 20 nodeids, sorted — not the reversed report order.
+        let mut sorted: Vec<&String> = regressions.iter().collect();
+        sorted.sort();
+        assert!(
+            fb.contains(&format!("  - {}\n", sorted[0])),
+            "the sample must be sorted; expected {} first:\n{fb}",
+            sorted[0]
+        );
+        assert!(
+            !fb.contains(&format!("  - {}\n", regressions[0])),
+            "the unsorted report order must not decide the sample"
+        );
+    }
+
+    // [VANTA-WHY] v1-m3.1 (§8.5) — at or below the limit the feedback is
+    // BYTE-IDENTICAL to the unbounded message the code produced before the bound
+    // existed: every nodeid in the report's own order, with its failure output, and
+    // NO stderr-tail line (the patched side ran, so it is not the empty case). The
+    // bound changes only what a huge list looks like; it must change nothing else.
+    #[test]
+    fn a_regression_list_at_the_limit_is_byte_identical_to_the_unbounded_feedback() {
+        let regressions: Vec<String> = (0..10).map(|i| format!("t/test_{i}.py::test_{i}")).collect();
+        let names: Vec<&str> = regressions.iter().map(String::as_str).collect();
+        let mut patched = clamped_report(&names, true, false);
+        patched.failure_outputs.insert(
+            "t/test_3.py::test_3".to_string(),
+            "AssertionError: boom".to_string(),
+        );
+
+        let fb = build_creator_feedback(&[], false, false, &regressions, &patched, &[], &[], &[]);
+
+        let mut expected = String::from("The previous patch failed verification:\n\n");
+        expected
+            .push_str("- The repository's own tests regressed (run with the ORIGINAL test files):\n");
+        for i in 0..10 {
+            expected.push_str(&format!("  - t/test_{i}.py::test_{i}\n"));
+            if i == 3 {
+                expected.push_str("    failure: AssertionError: boom\n");
+            }
+        }
+        expected.push_str(
+            "\nPlease revise the patch to fix these failures while preserving existing behavior.",
+        );
+        assert_eq!(fb, expected, "the small-list message must be unchanged");
     }
 
     // [VANTA-WHY] M3 item 1 — the grounding ledger separates "the audit ran and

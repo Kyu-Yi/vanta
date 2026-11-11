@@ -39879,7 +39879,7 @@ class TestReplayRow:
                 assert replay_mod.REPLAY_DIRNAME in path.parts
 
     def test_the_column_cap_is_derived_from_the_row_measurement(self, tmp_path, monkeypatch):
-        """M3 item D1 — a column runs the same native suite, so it gets the derived cap."""
+        """v1-m3.1 §8.3 — a column runs the same native suite the gate ran, so it gets the gate rule."""
         calls: list[dict] = []
         prep = _replay_prep(tmp_path, native_secs=700.0)
         sessions, debug = _replay_session(tmp_path, attempts=1)
@@ -39901,9 +39901,9 @@ class TestReplayRow:
         )
 
         assert calls, "the baseline column has to boot"
-        assert calls[0]["timeout_secs"] == 2100, (
-            "the replay floor is 1800, and a 700 s run derives max(1800, 3 × 700) = 2100, "
-            "so the per-bug cap reaches run_column"
+        assert calls[0]["timeout_secs"] == 7000, (
+            "the replay floor is 1800, and a 700 s run derives max(1800, 10 × 700) = 7000 "
+            "under the gate rule, so the per-bug cap reaches run_column"
         )
 
     def test_a_row_with_no_measurement_keeps_the_replay_floor(self, tmp_path, monkeypatch):

@@ -109,17 +109,23 @@ pub struct RunConfig {
     /// infrastructure failure instead of a pass. Zero and `None` leave every
     /// pre-item-W run byte-for-byte as it was.
     pub native_expected_tests: Option<usize>,
-    /// [VANTA-WHY] M3 item D1 — `--native-timeout-secs N`: the wall-clock cap for
-    /// the in-session native suite, derived per bug from the run's own prepare
-    /// measurement (`max(120, 3 × measured)`). `None` keeps the historical
-    /// `harness::test_timeout_secs()` (120 s, or `VANTA_TEST_TIMEOUT_SECS`), which
-    /// is every hand-run invocation and every row whose prepare recorded no time.
+    /// [VANTA-WHY] M3 item D1 / v1-m3.1 — `--native-timeout-secs N`: the wall-clock cap
+    /// for the in-session native suite, derived per bug from the run's own prepare
+    /// measurement (`max(600, 10 × measured)`, floor `max(600, test_timeout_secs())`).
+    /// `None` keeps the session floor (`harness::native_session_timeout_floor`, 600 s),
+    /// which is every hand-run invocation and every row whose prepare recorded no time.
     ///
-    /// The native gate runs the repo's own suite twice in-session, and that suite
-    /// is not always fast: pandas/1's takes ~487 s through prepare while the fixed
-    /// 120 s cap killed BOTH in-session runs, so the row died as a false "collected
-    /// nothing" (measured session, night3). A per-bug cap derived from a measured
-    /// run is the only value that is both large enough for the bug and still bounded.
+    /// The native gate runs the repo's own suite twice in-session — original tree vs
+    /// patched tree, both under THIS one cap — and that suite is not always fast:
+    /// pandas/1's takes ~487 s through prepare while the fixed 120 s cap killed BOTH
+    /// in-session runs, so the row died as a false "collected nothing" (measured
+    /// session, night3). The patched side is the suite PLUS the patch, so the cap has
+    /// to absorb the patch's own cost as well: luigi/23's one-file `luigi/scheduler.py`
+    /// patch cost ~3.6× the unpatched suite on an idle machine (119/116 s vs 33/31 s),
+    /// above D1's 3× (probe: `plans/private/diag_luigi23.py`, 2026-11-12). A per-bug cap
+    /// derived from a measured run is the only value that is both large enough for the
+    /// bug and still bounded; the two sides share it because the cap is part of the
+    /// suite-cache key (`suite_cache::native_key`, M3 item S1).
     pub native_timeout_secs: Option<u64>,
     /// Path to a clean original tree (git worktree of the base commit) for
     /// two-tree mode. If set, BATE runs against this tree instead of the
@@ -774,14 +780,20 @@ fn resolve_arm(
 /// The in-session native wall-clock cap, from `--native-timeout-secs` or the default.
 ///
 /// [VANTA-WHY] M3 item E13 — the flag RAISES the cap for a slow bug; it must never
-/// LOWER it. `harness::test_timeout_secs()` (120 s, or `VANTA_TEST_TIMEOUT_SECS`) is the
-/// cap this run would otherwise use, and the Python side already passes its value as
-/// `max(floor, 3 × measured)`, so a value below that floor asks every suite to time out
-/// sooner than the default — the gate could no longer measure the very bug the cap was
-/// raised for. Refused here, where the cap is resolved, naming the flag and the floor.
-/// `None` keeps the default; the CLI still refuses `0` at parse time.
+/// LOWER it. [`harness::native_session_timeout_floor`] (600 s, or the environment's own
+/// `VANTA_TEST_TIMEOUT_SECS` when that is larger) is the cap this run would otherwise
+/// use, and the Python side already passes its own session rule, so a value below that
+/// floor asks every suite to time out sooner than the default — the gate could no longer
+/// measure the very bug the cap was raised for. Refused here, where the cap is resolved,
+/// naming the flag and the floor. `None` keeps the floor; the CLI still refuses `0` at
+/// parse time.
+///
+/// [VANTA-WHY] v1-m3.1 — the floor moved from `test_timeout_secs()` (120 s) to the
+/// session floor, because the in-session gate now gives BOTH sides one raised cap: a
+/// patched side can legitimately cost several times the suite prepare measured, so a cap
+/// that could sit at 120 would kill it and report the patch as an infrastructure fault.
 pub fn resolve_native_timeout_secs(requested: Option<u64>) -> Result<u64, String> {
-    let floor = harness::test_timeout_secs();
+    let floor = harness::native_session_timeout_floor();
     match requested {
         None => Ok(floor),
         Some(secs) if secs < floor => Err(format!(
@@ -1676,16 +1688,30 @@ pub async fn run(
     } else {
         "creator"
     };
+    // [VANTA-WHY] M3 item D1 — the two sides' GENERATED-TEST timeouts may differ only
+    // through the test-only seam. `VANTA_PATCHED_TEST_TIMEOUT_SECS` exists so the timeout
+    // signal path can be exercised end to end without making BATE's baseline
+    // load-sensitive, and a real run that carries it is not a real measurement — hence
+    // the warning.
+    //
+    // [VANTA-WHY] v1-m3.1 — the warning is about that seam ONLY, and now says so. It can
+    // no longer describe the in-session native gate: the gate hands the original and the
+    // patched tree ONE shared cap (`native_cap`, recorded as `native_session_cap_secs` on
+    // `run.summary`), so "the patched side's native cap differs from the baseline's" is
+    // impossible by construction. Read as written, the message invited the opposite
+    // reading — that the native gate ran its two sides under two different caps — which
+    // §8.5 of `plans/private/v1m3.1-fix-design.md` removes.
     let baseline_test_timeout_secs = crate::pipeline::harness::test_timeout_secs();
     let patched_test_timeout_secs = crate::pipeline::harness::patched_test_timeout_secs();
     if baseline_test_timeout_secs != patched_test_timeout_secs {
         tracing::warn!(
             baseline_test_timeout_secs,
             patched_test_timeout_secs,
-            "patched-side test timeout differs from baseline timeout; this seam exists for tests and can bias a real run"
+            "patched-side test timeout differs from baseline timeout; this seam exists for tests and can bias a real run (generated tests only — the native gate runs both sides under one shared cap)"
         );
         eprintln!(
-            "  ⚠ patched-side test timeout differs from baseline timeout: baseline={}s patched={}s",
+            "  ⚠ patched-side test timeout differs from baseline timeout: baseline={}s patched={}s \
+             (generated tests only — the in-session native gate runs both sides under one shared cap)",
             baseline_test_timeout_secs, patched_test_timeout_secs
         );
     }
@@ -1974,11 +2000,11 @@ pub async fn run(
     // having to walk `evidence.json`.
     let mut native_cache_records: Vec<serde_json::Value> = Vec::new();
     let mut native_cache_hits: u32 = 0;
-    // [VANTA-WHY] M3 item D1 — the wall-clock cap every in-session native suite
-    // of this run uses. Declared once, here, so the gate, the judge's run and the
-    // terminal `run.summary` all name the SAME number: `None` on the config keeps
-    // the historical `harness::test_timeout_secs()`, and a row whose prepare
-    // measured its native suite passes `max(120, 3 × measured)`.
+    // [VANTA-WHY] M3 item D1 / v1-m3.1 — the wall-clock cap every in-session native
+    // suite of this run uses. Declared once, here, so the gate, the judge's run and
+    // the terminal `run.summary` all name the SAME number: `None` on the config keeps
+    // the session floor (`harness::native_session_timeout_floor`, 600 s), and a row
+    // whose prepare measured its native suite passes `max(600, 10 × measured)`.
     let native_cap = resolve_native_timeout_secs(config.native_timeout_secs)?;
     // [VANTA-WHY] Every NEW static finding this run's patch introduced, per
     // attempt, so evidence.json can name the finding that rejected a review
@@ -2716,11 +2742,15 @@ pub async fn run(
                 println!("\n▌ JUDGE: running the repo's own suite on the candidate...");
                 let report = run_with_spinner("Running the native suite for the judge", async {
                     // [VANTA-WHY] M3 item D1 — the judge's native run is the same
-                    // full repo suite as the gate's, so it takes the same per-bug cap.
+                    // full repo suite as the gate's, so it takes the same per-bug
+                    // cap. v1-m3.1 — the RESOLVED `native_cap`, not the raw
+                    // config option: `None` would otherwise fall through to the
+                    // 120 s default inside `run_native_suite` and grade the
+                    // candidate under a cap the gate never used.
                     harness::run_native_suite(
                         &judge_patched_concat,
                         &test_cmd,
-                        config.native_timeout_secs,
+                        Some(native_cap),
                     )
                     .await
                 })
@@ -3529,10 +3559,10 @@ pub async fn run(
                     .join(", ")
             );
         }
-        // [VANTA-WHY] M3 item D1 — the suite runs under `native_cap` (declared
-        // once for the run, above): a row with a prepare measurement passes
-        // `max(120, 3 × measured)`, and every other row keeps the historical
-        // `harness::test_timeout_secs()`.
+        // [VANTA-WHY] M3 item D1 / v1-m3.1 — the suite runs under `native_cap`
+        // (declared once for the run, above): the row's own prepare measurement
+        // decides it (`max(600, 10 × measured)`), and a row with no measurement
+        // keeps the session floor (`harness::native_session_timeout_floor`).
         // [VANTA-WHY] M3 item S1 — the two sides go through the content-keyed
         // cache. `native_original` is a function of the BUG (same original tree,
         // same command, same cap), so across a Phase-3 arm-and-seed grid it is
@@ -3550,20 +3580,30 @@ pub async fn run(
         // the reports, the cache keys and the entries written — is byte-identical
         // to running them in sequence: each is the same call with the same
         // arguments, joined rather than awaited one after the other.
+        //
+        // [VANTA-WHY] v1-m3.1 — ONE cap for BOTH sides, and it is the RESOLVED
+        // `native_cap` rather than the raw `config.native_timeout_secs`: passing
+        // the raw option would let `None` fall through to
+        // `harness::test_timeout_secs()` (120 s) inside `run_native_suite_cached`
+        // while the row recorded 600 — a cap the suite did not run under. The two
+        // sides must also share the value, not merely both be raised: the cap is
+        // part of the suite-cache key (`suite_cache::native_key`), so a per-side
+        // cap would give the original side a new key on every row and destroy the
+        // cross-arm reuse (item S1) it is measured for.
         let original_origin = format!("{}/a{}/original", session_id.as_str(), attempt + 1);
         let patched_origin = format!("{}/a{}/patched", session_id.as_str(), attempt + 1);
         let ((native_original, original_cache), (native_patched, patched_cache)) = tokio::join!(
             harness::run_native_suite_cached(
                 &original_concat,
                 &test_cmd,
-                config.native_timeout_secs,
+                Some(native_cap),
                 actual_backend,
                 &original_origin,
             ),
             harness::run_native_suite_cached(
                 &native_patched_concat,
                 &test_cmd,
-                config.native_timeout_secs,
+                Some(native_cap),
                 actual_backend,
                 &patched_origin,
             ),
@@ -9210,11 +9250,12 @@ mod tests {
         assert!(resolve_arm(Some("b3"), true, false, true, 4, None, Some(9)).is_ok());
     }
 
-    // [VANTA-WHY] M3 item E13 — `--native-timeout-secs` may only RAISE the in-session
-    // native cap. Below the effective cap (`harness::test_timeout_secs()`, 120 s by
-    // default) the value would make every suite time out sooner than the default, which
-    // is the opposite of what the flag exists for; refused where the cap is resolved,
-    // naming the flag and the floor.
+    // [VANTA-WHY] M3 item E13 / v1-m3.1 — `--native-timeout-secs` may only RAISE the
+    // in-session native cap. Below the effective cap (the session floor,
+    // `harness::native_session_timeout_floor()`, 600 s or `VANTA_TEST_TIMEOUT_SECS` when
+    // that is larger) the value would make every suite time out sooner than the default,
+    // which is the opposite of what the flag exists for; refused where the cap is
+    // resolved, naming the flag and the floor.
     //
     // [VANTA-WHY] M3 item F6 — every expectation is DERIVED from the floor the run
     // actually resolves, so this passes whatever `VANTA_TEST_TIMEOUT_SECS` is set to.
@@ -9222,8 +9263,12 @@ mod tests {
     // for no reason about the code — on any machine that raised the variable.
     #[test]
     fn a_native_timeout_below_the_effective_cap_is_refused() {
-        let floor = crate::pipeline::harness::test_timeout_secs();
+        let floor = crate::pipeline::harness::native_session_timeout_floor();
         assert!(floor > 0, "the effective cap is a positive number of seconds");
+        assert!(
+            floor >= crate::pipeline::harness::NATIVE_SESSION_TIMEOUT_FLOOR_SECS,
+            "the session floor is the floor of the effective cap"
+        );
         // Absent keeps the floor; the floor itself and anything above it are accepted.
         assert_eq!(resolve_native_timeout_secs(None).unwrap(), floor);
         assert_eq!(resolve_native_timeout_secs(Some(floor)).unwrap(), floor);

@@ -2118,22 +2118,27 @@ def invoke_vanta(
     if prep.prepare_mode == prepare_mod.FULL:
         native_expected = prep.pass_to_pass_count + len(prep.native_failure_baseline)
         argv += ["--native-expected-tests", str(native_expected)]
-    # M3 item D1 — the in-session native suite's wall-clock cap, derived per bug from
-    # prepare's OWN measurement of the same suite. The old cap was the Rust default
-    # (120 s), which pandas/1's ~487 s native run can never fit: the gate then killed
-    # both runs, read as "collected nothing" and ended the row `native_vacuous` — an
-    # `infra_failure` blamed on the tree for what was a fact about the CAP. The rule is
-    # `max(120, 3 × measured)`; `native_secs` is `None` on a row prepared before D1 (or
-    # a measure-only row), which holds the old 120 s. The cap the run actually used is
-    # recorded on the row from `run.summary`.
-    # M3 item F4 — the floor is the run's EFFECTIVE environment's own cap, not the fixed
-    # 120: `driver.rs::resolve_native_timeout_secs` refuses any `--native-timeout-secs`
+    # M3 item D1 / v1-m3.1 — the in-session native suite's wall-clock cap, derived per bug
+    # from prepare's OWN measurement of the same suite. The old cap was the Rust default
+    # (120 s), which pandas/1's ~487 s native run can never fit: the gate then killed both
+    # runs, read as "collected nothing" and ended the row `native_vacuous` — an
+    # `infra_failure` blamed on the tree for what was a fact about the CAP. D1's rule was
+    # `max(120, 3 × measured)`; it is now `max(600, 10 × measured)`, because the luigi/23
+    # probe measured a legitimate one-file patch at ~3.6× the unpatched suite on an idle
+    # machine, above 3×. BOTH sides of the gate get this ONE value (see
+    # `suite_mod.native_session_timeout_secs`): the original side is content-keyed in the
+    # suite cache and the cap is part of that key, so a per-side cap would re-measure it.
+    # `native_secs` is `None` on a row prepared before D1 (or a measure-only row), which
+    # holds the floor. The cap the run actually used is recorded on the row from
+    # `run.summary` (`native_timeout_secs`, `native_session_cap_secs`).
+    # M3 item F4 — the floor is the run's EFFECTIVE environment's own cap, never below
+    # 600: `driver.rs::resolve_native_timeout_secs` refuses any `--native-timeout-secs`
     # below `harness::test_timeout_secs()` for the SAME child environment (`env` here,
-    # which already carries item 19's frozen `[env]`). Measuring against the fixed 120
-    # while the operator raised `VANTA_TEST_TIMEOUT_SECS` sent a value the binary
-    # refused before it ran, so the job ended `infra_failure` with no `run.summary`.
-    native_cap = suite_mod.native_timeout_secs(
-        prep.native_secs, floor=suite_mod.native_timeout_floor(env)
+    # which already carries item 19's frozen `[env]`). Measuring against the fixed floor
+    # while the operator raised `VANTA_TEST_TIMEOUT_SECS` sent a value the binary refused
+    # before it ran, so the job ended `infra_failure` with no `run.summary`.
+    native_cap = suite_mod.native_session_timeout_secs(
+        prep.native_secs, floor=suite_mod.native_session_timeout_floor(env)
     )
     argv += ["--native-timeout-secs", str(native_cap)]
     if candidate is not None:

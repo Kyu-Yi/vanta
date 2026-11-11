@@ -2454,6 +2454,37 @@ pub fn test_timeout_secs() -> u64 {
         .unwrap_or(120)
 }
 
+/// The in-session native GATE's cap floor, in seconds — v1-m3.1, the Rust mirror of
+/// `scripts/bugsinpy/suite.py`'s `NATIVE_SESSION_TIMEOUT_FLOOR_SECS`.
+///
+/// [VANTA-WHY] The gate's two sides (original vs patched) run one repo suite under ONE
+/// cap, and that cap must absorb the patch's own cost as well as machine load. M3 item
+/// D1's rule (`max(120, 3 × prepare's measurement)`) did not: measured on luigi/23, a
+/// one-file `luigi/scheduler.py` patch costs ~3.6× the unpatched suite on an idle
+/// machine (119/116 s vs 33/31 s), so the derived 120 s sat below the patched suite's
+/// own cost and the run's load pushed it past the kill. The floor is therefore 600 s,
+/// and the harness's multiplier above it is 10× (`native_session_timeout_secs`).
+///
+/// The Python side derives the cap and passes it as `--native-timeout-secs`; this
+/// constant is what this binary then refuses to go BELOW, so the two sides of the
+/// process boundary cannot disagree about the floor. The multiplier itself has no Rust
+/// mirror: nothing here multiplies a measured native run — the measurement lives in
+/// prepare, on the Python side, and arrives as an already-derived number.
+pub const NATIVE_SESSION_TIMEOUT_FLOOR_SECS: u64 = 600;
+
+/// The floor [`resolve_native_timeout_secs`](crate::pipeline::driver::resolve_native_timeout_secs)
+/// enforces: the new floor, or the environment's own cap when that is larger.
+///
+/// [VANTA-WHY] M3 item F4's reasoning at the new floor, on the Rust side. A host that
+/// runs `VANTA_TEST_TIMEOUT_SECS=1800` raises `test_timeout_secs()` above 600, and the
+/// harness builds its `--native-timeout-secs` from THAT number; a bare 600 floor here
+/// would then refuse the flag the harness sent for a bug whose suite is unmeasured and
+/// end the job `infra_failure` with no `run.summary`. Taking the larger of the two is
+/// what keeps the two readings of one number in agreement.
+pub fn native_session_timeout_floor() -> u64 {
+    NATIVE_SESSION_TIMEOUT_FLOOR_SECS.max(test_timeout_secs())
+}
+
 /// Timeout for PATCHED-side execution. Tests may lower only this cap so the
 /// real timeout path is exercised without making BATE's baseline load-sensitive.
 pub fn patched_test_timeout_secs() -> u64 {

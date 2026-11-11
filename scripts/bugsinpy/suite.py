@@ -337,13 +337,16 @@ def native_timeout_secs(native_secs: Optional[float], *, floor: int) -> int:
     so the gate could never finish there; matplotlib/1's ~103 s was already inside the
     margin.
 
-    [VANTA-WHY] v1-m3.1 — this is now the MEASUREMENT rule only. Its remaining callers
-    (``oracle.py`` and ``replay.py``, both at floor 1800) run ONE tree twice, so there
-    is no patched side whose cost the cap has to absorb; the in-session GATE moved to
-    :func:`native_session_timeout_secs`, whose shared 10×/1200 rule is what §8.3 of
-    ``plans/private/v1m3.1-fix-design.md`` specifies (raised from 600 by v1-m3.1
-    follow-up 7). Keeping the two rules apart is
-    what stops a raise meant for the gate from also raising a replay column's cap.
+    [VANTA-WHY] v1-m3.1 — this is now the MEASUREMENT rule only, and its ONLY caller is
+    the development probe ``scripts/probe_xdist.py`` (floor 1800). ``oracle.py`` and
+    ``replay.py`` USED to call it here (both at floor 1800), but they grade a PATCHED
+    tree — and, in the oracle view, run the hidden nodeids — so a legitimate patch that
+    is ``3.6×`` the unpatched suite (the luigi/23 probe) exceeded their ``max(1800, 3 ×
+    native)`` cap and was censored. They now call :func:`native_session_timeout_secs`,
+    the same shared 10×/1200 rule the in-session GATE uses (§8.3 of
+    ``plans/private/v1m3.1-fix-design.md``), and keep the floor 1800. Keeping the two
+    rules apart is what stops a raise meant for the gate from also raising the dev
+    probe's cap.
 
     ``floor`` is the caller's CURRENT cap, so the rule can only raise a cap, never
     lower one that was already large enough; ``native_secs is None`` (a row prepared

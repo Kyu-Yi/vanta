@@ -286,12 +286,18 @@ def grade(
     grading exactly the serial pair it was.
     """
     started = time.monotonic()
-    # M3 item D1 — the grading runs cover the same *native* suite the in-session gate
-    # does (``patched_pair`` runs ``prep.test_cmd`` in full), so the cap is derived
-    # from prepare's own measurement by the one shared rule. The floor here is the
-    # caller's current value (1800), so a bug whose suite was measured fast keeps its
-    # cap and a slow one gets room; the rule can only ever raise it.
-    timeout_secs = suite_mod.native_timeout_secs(prep.native_secs, floor=timeout_secs)
+    # M3 item D1 / v1-m3.1 — the grading runs cover the same *native* suite the
+    # in-session gate does (``patched_pair`` runs ``prep.test_cmd`` in full) on a
+    # PATCHED tree, so the cap must absorb the patch's own cost exactly as the gate's
+    # does: the shared 10×/1200 rule (``native_session_timeout_secs``), NOT D1's 3×,
+    # which the luigi/23 probe showed sat below a legitimate patch's own idle cost
+    # (119/116 s vs 33/31 s). The floor is the caller's current value (1800), so a bug
+    # whose suite was measured fast keeps its cap and a slow one gets room (pandas/6:
+    # max(1800, 10 × 725) = 7250, which clears a 3.6× or 5× patch); the rule can only
+    # raise it.
+    timeout_secs = suite_mod.native_session_timeout_secs(
+        prep.native_secs, floor=timeout_secs
+    )
     # §3.4: ``hidden_nodeids`` is the declared ``FAIL_TO_PASS`` **plus** the recorded
     # collect-flips — the files that do not collect on the buggy source at all, so
     # they appear in no BugsInPy list yet are exactly the fail→pass flips the oracle

@@ -6327,6 +6327,13 @@ class TestNativeSessionTimeoutDerivation:
         # pandas/1's native run is ~487 s (D1's own measurement); 10 × 487 clears
         # both the 1200 s floor and the patched side's own cost.
         assert suite_mod.native_session_timeout_secs(487.0, floor=1200) == 4870
+        # pandas/6 is the grader's case: its native run is ~725 s, and the oracle and
+        # replay call this rule at floor 1800, so both grade the patch under
+        # max(1800, 10 × 725) = 7250 — clear of a 3.6× (2610 s) or 5× (3625 s) patch.
+        assert suite_mod.native_session_timeout_secs(725.0, floor=1800) == 7250, "pandas/6"
+        assert suite_mod.native_session_timeout_secs(725.0, floor=1200) == 7250, (
+            "the gate's own floor is below 10 × 725, so the measurement decides"
+        )
 
     def test_a_short_suite_stays_at_the_1200_second_floor(self):
         """fastapi/8 and luigi/23 are short suites, so 10 × is below the floor.
@@ -27226,14 +27233,14 @@ class TestOracleGrade:
         assert "tests" not in hidden["test_cmd"]
 
     def test_the_grading_cap_is_derived_from_the_row_measurement(self, wired, tmp_path):
-        """M3 item D1 — the grading runs cover the native suite, so they get the derived cap.
+        """v1-m3.1 §8.3 — the grading runs cover the PATCHED native suite, so they get the gate rule.
 
-        The floor here is the caller's 1800; a measured run whose 3× exceeds it raises
+        The floor here is the caller's 1800; a measured run whose 10× exceeds it raises
         both the hidden and the patched run, and a row with no measurement keeps 1800.
         """
         self._grade(wired, tmp_path, prep_over={"native_secs": 700.0})
-        assert [run["timeout_secs"] for run in wired["runs"]] == [2100, 2100], (
-            "max(1800, 3 × 700) = 2100, on both the hidden and the patched run"
+        assert [run["timeout_secs"] for run in wired["runs"]] == [7000, 7000], (
+            "max(1800, 10 × 700) = 7000, on both the hidden and the patched run"
         )
 
     def test_a_row_with_no_measurement_keeps_the_grading_floor(self, wired, tmp_path):
@@ -39291,6 +39298,43 @@ class TestReplaySessionReuse:
         entry = record["views"][replay_mod.VIEW_GENERATED]["transitions"][0]
         assert (entry["n_pp"], entry["n_pf"]) == (2, 0)
         assert entry["by_source"][replay_mod.SOURCE_REPO_BASELINE]["n_pp"] == 1
+
+    def test_the_replay_cap_is_derived_from_the_row_measurement(self, tmp_path, monkeypatch):
+        """v1-m3.1 §8.3 — a replay column grades the PATCHED tree, so it gets the gate rule.
+
+        The column runs the same *native* suite the gate ran, plus the patch, so D1's
+        3× sat below a legitimate patch's own cost (luigi/23: 3.6×). The caller's 1800
+        is the floor: pandas/6's ~725 s measurement gives ``max(1800, 10 × 725) = 7250``
+        and a short suite keeps the caller's cap.
+        """
+        for native_secs, expected in ((725.0, 7250), (33.0, replay_mod.DEFAULT_TIMEOUT_SECS)):
+            prep = _replay_prep(tmp_path, native_secs=native_secs)
+            sessions, debug = _replay_session(tmp_path, attempts=1)
+            write(
+                debug / "shared_tests.json",
+                json.dumps([{"test_name": "g_c", "test_source": "assert 1"}]),
+            )
+            calls: list[dict] = []
+            _fake_column(monkeypatch, {0: {"generated:g_c": "passed"}}, calls=calls)
+
+            replay_mod.replay_row(
+                record=_replay_record(),
+                prep=prep,
+                checkpoint="ck",
+                batch_dir=tmp_path / "batch",
+                sessions_dir=sessions,
+                views=(replay_mod.VIEW_GENERATED,),
+                seed=replay_mod.DEFAULT_SEED,
+                sample_rate=0.0,
+                disk_mb=prepare_mod.DISK_MB,
+                timeout_secs=replay_mod.DEFAULT_TIMEOUT_SECS,
+                progress=False,
+            )
+
+            assert calls, "the column carrying the unreused g_c cell has to boot"
+            assert {call["timeout_secs"] for call in calls} == {expected}, (
+                f"native_secs={native_secs} must give every column the derived cap"
+            )
 
 
 class TestReplayBaselineParity:

@@ -311,6 +311,21 @@ pub struct NativeSuiteReport {
     /// `native_suite.summary` can record it for BOTH sides of the gate — a
     /// value with spaces in a summary is already the norm (`judge_reason=`).
     pub collection: Option<CollectionFailure>,
+    /// Did the harness fail to obtain an ATTRIBUTABLE measurement of the tree —
+    /// no exit status observed and the cap never hit?
+    ///
+    /// [VANTA-WHY] Finding A (PR #4 review). A patched side that collected
+    /// nothing is the PATCH's doing ONLY when the suite command actually ran and
+    /// exited (`exit_code` is `Some` — a collection or import error, pytest exit
+    /// 2/4/5) OR it hit the cap (`timed_out`). When NEITHER holds the harness
+    /// never got a verdict out of the command — the backend could not spawn, the
+    /// tree or the exit plugin could not be written, the `execute` call errored,
+    /// or the process died without an exit status — so the emptiness is an
+    /// INFRASTRUCTURE fact. `native_regressions` over it would blame the
+    /// candidate for a suite it never ran. Recorded on the report (it rides the
+    /// suite cache) so the driver can read the marker BEFORE computing
+    /// regressions, instead of inferring it from an absent exit code.
+    pub setup_failed: bool,
 }
 
 /// A report's census of its own collectors, and its FIRST collection failure.
@@ -386,8 +401,11 @@ impl CollectionFailure {
 }
 
 impl NativeSuiteReport {
-    /// The suite never started: the backend could not spawn, or the source tree
-    /// could not be written into the sandbox.
+    /// The suite never started: the backend could not spawn, the source tree or
+    /// the exit plugin could not be written into the sandbox, or the `execute`
+    /// call itself errored. Every one of those is a SETUP/TRANSPORT failure, so
+    /// `setup_failed` is set — see the field's note for why the driver must read
+    /// it before blaming the patch.
     fn not_run() -> Self {
         Self {
             tests: Vec::new(),
@@ -398,6 +416,7 @@ impl NativeSuiteReport {
             exit_code: None,
             stderr_tail: String::new(),
             collection: None,
+            setup_failed: true,
         }
     }
 
@@ -409,6 +428,11 @@ impl NativeSuiteReport {
     /// [VANTA-WHY] M3 item D1 — a TIMEOUT is split out into
     /// :func:`timed_out_run` rather than folded in here: it is the one failed run
     /// whose cause is the harness's own cap, so it gets its own reason.
+    ///
+    /// [VANTA-WHY] Finding A (PR #4 review) — a run with NO exit code at all (the
+    /// process died without a status and the cap did not mark a timeout) produced
+    /// no attributable verdict, so it takes the same `setup_failed` marker as
+    /// :func:`not_run`.
     fn failed_run(exit_code: Option<i32>, stderr_tail: String) -> Self {
         Self {
             tests: Vec::new(),
@@ -419,6 +443,7 @@ impl NativeSuiteReport {
             exit_code,
             stderr_tail,
             collection: None,
+            setup_failed: exit_code.is_none(),
         }
     }
 
@@ -440,6 +465,7 @@ impl NativeSuiteReport {
             exit_code,
             stderr_tail,
             collection: None,
+            setup_failed: false,
         }
     }
 
@@ -782,6 +808,7 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
         exit_code: exec.exit_code,
         stderr_tail: tail,
         collection: CollectionFailure::of(&report),
+        setup_failed: false,
     }
 }
 
@@ -1069,6 +1096,45 @@ pub fn native_vacuous_reason(
          {expected_tests} native test(s) for this bug, but the ORIGINAL side of the in-session suite \
          collected nothing, so the base tree could not be graded and the native gate could not run; \
          this is NOT evidence of zero regressions: {sides}{patched_note}",
+    )
+}
+
+/// The reason a native gate ended as an infrastructure fault because a side could
+/// not be SET UP or transported (Finding A, PR #4 review).
+///
+/// [VANTA-WHY] An empty side is patch-attributable ONLY when the suite command ran
+/// and exited (`exit_code` is `Some` — a collection or import error, pytest exit
+/// 2/4/5) or hit the cap (`timed_out`). When neither holds the harness never
+/// measured the tree — the backend could not spawn, the tree or the exit plugin
+/// could not be written, `execute` errored, or the process died without a status —
+/// so `native_regressions` over it would blame the candidate for a suite Vanta
+/// never ran. This reason names both sides' states so the `infra_failure` row
+/// explains itself.
+pub fn native_setup_failure_reason(
+    original: &NativeSuiteReport,
+    patched: &NativeSuiteReport,
+) -> String {
+    let side = |label: &str, report: &NativeSuiteReport| -> String {
+        format!(
+            "{label}={}{} (tests={} exit_code={} stderr={:?})",
+            if report.ran { "ran" } else { "not_run" },
+            if report.timed_out { " timed_out" } else { "" },
+            report.tests.len(),
+            report
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unset".to_string()),
+            report.stderr_tail,
+        )
+    };
+    let which = if original.setup_failed { "original" } else { "patched" };
+    format!(
+        "native_setup_failed=true — the {which} side of the in-session native suite could not be \
+         SET UP or transported (no exit status was observed and the run's cap was not hit), so it \
+         measured nothing about the tree; this is an INFRASTRUCTURE fault, never a native \
+         regression against the candidate: {} {}",
+        side("original", original),
+        side("patched", patched),
     )
 }
 
@@ -2697,6 +2763,7 @@ mod tests {
         copy_static_configs, copy_tree_excluding, empty_report_note, interpreter_for,
         is_native_test_path, is_tooling_package, native_collection_summary, native_gate_vacuous,
         native_outcome, native_regressions, native_results_index, native_suite_collapsed,
+        native_setup_failure_reason,
         native_suite_command,
         native_tree_with_original_tests,
         native_vacuous_reason, new_diagnostics, parse_mypy_line, parse_native_report,
@@ -3024,6 +3091,7 @@ mod tests {
             exit_code: Some(0),
             stderr_tail: String::new(),
             collection: None,
+            setup_failed: false,
         }
     }
 
@@ -3526,6 +3594,7 @@ mod tests {
             exit_code,
             stderr_tail: String::new(),
             collection: None,
+            setup_failed: false,
         }
     }
 
@@ -3757,6 +3826,19 @@ mod tests {
     /// `GovernorMode`, so Repair and Review answer them identically. The mode
     /// enters only on row 3, at `attempt_verdict` (pinned in driver.rs): a repair
     /// round retries, a review round rejects the candidate.
+    ///
+    /// [VANTA-WHY] Finding A (PR #4 review) — row 3 holds only when the patched
+    /// side's emptiness is ATTRIBUTABLE: the suite command ran and exited
+    /// (`exit_code` is `Some`) or hit the cap (`timed_out`). A third patched state
+    /// therefore exists — `ran=false`, no exit code, not timed out — where the
+    /// harness never measured the tree (spawn/seed/exit-plugin/execute failure).
+    /// `NativeSuiteReport::setup_failed` marks it, and the driver reads the marker
+    /// BEFORE `native_regressions` and ends the run as `InfraFailure` (row 3b below),
+    /// so a machine fault is never recorded as a regression against the candidate.
+    ///
+    /// | original | patched       | vacuous | verdict        |
+    /// |----------|---------------|---------|----------------|
+    /// | ran      | setup-failed  | no      | InfraFailure   |
     #[test]
     fn the_reclassification_truth_table_holds_over_both_sides() {
         let empty = vacuity_report(&[], true, Some(5)); // collected nothing
@@ -3802,6 +3884,62 @@ mod tests {
             row(&full, &full),
             (false, Vec::<String>::new()),
             "row 4, unchanged side: a clean gate"
+        );
+    }
+
+    /// [VANTA-WHY] Finding A (PR #4 review) — the marker that tells an
+    /// ATTRIBUTABLE emptiness (the suite ran and exited, or the cap killed it) from
+    /// a SETUP/TRANSPORT failure, over every constructor.
+    ///
+    /// The rule: an empty side is patch-attributable ONLY when `exit_code` is
+    /// `Some` (a collection or import error, pytest exit 2/4/5) or `timed_out`. A
+    /// `not_run()` (no backend, no tree, no exit plugin, or an `execute` error) and
+    /// a `failed_run` with no exit status both measured nothing about the tree, so
+    /// each is marked; a collection error WITH an exit code and a cap kill are not.
+    #[test]
+    fn only_an_unattributable_empty_run_is_marked_as_a_setup_failure() {
+        assert!(
+            NativeSuiteReport::not_run().setup_failed,
+            "a suite the harness never started (spawn/seed/exit-plugin/execute) is a setup failure"
+        );
+        assert!(
+            NativeSuiteReport::failed_run(None, String::new()).setup_failed,
+            "a run that produced no exit status measured nothing attributable"
+        );
+        assert!(
+            !NativeSuiteReport::failed_run(Some(2), String::new()).setup_failed,
+            "a collection error with an exit code IS attributable to the tree"
+        );
+        assert!(
+            !NativeSuiteReport::failed_run(Some(4), String::new()).setup_failed,
+            "pytest exit 4 (usage error) still carries a status"
+        );
+        assert!(
+            !NativeSuiteReport::timed_out_run(None, String::new()).setup_failed,
+            "a cap kill is the harness's cap, not a setup failure"
+        );
+    }
+
+    /// [VANTA-WHY] Finding A (PR #4 review) — the setup-failure reason names the
+    /// side that could not be set up and the state of BOTH sides, so an
+    /// `infra_failure` row explains itself instead of reading as a regression list.
+    #[test]
+    fn the_setup_failure_reason_names_the_failed_side_and_both_states() {
+        let original = vacuity_report(&["a"], true, Some(0));
+        let mut patched = vacuity_report(&[], false, None);
+        patched.setup_failed = true;
+
+        let reason = native_setup_failure_reason(&original, &patched);
+
+        assert!(reason.contains("native_setup_failed=true"), "{reason}");
+        assert!(reason.contains("the patched side"), "{reason}");
+        assert!(
+            reason.contains("original=ran (tests=1 exit_code=0"),
+            "the measuring side must be named: {reason}"
+        );
+        assert!(
+            reason.contains("patched=not_run (tests=0 exit_code=unset"),
+            "the side that could not be set up must be named with its state: {reason}"
         );
     }
 

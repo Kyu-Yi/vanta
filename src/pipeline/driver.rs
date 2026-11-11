@@ -863,6 +863,29 @@ fn native_vacuous_is_infrastructure(gate_clamped: bool, original_timed_out: bool
     native_vacuous_exit(gate_clamped, original_timed_out) != GovernorDecision::NeedsReview
 }
 
+/// Did the native gate end as an INFRASTRUCTURE fault because a side could not be
+/// SET UP or transported (Finding A, PR #4 review)?
+///
+/// [VANTA-WHY] An empty side is patch-attributable ONLY when the suite command ran
+/// and exited (`exit_code` is `Some` — a collection or import error, pytest exit
+/// 2/4/5) or hit the cap (`timed_out`); `NativeSuiteReport::setup_failed` is false
+/// for exactly those two. When it is set the harness never obtained a measurement,
+/// so `native_regressions` over it would list every ORIGINAL test as a regression
+/// against a suite Vanta never ran — a machine fault blamed on the patch.
+///
+/// An ORIGINAL side that could not be set up is this fault UNCONDITIONALLY: its
+/// emptiness is not the deadline clamp's doing, so it must not take the clamp's
+/// `budget_exhausted` exit. A PATCHED side's is this fault whenever the ORIGINAL
+/// side is not itself vacuous — an original vacuity already ends the run as
+/// `InfraFailure` through its own branch, with its own (more specific) reason.
+fn native_setup_failure(
+    original_setup_failed: bool,
+    patched_setup_failed: bool,
+    original_vacuous: bool,
+) -> bool {
+    original_setup_failed || (patched_setup_failed && !original_vacuous)
+}
+
 /// Render one effective sampling value for the `run.summary` provenance keys.
 ///
 /// [VANTA-WHY] `unset` (not `null`, not a plausible default) is what an absent
@@ -2874,6 +2897,27 @@ pub async fn run(
                     .await
                 })
                 .await;
+                // [VANTA-WHY] Finding A (PR #4 review) — a judge suite the harness
+                // could not SET UP or transport measured nothing about the candidate,
+                // so the judge must not be handed an empty result as if the tree had
+                // no tests, and the row must not read as a REJECTED candidate. Take
+                // the same infrastructure exit the native gate takes.
+                if report.setup_failed {
+                    let reason = format!(
+                        "Judge's native suite could not be SET UP or transported (no exit status \
+                         and no cap timeout) — the candidate was neither graded nor rejected; \
+                         patched=not_run (tests={} exit_code={} stderr={:?})",
+                        report.tests.len(),
+                        report
+                            .exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "unset".to_string()),
+                        report.stderr_tail,
+                    );
+                    println!("  ✗ NATIVE SUITE SETUP FAILED: {reason}");
+                    infra_failure_error = Some(reason);
+                    break 'attempts GovernorDecision::InfraFailure;
+                }
                 Some(render_judge_suite_result(&report))
             } else {
                 None
@@ -3813,6 +3857,25 @@ pub async fn run(
         // counts a patch-caused import error as a `fail`, not censored.
         let native_expected = config.native_expected_tests.unwrap_or(0);
         let native_vacuous = harness::native_gate_vacuous(native_expected, &native_original);
+        // [VANTA-WHY] Finding A (PR #4 review) — a side the harness could not even
+        // SET UP or transport measured nothing about the tree, so its emptiness must
+        // not be read as regressions against the candidate (nor, for the ORIGINAL
+        // side, as the deadline clamp's exit). Checked BEFORE `native_regressions`
+        // (below) and before the timeout flag, so a setup failure never counts as a
+        // candidate regression and never sets `native_timeout`; the run ends as
+        // `InfraFailure` in BOTH repair and review modes. `native_vacuous_seen` stays
+        // FALSE — that flag documents "the BASE tree could not be graded", which this
+        // is not.
+        if native_setup_failure(
+            native_original.setup_failed,
+            native_patched.setup_failed,
+            native_vacuous,
+        ) {
+            let reason = harness::native_setup_failure_reason(&native_original, &native_patched);
+            println!("  ✗ NATIVE SUITE SETUP FAILED: {reason}");
+            infra_failure_error = Some(reason);
+            break 'attempts GovernorDecision::InfraFailure;
+        }
         // [VANTA-WHY] v1-m3.1 F3 — `native_vacuous_seen` documents an
         // INFRASTRUCTURE fault (the base tree could not be graded), so it is set
         // where that exit is actually taken, below — NOT here. A gate made vacuous
@@ -7664,7 +7727,7 @@ mod tests {
         harness_infrastructure_collapse,
         is_judge_site,
         ledger_text,
-        modified_test_config_records, native_gate_cap, native_vacuous_exit,
+        modified_test_config_records, native_gate_cap, native_setup_failure, native_vacuous_exit,
         native_vacuous_is_infrastructure, new_files_from_patch,
         open_fixed_round_record,
         patch_attempt_id_for_patch,
@@ -9741,6 +9804,10 @@ mod tests {
     /// A `NativeSuiteReport` for the gate-clamp tests: the nodeids and run state
     /// spelled out, `timed_out` set explicitly (the harness's own test helper
     /// hard-codes `false`, so a killed side cannot be built with it).
+    ///
+    /// [VANTA-WHY] Finding A — `setup_failed` defaults to `false` (an attributable
+    /// report); a test that needs a SETUP/TRANSPORT failure sets the flag on the
+    /// value it builds.
     fn clamped_report(
         tests: &[&str],
         ran: bool,
@@ -9758,6 +9825,7 @@ mod tests {
             exit_code: None,
             stderr_tail: String::new(),
             collection: None,
+            setup_failed: false,
         }
     }
 
@@ -9860,6 +9928,69 @@ mod tests {
         let regressions =
             crate::pipeline::harness::native_regressions(&original.tests, &patched.tests);
         assert_eq!(regressions, vec!["t/test_x.py::test_a".to_string()]);
+    }
+
+    // [VANTA-WHY] Finding A (PR #4 review) — a PATCHED side the harness could not
+    // SET UP or transport measured nothing, so `native_regressions` over it would
+    // list every ORIGINAL test as a regression and fail the attempt on a suite Vanta
+    // never ran. The marker (`NativeSuiteReport::setup_failed`) is read BEFORE the
+    // regression list, and the run ends as `InfraFailure` — in BOTH repair and review
+    // modes, since the guard takes no `GovernorMode`.
+    #[test]
+    fn a_setup_failed_patched_side_is_an_infrastructure_fault_not_a_regression() {
+        let original = clamped_report(&["t/test_x.py::test_a"], true, false);
+        let mut patched = clamped_report(&[], false, false);
+        patched.setup_failed = true;
+        let vacuous = crate::pipeline::harness::native_gate_vacuous(1, &original);
+        assert!(!vacuous, "the original ran, so the gate is not vacuous");
+        // The list the driver would otherwise build blames the patch ...
+        assert_eq!(
+            crate::pipeline::harness::native_regressions(&original.tests, &patched.tests),
+            vec!["t/test_x.py::test_a".to_string()],
+            "an unattributed empty patched report names every original test as a regression"
+        );
+        // ... and this is the marker that stops it.
+        assert!(
+            native_setup_failure(original.setup_failed, patched.setup_failed, vacuous),
+            "a patched side the harness never set up is an infrastructure fault, not a failed attempt"
+        );
+        // An ATTRIBUTABLE empty patched side over a running original is unchanged:
+        // the patch's own cost, a failed attempt (row 3 of §8.1).
+        assert!(!native_setup_failure(false, false, false));
+        // An ORIGINAL side that could not be set up is the fault UNCONDITIONALLY —
+        // even under a clamp, its emptiness is not the clock's doing and must not
+        // take the clamp's `budget_exhausted` exit.
+        assert!(native_setup_failure(true, false, true));
+        assert!(native_setup_failure(true, false, false));
+        // But an original that is vacuous WITHOUT a setup failure keeps its own,
+        // more specific reason: an original vacuity already ends the run as
+        // `InfraFailure` through the vacuity branch.
+        assert!(!native_setup_failure(false, true, true));
+    }
+
+    // [VANTA-WHY] Finding A (PR #4 review) — the guard is worth nothing if it does
+    // not run in the shared attempt loop, and it must run BEFORE the regression list
+    // is built (and before the timeout flag), so a setup failure never counts as a
+    // candidate regression. The judge's own suite takes the same exit. Pin both call
+    // sites.
+    #[test]
+    fn the_setup_failure_guard_runs_before_native_regressions_in_the_shared_loop() {
+        let source = include_str!("driver.rs");
+        let guard = source
+            .find("if native_setup_failure(")
+            .expect("the shared loop must take the setup-failure guard");
+        let regressions = source
+            .find("let mut native_regressions =")
+            .expect("the native gate must build its regression list");
+        assert!(
+            guard < regressions,
+            "the setup-failure guard must run BEFORE `native_regressions`, or a machine \
+             fault is counted as a candidate regression"
+        );
+        assert!(
+            source.contains("if report.setup_failed {"),
+            "the judge's native suite must take the same setup-failure exit"
+        );
     }
 
     // [VANTA-WHY] v1-m3.1 (§8.5, case a) — an empty patched report over a large

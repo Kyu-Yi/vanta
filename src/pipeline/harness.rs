@@ -3679,6 +3679,76 @@ mod tests {
         );
     }
 
+    /// v1-m3.1 (§8.1) — the whole truth table, over BOTH sides.
+    ///
+    /// [VANTA-WHY] Two facts decide a row, and both are computed here: the guard
+    /// (`native_gate_vacuous`, keyed on the ORIGINAL side ALONE) and the
+    /// regression list (`native_regressions`, original vs patched). Their pair is
+    /// the row's verdict in the driver:
+    ///
+    /// | original | patched | vacuous | regressions | verdict               |
+    /// |----------|---------|---------|-------------|-----------------------|
+    /// | empty    | empty   | yes     | (none)      | InfraFailure          |
+    /// | empty    | ran     | yes     | (none)      | InfraFailure          |
+    /// | ran      | empty   | no      | every test  | failed attempt        |
+    /// | ran      | ran     | no      | the broken  | the attempt's own     |
+    ///
+    /// Row 3 is the fix: an empty PATCHED side under a measuring original is the
+    /// patch's own failure (fastapi/8 — the patch broke collection while the
+    /// original ran 664 tests), and it reaches the Governor through
+    /// `native_regressions` because no original test survives in an empty patched
+    /// report. Rows 1–2 and 4 are mode-independent: the guard takes no
+    /// `GovernorMode`, so Repair and Review answer them identically. The mode
+    /// enters only on row 3, at `attempt_verdict` (pinned in driver.rs): a repair
+    /// round retries, a review round rejects the candidate.
+    #[test]
+    fn the_reclassification_truth_table_holds_over_both_sides() {
+        let empty = vacuity_report(&[], true, Some(5)); // collected nothing
+        let not_run = vacuity_report(&[], false, None); // produced no report
+        let full = vacuity_report(&["a", "b"], true, Some(0));
+        let one = vacuity_report(&["a"], true, Some(0));
+
+        // The pair the driver computes for one row: (vacuous, regressions).
+        let row = |original: &NativeSuiteReport, patched: &NativeSuiteReport| {
+            (
+                native_gate_vacuous(2, original),
+                native_regressions(&original.tests, &patched.tests),
+            )
+        };
+
+        assert_eq!(
+            row(&empty, &empty),
+            (true, Vec::<String>::new()),
+            "row 1: original empty, patched empty — the base tree cannot be graded, \
+             and there is nothing original left to name as a regression, which is \
+             exactly why the GUARD, not the regression list, has to catch this row"
+        );
+        assert_eq!(
+            row(&not_run, &full),
+            (true, Vec::<String>::new()),
+            "row 2: original empty, patched ran — the same fact about the base tree; \
+             the guard never consults the patched side"
+        );
+        assert_eq!(
+            row(&full, &empty),
+            (false, vec!["a".to_string(), "b".to_string()]),
+            "row 3: original ran, patched empty — NOT an infra failure; every \
+             original test is absent from the patched report, so every one is a \
+             regression and the attempt fails on the patch's own evidence"
+        );
+        assert_eq!(
+            row(&full, &one),
+            (false, vec!["b".to_string()]),
+            "row 4: original ran, patched ran — only the test the patch dropped is \
+             named; `a` is present and passing, so it is not a regression"
+        );
+        assert_eq!(
+            row(&full, &full),
+            (false, Vec::<String>::new()),
+            "row 4, unchanged side: a clean gate"
+        );
+    }
+
     // ---- static findings: error-class only ------------------------------------
 
     #[test]

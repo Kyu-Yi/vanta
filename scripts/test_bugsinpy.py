@@ -6310,6 +6310,81 @@ class TestNativeTimeoutDerivation:
         assert suite_mod._marker_duration(stdout, "1") is None
 
 
+class TestNativeSessionTimeoutDerivation:
+    """v1-m3.1 §8.3 — the in-session GATE's cap, ``max(600, 10 × measured)``.
+
+    [VANTA-WHY] The D1 rule above (``max(120, 3 × measured)``) is the MEASUREMENT
+    rule and stays where it is: its remaining callers run ONE tree. The gate runs
+    TWO — the original and the patched tree — and the patched side is that suite
+    plus the patch. The luigi/23 probe measured a legitimate one-file
+    ``luigi/scheduler.py`` change at ~3.6× the unpatched control (119/116 s vs
+    33/31 s) with no load, so D1's 3× sat BELOW the patched suite's own cost and
+    reported the patch as the harness's fault. These pin the new number, the new
+    floor, and that the two rules are no longer the same function.
+    """
+
+    def test_the_rule_is_ten_times_the_measured_run(self):
+        # pandas/1's native run is ~487 s (D1's own measurement); 10 × 487 clears
+        # both the 600 s floor and the patched side's own cost.
+        assert suite_mod.native_session_timeout_secs(487.0, floor=600) == 4870
+
+    def test_a_short_suite_stays_at_the_600_second_floor(self):
+        """fastapi/8 and luigi/23 are short suites, so 10 × is below the floor.
+
+        luigi/23's unpatched control ran 33 s (the probe's own measurement), so
+        ``10 × 33 = 330 < 600`` and the floor is what ships. fastapi/8's native
+        suite is likewise sub-minute — the point of the example is that under the
+        OLD rule such a suite was sent the 120 s cap, and the new floor is what
+        that side now runs under.
+        """
+        assert suite_mod.native_session_timeout_secs(33.0, floor=600) == 600, "luigi/23"
+        for measured in (5.0, 20.0, 59.0, 60.0):
+            assert suite_mod.native_session_timeout_secs(measured, floor=600) == 600, (
+                f"a suite measured at {measured}s must not fall below the 600 s floor"
+            )
+
+    def test_a_raised_environment_floor_wins_over_600(self):
+        """F4 — the floor is the run's EFFECTIVE ``VANTA_TEST_TIMEOUT_SECS``.
+
+        ``resolve_native_timeout_secs`` refuses a ``--native-timeout-secs`` below
+        its own ``test_timeout_secs()``, so a bare 600 would be refused on a host
+        whose environment sets ``VANTA_TEST_TIMEOUT_SECS=1800`` and the job would
+        end ``infra_failure`` with no ``run.summary``. ``max(600, …)`` keeps the
+        flag acceptable and never lowers an operator's own cap.
+        """
+        assert suite_mod.native_session_timeout_floor({}) == 600
+        env = {suite_mod.NATIVE_TIMEOUT_ENV: "1800"}
+        floor = suite_mod.native_session_timeout_floor(env)
+        assert floor == 1800, "the environment's 1800 s cap is above the 600 s floor"
+        assert suite_mod.native_session_timeout_secs(10.0, floor=floor) == 1800, (
+            "a short suite still runs under the raised floor"
+        )
+        assert suite_mod.native_session_timeout_secs(487.0, floor=floor) == 4870, (
+            "10 × the measurement still wins when it is the larger number"
+        )
+
+    def test_a_sub_600_environment_floor_does_not_lower_the_gate(self):
+        assert suite_mod.native_session_timeout_floor(
+            {suite_mod.NATIVE_TIMEOUT_ENV: "300"}
+        ) == 600, "the gate's own 600 s floor is not lowered by a smaller caller cap"
+
+    def test_no_measurement_keeps_the_floor(self):
+        assert suite_mod.native_session_timeout_secs(None, floor=600) == 600
+
+    def test_the_gate_rule_is_not_the_measurement_rule(self):
+        """The two rules are one call apart, and must not be one function.
+
+        A raise meant for the gate must not also raise a replay/oracle column's
+        cap: the same 487 s measurement is 1461 under the measurement rule and
+        4870 under the gate rule.
+        """
+        floor = suite_mod.native_session_timeout_floor({})
+        assert suite_mod.native_timeout_secs(487.0, floor=floor) == 1461
+        assert suite_mod.native_session_timeout_secs(487.0, floor=floor) == 4870
+        assert suite_mod.NATIVE_SESSION_TIMEOUT_MULTIPLIER == 10
+        assert suite_mod.NATIVE_SESSION_TIMEOUT_FLOOR_SECS == 600
+
+
 class TestSuiteCommand:
     def test_substitutes_the_report_placeholder(self):
         cmd = suite_mod.build_command(
@@ -9242,6 +9317,38 @@ class TestCleanTreeNoise:
         write(tree / "demo.py", "x = 1\n")
         suite_mod._clean_tree_noise(tree)
         assert (tree / "demo.py").exists()
+
+
+class TestHarnessDirtyStagingTrees:
+    """v1-m3.1 §5 — the harness's own seed staging tree is not a source edit.
+
+    [VANTA-WHY] `harness::prepare_seed_tree` stages the repo into a
+    `tempdir_in(current_dir())` named ``vanta-seed-*``, i.e. INSIDE the repo root.
+    While any run is in flight ``git status --porcelain`` is therefore non-empty
+    for a reason that has nothing to do with a source edit, and
+    ``runner.git_revision()`` — read once per bug — recorded ``harness_dirty=True``
+    for 153 of Phase-3's 187 rows from the first run that staged a seed tree, with
+    no tracked file modified. The ``.gitignore`` entry is what makes that flag mean
+    what it says. Telemetry only: no behaviour and no measurement changes.
+    """
+
+    def test_the_staging_tree_pattern_is_in_gitignore(self):
+        gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        assert "vanta-seed-*/" in gitignore
+
+    def test_git_itself_ignores_a_staging_tree(self):
+        proc = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "check-ignore", "vanta-seed-abc123/"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert proc.returncode == 0, (
+            "a `vanta-seed-*` staging tree in the repo root must be ignored, or "
+            "`git status --porcelain` reports it and every row reads "
+            f"harness_dirty=True: {proc.stdout!r} {proc.stderr!r}"
+        )
 
 
 class TestDropTestFileHunks:
@@ -28228,7 +28335,7 @@ class TestInvokeVantaCarriesTheNativeExpectedTestCount:
 
 
 class TestInvokeVantaCarriesTheNativeTimeout:
-    """M3 item D1 — the cap derived from prepare's measurement reaches ``--native-timeout-secs``.
+    """The cap derived from prepare's measurement reaches ``--native-timeout-secs``.
 
     [VANTA-WHY] The in-session native suite was run under a fixed 120 s cap while
     prepare's own runs of the same suite used 1800 s. pandas/1's native run is ~487 s,
@@ -28237,6 +28344,13 @@ class TestInvokeVantaCarriesTheNativeTimeout:
     blamed on the tree for a fact about the CAP. The cap is derived from the row's
     own measurement by the one shared rule (``max(120, 3 × measured)``); a row with
     no measurement (pre-D1, or a measure-only row) keeps the historical 120 s.
+
+    [VANTA-WHY] v1-m3.1 (§8.3) — the GATE's rule is now ``max(600, 10 × measured)``
+    over the same measurement, because the luigi/23 probe measured a legitimate
+    one-file patch at ~3.6× its unpatched control on an idle machine: D1's 3× sat
+    below the patched side's own cost, so the cap, not the patch, ended the row.
+    ``max(120, 3 × measured)`` remains the MEASUREMENT rule for the callers that run
+    ONE tree (oracle/replay) — it is no longer what reaches this flag.
     """
 
     @staticmethod
@@ -28264,41 +28378,51 @@ class TestInvokeVantaCarriesTheNativeTimeout:
         )
         return log_path.read_text(encoding="utf-8")
 
-    def test_a_measured_bug_gets_three_times_its_native_run(self, tmp_path, monkeypatch):
+    def test_a_measured_bug_gets_ten_times_its_native_run(self, tmp_path, monkeypatch):
         text = self._run(tmp_path, monkeypatch, native_secs=487.0)
-        assert "--native-timeout-secs 1461" in text, (
-            "pandas/1: max(120, 3 × 487) = 1461 s, room for the suite to finish"
+        assert "--native-timeout-secs 4870" in text, (
+            "pandas/1: max(600, 10 × 487) = 4870 s, room for the suite to finish"
         )
         assert text.index("--max-attempts 2") < text.index("--native-timeout-secs"), (
             "the flag is appended after the fixed arguments"
         )
 
-    def test_a_row_with_no_measurement_keeps_the_historical_cap(
+    def test_a_row_with_no_measurement_keeps_the_600_second_floor(
         self, tmp_path, monkeypatch
     ):
         text = self._run(tmp_path, monkeypatch)
-        assert "--native-timeout-secs 120" in text, (
-            "a pre-D1 or measure-only row keeps the old 120 s, never a cap derived "
-            "from a missing number"
+        assert "--native-timeout-secs 600" in text, (
+            "a pre-D1 or measure-only row holds the gate's 600 s floor, never a cap "
+            "derived from a missing number"
         )
 
     def test_a_raised_environment_timeout_raises_the_flag(self, tmp_path, monkeypatch):
-        """F4 — the finding's case: ``VANTA_TEST_TIMEOUT_SECS=300``, no measurement.
+        """F4 — the floor is the run's EFFECTIVE ``VANTA_TEST_TIMEOUT_SECS``.
 
         [VANTA-WHY] The old fixed 120 s floor emitted ``--native-timeout-secs 120``,
         which ``driver.rs::resolve_native_timeout_secs`` refuses as below its own
-        effective cap of 300 s: the binary exited before running, the row landed as
+        effective cap: the binary exited before running, the row landed as
         ``infra_failure`` with no ``run.summary``, and every affected job was blamed for
-        a discrepancy between two readings of one number.
+        a discrepancy between two readings of one number. Under v1-m3.1 the floor is
+        ``max(600, that environment cap)``, so a raised environment still reaches the
+        flag and a lower one can never lower the gate below 600.
         """
-        env = {"PATH": "/usr/bin", suite_mod.NATIVE_TIMEOUT_ENV: "300"}
+        env = {"PATH": "/usr/bin", suite_mod.NATIVE_TIMEOUT_ENV: "1800"}
         text = self._run(tmp_path, monkeypatch, env=env)
-        assert "--native-timeout-secs 300" in text, (
-            "an unmeasured suite must be sent the environment's own cap, not 120"
+        assert "--native-timeout-secs 1800" in text, (
+            "an unmeasured suite must be sent the environment's own cap"
         )
         measured = self._run(tmp_path, monkeypatch, env=env, native_secs=487.0)
-        assert "--native-timeout-secs 1461" in measured, (
-            "3 × the measurement is still the larger number and still wins"
+        assert "--native-timeout-secs 4870" in measured, (
+            "10 × the measurement is still the larger number and still wins"
+        )
+        lower = self._run(
+            tmp_path,
+            monkeypatch,
+            env={"PATH": "/usr/bin", suite_mod.NATIVE_TIMEOUT_ENV: "300"},
+        )
+        assert "--native-timeout-secs 600" in lower, (
+            "an environment cap below 600 must not lower the gate's own floor"
         )
 
     def test_the_cap_is_never_below_the_binarys_own_floor(self, tmp_path, monkeypatch):
@@ -31935,6 +32059,63 @@ class TestRunJob:
         assert old["native_secs"] is None
         assert old["native_timeout_secs"] is None
         assert old["native_timeout"] is None
+
+    def test_a_row_records_the_per_side_native_seconds_and_the_cap_that_ran(
+        self, tmp_path, monkeypatch
+    ):
+        """v1-m3.1 §4 — the per-side in-session wall time, kill flags and the cap.
+
+        The §8.1 truth table is a claim about the two SIDES (original vs patched),
+        so the row has to state what each side did and the cap it did it under.
+        `native_original_secs`/`native_patched_secs` are seconds (float) or `None`
+        when a side produced no wall time; the two `*_timed_out` flags are bools;
+        `native_session_cap_secs` is the resolved cap (the `native_cap` the driver
+        declared once and passed to both native-suite call sites).
+        """
+        base = _outcome(tmp_path)
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path,
+                summary=dict(
+                    base.summary,
+                    native_timeout_secs="600",
+                    native_timeout="true",
+                    native_original_secs="33.000",
+                    native_patched_secs="119.000",
+                    native_original_timed_out="false",
+                    native_patched_timed_out="true",
+                    native_session_cap_secs="600",
+                ),
+            ),
+        )
+        measured = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root", native_secs=33.0)),
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert measured["native_original_secs"] == 33.0
+        assert measured["native_patched_secs"] == 119.0
+        assert isinstance(measured["native_original_secs"], float)
+        assert measured["native_original_timed_out"] is False
+        assert measured["native_patched_timed_out"] is True
+        assert measured["native_session_cap_secs"] == 600
+
+        # A row whose run.summary predates v1-m3.1 records `None`, never a guess.
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        old = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")),
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert old["native_original_secs"] is None
+        assert old["native_patched_secs"] is None
+        assert old["native_original_timed_out"] is None
+        assert old["native_patched_timed_out"] is None
+        assert old["native_session_cap_secs"] is None
 
     def test_a_missing_final_patch_is_a_measurement_failure_not_a_creator_failure(
         self, tmp_path, monkeypatch

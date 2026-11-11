@@ -7958,6 +7958,30 @@ mod tests {
         );
     }
 
+    /// [VANTA-WHY] v1-m3.1 (§8.1 row 3) — an EMPTY patched side is a failed
+    /// attempt in BOTH modes, and the mode only decides what that costs.
+    ///
+    /// `native_regression` is the path row 3 takes to the Governor (every
+    /// original test is absent from an empty patched report, so every one is a
+    /// regression), and `attempt_verdict` rejects on it in any mode. In review
+    /// mode that rejection IS the candidate's verdict — a recorded reject, not a
+    /// censored `infra_failure`; in repair mode it is a round the Creator gets
+    /// back and retries. fastapi/8 (session 89ea1886) used to leave this path
+    /// entirely and end the row `infra_failure`, dropping the bug out of the
+    /// attempt loop, though its patch alone broke collection while the original
+    /// ran 664 tests.
+    #[test]
+    fn an_empty_patched_side_fails_the_attempt_in_both_modes() {
+        for mode in [GovernorMode::Repair, GovernorMode::Review] {
+            assert_eq!(
+                attempt_verdict(true, &[], true, false, mode),
+                AttemptVerdict::Rejected,
+                "row 3 in {mode:?}: a patch that wiped the native suite must reject, \
+                 never read as a clean gate nor as an infrastructure fault"
+            );
+        }
+    }
+
     fn audit_finding(file: &str, code: &str) -> StaticDiagnostic {
         StaticDiagnostic {
             file: file.to_string(),

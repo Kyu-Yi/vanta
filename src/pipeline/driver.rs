@@ -2827,6 +2827,37 @@ pub async fn run(
                     &patch_deleted_paths(&patch_text),
                 );
                 let judge_patched_concat = build_source_concat(&native_tree.files);
+                // [VANTA-WHY] v1-m3.1 F2 — the judge's native run is CLAMPED to the
+                // run's clock exactly as the gate's two sides are (§8.4), because it
+                // is the same sized step and, unclamped, the same failure follows:
+                // the attempt top honours the deadline only once the deadline has
+                // ALREADY passed, so a run taken with the whole resolved cap can
+                // start at `VANTA_DEADLINE_SECS` (this attempt's own in-session
+                // import guard is allowed to start first, and it has its own cap)
+                // and then outlive `RUN_TIMEOUT_SECS` on its own. The harness
+                // SIGKILLs the row mid-run, and a killed row writes no manifest
+                // entry at all — invisible to the wave-1 gate. The margin between
+                // the deadline and that kill is ONE model call's worth, and this
+                // arm's single model call (the judge's, below and AFTER this run)
+                // already needs it: it cannot cover the suite as well. With nothing
+                // left there is no run to make, and the attempt takes the SAME
+                // deadline exit the top of the loop takes (`stop_reason =
+                // BUDGET_EXHAUSTED`, `NeedsReview`), adding no new outcome. The
+                // clamp can only LOWER the cap, so a run with time to spare keeps
+                // the resolved `native_cap`.
+                let remaining = crate::llm::remaining_secs();
+                let judge_suite_cap = match native_gate_cap(native_cap, remaining) {
+                    Some(cap) => cap,
+                    None => {
+                        stop_reason = Some(BUDGET_EXHAUSTED);
+                        println!(
+                            "\n  ⏱ Wall-clock deadline reached before the judge's native suite — \
+                             skipping it and ending the run as NeedsReview ({BUDGET_EXHAUSTED}); \
+                             the candidate has been neither approved nor rejected."
+                        );
+                        break 'attempts GovernorDecision::NeedsReview;
+                    }
+                };
                 println!("\n▌ JUDGE: running the repo's own suite on the candidate...");
                 let report = run_with_spinner("Running the native suite for the judge", async {
                     // [VANTA-WHY] M3 item D1 — the judge's native run is the same
@@ -2835,11 +2866,10 @@ pub async fn run(
                     // config option: `None` would otherwise fall through to the
                     // 120 s default inside `run_native_suite` and grade the
                     // candidate under a cap the gate never used.
-                    // Post-gate bound: 1 attempt ≤ max_call_secs (3600 s) + native_cap (7250 s) = 10850 s < 13800 s.
                     harness::run_native_suite(
                         &judge_patched_concat,
                         &test_cmd,
-                        Some(native_cap),
+                        Some(judge_suite_cap),
                     )
                     .await
                 })
@@ -9655,6 +9685,57 @@ mod tests {
         assert_eq!(native_gate_cap(1200, Some(0)), None);
         // The distinguishing case: no deadline is NOT zero seconds left.
         assert_eq!(native_gate_cap(1200, None), Some(1200));
+    }
+
+    // [VANTA-WHY] v1-m3.1 F2 — the judge's own native run (`judge+suite`) is the SAME
+    // sized step as the gate's, and unclamped it fails the same way: the attempt top
+    // honours the deadline only once it has passed, so a run taken with the whole
+    // resolved cap can start AT the deadline — the in-session import guard may start
+    // first and has its own cap — and reach the harness's `RUN_TIMEOUT_SECS` on its
+    // own. The source once claimed a `max_call_secs + native_cap` bound for it, and
+    // that is not how the clock works: the margin between the deadline and the kill is
+    // ONE in-flight model call's worth, and this arm's model call comes AFTER the run,
+    // so the margin is already spent by then. The run is therefore clamped like the
+    // gate's two sides. Both halves are pinned here because they are two claims: the
+    // arithmetic, and the call site that takes the rule.
+    #[test]
+    fn the_judge_suite_run_takes_the_gate_s_clamped_cap_and_the_deadline_exit() {
+        // The two clocks, as the harness hands them out: the deadline Vanta is given,
+        // and the backstop it SIGKILLs the row at.
+        let deadline: u64 = 10_200;
+        let run_timeout: u64 = 13_800;
+        // The margin is one model call's backstop — exactly what the judge's own call
+        // (after this run) may spend, so it cannot also cover the suite.
+        assert_eq!(run_timeout - deadline, 3_600);
+        // A slow suite's per-side cap, larger than that margin: this is the case the
+        // clamp exists for.
+        let cap: u64 = 7_200;
+        assert!(cap > run_timeout - deadline);
+        // The import guard's own cap, which may run before the suite in the same attempt.
+        let guard_cap: u64 = 120;
+        assert!(
+            deadline + guard_cap + cap >= run_timeout,
+            "an unclamped run started at the deadline reaches the harness's kill \
+             ({} s >= {} s), and a killed row writes no manifest entry",
+            deadline + guard_cap + cap,
+            run_timeout
+        );
+        // The clamp itself: the full cap while the run has at least that much left...
+        assert_eq!(native_gate_cap(cap, Some(deadline)), Some(cap));
+        // ...the time left when it has less, so the run ends by the deadline...
+        assert_eq!(native_gate_cap(cap, Some(3_000)), Some(3_000));
+        // ...and NO run at all when the clock is out, which is the value the call site
+        // maps to the existing deadline exit (`budget_exhausted`/`NeedsReview`).
+        assert_eq!(native_gate_cap(cap, Some(0)), None);
+        // The rule is worth nothing if the judge's native run is not what takes it, so
+        // the call site is pinned too. `native_gate_cap` is called from two places and
+        // the gate's own line is a different one: this is the judge's.
+        let source = include_str!("driver.rs");
+        assert!(
+            source.contains("let judge_suite_cap = match native_gate_cap(native_cap, remaining) {"),
+            "the judge's native run must take `native_gate_cap`, exactly as the gate \
+             does; this file has no clamped judge-suite call site"
+        );
     }
 
     /// A `NativeSuiteReport` for the gate-clamp tests: the nodeids and run state

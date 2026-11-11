@@ -3630,12 +3630,24 @@ pub async fn run(
         // original ran=true (0 tests), patched ran=true (0 tests), 0
         // regression(s)`) while the SAME tree collected 88643 tests through the
         // prepare path. When the row's own prepare recorded tests for this bug,
-        // a native run that collected nothing means the check could not be DONE:
-        // it is an infrastructure fact, never a pass, and it ends the run as
-        // `InfraFailure` (exit 2) so the row is `infra_failure`.
+        // a native run in which the ORIGINAL side collected nothing means the
+        // base tree could not be graded at all: an infrastructure fact, never a
+        // pass, and it ends the run as `InfraFailure` (exit 2) so the row is
+        // `infra_failure`.
+        //
+        // [VANTA-WHY] v1-m3.1 (§8.1) — the guard is keyed on the ORIGINAL side
+        // ALONE. The original side running is what makes the patched side's
+        // emptiness attributable to the PATCH: a patched side that collected
+        // nothing while the original ran (a collection error, OR a cap kill) is a
+        // FAILED ATTEMPT, never `InfraFailure`. It reaches the Governor on its
+        // own, because every original test is then absent from the patched report
+        // (`native_regressions`, and `native_suite_collapsed`). Reading it as
+        // vacuous is what labelled fastapi/8 (session 89ea1886) `infra_failure`
+        // and dropped the bug out of the attempt loop, though its patch alone
+        // broke collection while the original ran 664 tests — the pre-registration
+        // counts a patch-caused import error as a `fail`, not censored.
         let native_expected = config.native_expected_tests.unwrap_or(0);
-        let native_vacuous =
-            harness::native_gate_vacuous(native_expected, &native_original, &native_patched);
+        let native_vacuous = harness::native_gate_vacuous(native_expected, &native_original);
         native_vacuous_seen |= native_vacuous;
         // [VANTA-WHY] M3 item D1 — record that the cause was a KILL, not a tree
         // that collected nothing. Only meaningful when the gate is actually
@@ -3728,6 +3740,14 @@ pub async fn run(
         // `InfraFailure` machinery (run.infra_failure row, exit code 2, row
         // verdict `InfraFailure` → label `infra_failure`) is what makes the row
         // unapprovable on this evidence rather than a silent false accept.
+        //
+        // [VANTA-WHY] v1-m3.1 (§8.1/§8.5) — the branch is reachable only on §8.1
+        // row 1 (`native_vacuous` is now "the ORIGINAL side collected nothing"),
+        // so it fires when the BASE tree could not be graded, whatever the patched
+        // side did. A patched side that collected nothing while the original ran
+        // does NOT reach here: it stays in the attempt loop as a failed attempt,
+        // which in review mode REJECTS the candidate (`attempt_verdict` sees the
+        // native regression) instead of ending the run as an infrastructure fault.
         if native_vacuous {
             let reason = harness::native_vacuous_reason(
                 native_expected,
@@ -3735,7 +3755,7 @@ pub async fn run(
                 &native_original,
                 &native_patched,
             );
-            println!("  ✗ NATIVE VACUOUS: {reason}");
+            println!("  ✗ NATIVE VACUOUS (original side collected nothing): {reason}");
             infra_failure_error = Some(reason);
             break 'attempts GovernorDecision::InfraFailure;
         }

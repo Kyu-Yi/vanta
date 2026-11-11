@@ -941,8 +941,8 @@ pub fn native_suite_collapsed(
     original.ran && !original.tests.is_empty() && patched.tests.len() < original.tests.len()
 }
 
-/// Is this attempt's native gate VACUOUS — did either side measure nothing,
-/// for a bug whose own preparation recorded that it has tests?
+/// Is this attempt's native gate VACUOUS — did the ORIGINAL side measure
+/// nothing, for a bug whose own preparation recorded that it has tests?
 ///
 /// [VANTA-WHY] M3 item W. `native_regressions` over an empty original list is
 /// VACUOUSLY empty, and `native_suite_collapsed` requires a non-empty original,
@@ -951,33 +951,43 @@ pub fn native_suite_collapsed(
 /// row's own `prepare` recorded for this bug (``pass_to_pass_count`` plus the
 /// native-failure baseline, the same figure `prepare_summary.md` prints); when
 /// it is zero the bug genuinely ships no native tests and the gate is
-/// legitimately silent, so the guard does not fire. When it is positive and the
-/// in-session suite collected nothing, the check COULD NOT BE DONE — an
-/// infrastructure fact, never a pass.
-pub fn native_gate_vacuous(
-    expected_tests: usize,
-    original: &NativeSuiteReport,
-    patched: &NativeSuiteReport,
-) -> bool {
-    expected_tests > 0 && (original.collected_nothing() || patched.collected_nothing())
+/// legitimately silent, so the guard does not fire.
+///
+/// [VANTA-WHY] v1-m3.1 (§8.1) — the guard is keyed on the ORIGINAL side ALONE.
+/// The original side running is what makes the patched side's emptiness
+/// attributable to the PATCH; the original side collecting nothing means the BASE
+/// tree cannot be graded at all, which is an infrastructure fact whatever the
+/// patched side did (a cap kill, or a collection error — "both sides empty" is
+/// the same row). A patched side that collected nothing while the ORIGINAL side
+/// ran is the patch's OWN failure — a collection error, or a cap kill — and it
+/// already reaches the Governor as a rejection on its own: every original test is
+/// then absent from the patched report, so `native_regressions` names it (and
+/// `native_suite_collapsed` fires when the originals were not all passing). It is
+/// deliberately NOT read as vacuous here: that ended the run as `InfraFailure`
+/// and dropped the bug out of the attempt loop (fastapi/8, session 89ea1886,
+/// whose patch alone broke collection while the original ran 664 tests).
+pub fn native_gate_vacuous(expected_tests: usize, original: &NativeSuiteReport) -> bool {
+    expected_tests > 0 && original.collected_nothing()
 }
 
-/// The recorded reason a native gate is vacuous, naming the side and the cause.
+/// The recorded reason a native gate is vacuous, naming the cause.
 ///
 /// [VANTA-WHY] M3 item W. The reader acts on the reason, not the boolean: "the
-/// original side never ran", "the patch side collected nothing" and "neither
-/// side produced a usable report" need different responses, and the exit code
-/// and the stderr tail of the empty side are what tell them apart.
+/// original side never ran", "the original side hit the cap" and "the original
+/// side collected nothing" need different responses, and the exit code and the
+/// stderr tail of the empty side are what tell them apart.
 ///
-/// [VANTA-WHY] M3 item D1 — a side killed by the wall-clock cap gets its OWN
-/// reason, ``native_timeout``, rather than the generic "collected nothing". The
-/// two emptinesses point at opposite fixes: a collection error is the tree's own
-/// import failing (pandas/1's xarray `TypeError`, fixed by the version pin),
-/// while a timeout is the harness's cap being too small for a legitimate suite
-/// (pandas/1's ~487 s native run under a 120 s in-session cap). `cap_secs` is the
-/// cap the run actually used, so the reason states the number the operator must
-/// raise. The guard is unchanged in force: either reason still ends the run as
-/// `InfraFailure`, and neither can ever count as zero regressions.
+/// [VANTA-WHY] M3 item D1 / v1-m3.1 (§8.5) — a side killed by the wall-clock cap
+/// gets its OWN reason, ``native_timeout``, naming the cap. But the "raise the
+/// derived cap" advice D1 put here is gone: it is only reachable when the gate is
+/// vacuous, i.e. when the ORIGINAL side collected nothing (§8.1 row 1), and under
+/// v1-m3.1 the shared cap is ``10 ×`` the bug's own prepare measurement (never
+/// below 600 s). An original side that cannot finish inside 10× the time prepare
+/// measured for the SAME tree is this run failing to reproduce its own
+/// measurement — an environment fault, not a cap to tune — while a patched side
+/// that cannot is the patch's cost: a failed attempt, never this reason at all.
+/// The guard is otherwise unchanged in force: this reason still ends the run as
+/// `InfraFailure`, and it can never count as zero regressions.
 pub fn native_vacuous_reason(
     expected_tests: usize,
     cap_secs: u64,
@@ -1011,16 +1021,18 @@ pub fn native_vacuous_reason(
         return format!(
             "native_timeout=true expected_tests={expected_tests} native_timeout_secs={cap_secs} — \
              {which} of the in-session native suite hit the run's {cap_secs}s wall-clock cap and was \
-             killed, so the native gate could not run and is NOT evidence of zero regressions. This is \
-             the cap being too small for this bug's suite, not the suite collecting nothing: raise the \
-             derived cap (prepare's measured native time × 3) rather than reading the emptiness as a \
-             tree with no tests. {sides}",
+             killed, so the native gate could not run and is NOT evidence of zero regressions. Under \
+             v1-m3.1 the cap is 10× the bug's own prepare measurement (never below 600 s), so a kill \
+             is not a cap to raise: an ORIGINAL side that cannot finish in it is this run failing to \
+             reproduce its own prepare measurement — an environment fault — and a patched side that \
+             cannot is the patch's cost, a failed attempt rather than this infra reason. {sides}",
         );
     }
     format!(
         "native_vacuous=true expected_tests={expected_tests} — the row's own prepare recorded \
-         {expected_tests} native test(s) for this bug, but the in-session suite collected nothing, \
-         so the native gate could not run and is NOT evidence of zero regressions: {sides}",
+         {expected_tests} native test(s) for this bug, but the ORIGINAL side of the in-session suite \
+         collected nothing, so the base tree could not be graded and the native gate could not run; \
+         this is NOT evidence of zero regressions: {sides}",
     )
 }
 
@@ -3474,80 +3486,82 @@ mod tests {
         }
     }
 
-    /// The guard: with a POSITIVE expected count, either side measuring nothing
-    /// makes the gate vacuous; with zero the bug genuinely has no native tests
-    /// and the gate is legitimately silent.
+    /// The guard: with a POSITIVE expected count, the ORIGINAL side measuring
+    /// nothing makes the gate vacuous; with zero the bug genuinely has no native
+    /// tests and the gate is legitimately silent.
     ///
     /// [VANTA-WHY] `native_regressions` over an empty original is vacuously empty
     /// and `native_suite_collapsed` requires a non-empty original, so `(0, 0)`
-    /// cleared both holes and read as "0 regressions" (pandas/1 c9289597). This
-    /// is the only thing that tells "no tests to check" apart from "the suite
-    /// could not run".
+    /// cleared both holes and read as "0 regressions" (pandas/1 c9289597). This is
+    /// the only thing that tells "no tests to check" apart from "the suite could
+    /// not run".
+    ///
+    /// [VANTA-WHY] v1-m3.1 (§8.1) — the key is the ORIGINAL side. A PATCHED side
+    /// that collected nothing while the original ran is the patch's own failure,
+    /// which `native_regressions` already turns into a rejection (fastapi/8), so
+    /// it is NOT vacuous.
     #[test]
-    fn native_gate_vacuous_fires_only_when_prepare_measured_tests() {
+    fn native_gate_vacuous_fires_only_when_the_original_side_collected_nothing() {
         let full = vacuity_report(&["a", "b"], true, Some(1));
         let empty = vacuity_report(&[], true, Some(5));
         let not_run = vacuity_report(&[], false, None);
 
         assert!(
-            native_gate_vacuous(88642, &full, &empty),
-            "a patch side that collected nothing must not read as 0 regressions"
+            !native_gate_vacuous(88642, &full),
+            "an original that measured is a real gate — a patched side that collected nothing \
+             while it ran is a patch failure (every original test is then a regression), not a \
+             vacuous gate"
         );
         assert!(
-            native_gate_vacuous(88642, &empty, &full),
-            "an original side that collected nothing is just as vacuous"
+            native_gate_vacuous(88642, &empty),
+            "an original side that collected nothing cannot be graded at all"
         );
         assert!(
-            native_gate_vacuous(88642, &not_run, &not_run),
-            "neither side running is the worst case, not a clean gate"
+            native_gate_vacuous(88642, &not_run),
+            "an original that never ran is the worst case, not a clean gate"
         );
         assert!(
-            native_gate_vacuous(88642, &empty, &empty),
-            "0 vs 0 is exactly the false accept the guard exists for"
-        );
-        assert!(
-            !native_gate_vacuous(88642, &full, &full),
-            "both sides measured: this is a real gate, not a vacuous one"
-        );
-        assert!(
-            !native_gate_vacuous(0, &empty, &empty),
+            !native_gate_vacuous(0, &empty),
             "a bug with no native tests must not be forced into infra_failure"
         );
         assert!(
-            !native_gate_vacuous(0, &not_run, &not_run),
+            !native_gate_vacuous(0, &not_run),
             "a hand-run binary records no count and keeps the old reading"
         );
     }
 
-    /// The reason names the failing side and its exit code, so the reader can
-    /// tell "the original never ran" from "the patch collected nothing".
+    /// The reason names BOTH sides and their exit codes, so the reader can tell
+    /// "the original never ran" from "the original collected nothing",
+    /// and it carries WHICH module broke collection.
     ///
-    /// [VANTA-WHY] M3 item W follow-up — the reason also has to carry WHICH
-    /// module broke collection. `empty_report_note` renders the collector census
-    /// into the report's `stderr_tail`, and the reason prints that tail, so the
-    /// module name reaches the operator here (and, tokenised, in
+    /// [VANTA-WHY] M3 item W follow-up — `empty_report_note` renders the collector
+    /// census into the report's `stderr_tail`, and the reason prints that tail, so
+    /// the module name reaches the operator here (and, tokenised, in
     /// `native_suite.summary`) instead of forcing a second sandbox boot.
+    ///
+    /// [VANTA-WHY] v1-m3.1 (§8.5) — the reason is only produced when the ORIGINAL
+    /// side collected nothing (§8.1 row 1), so the EMPTY side is the original here.
     #[test]
-    fn native_vacuous_reason_names_the_side_and_its_exit_code() {
-        let full = vacuity_report(&["a", "b"], true, Some(0));
-        let mut empty = vacuity_report(&[], true, Some(5));
-        empty.stderr_tail = "shuru: booting VM | native report collected 0 tests (report \
+    fn native_vacuous_reason_names_both_sides_and_the_broken_collector() {
+        let patched = vacuity_report(&["a", "b"], true, Some(0));
+        let mut original = vacuity_report(&[], true, Some(5));
+        original.stderr_tail = "shuru: booting VM | native report collected 0 tests (report \
              exitcode=2 summary.collected=88592 collectors=2620 failed_collectors=1 \
              first_failed_collector=pandas/tests/io/test_x.py \
              first_collector_error=ImportError while importing test module)"
             .to_string();
 
-        let reason = native_vacuous_reason(88642, 120, &full, &empty);
+        let reason = native_vacuous_reason(88642, 600, &original, &patched);
 
         assert!(reason.contains("native_vacuous=true"), "{reason}");
         assert!(reason.contains("expected_tests=88642"), "{reason}");
         assert!(
-            reason.contains("original=ran (tests=2 exit_code=0"),
-            "the measuring side must be reported too: {reason}"
+            reason.contains("original=ran (tests=0 exit_code=5"),
+            "the empty side and its exit code must be named: {reason}"
         );
         assert!(
-            reason.contains("patched=ran (tests=0 exit_code=5"),
-            "the empty side and its exit code must be named: {reason}"
+            reason.contains("patched=ran (tests=2 exit_code=0"),
+            "the measuring side must be reported too: {reason}"
         );
         assert!(
             reason.contains("failed_collectors=1")
@@ -3594,19 +3608,21 @@ mod tests {
         );
     }
 
-    /// [VANTA-WHY] M3 item D1 — a vacuous gate caused by a KILLED side reports
-    /// `native_timeout` with the cap named, not `native_vacuous`. The two send the
-    /// operator to opposite places — the cap (a harness fact) vs the tree (an
-    /// import error) — and the guard's force is unchanged either way: a killed
-    /// side is still vacuous and still ends the run as `InfraFailure`.
+    /// [VANTA-WHY] M3 item D1 / v1-m3.1 (§8.5) — a vacuous gate caused by a KILLED
+    /// side reports `native_timeout` with the cap named, not the generic
+    /// `native_vacuous`. The reason names the cap but no longer advises raising it:
+    /// under v1-m3.1 the cap is 10× prepare's own measurement (§8.3), so an
+    /// original side that cannot finish in it is an environment fault, not a cap to
+    /// tune. The guard's force is unchanged: an empty original is still vacuous and
+    /// still ends the run as `InfraFailure`.
     #[test]
     fn native_vacuous_reason_names_a_timeout_as_its_own_reason() {
-        let full = vacuity_report(&["a", "b"], true, Some(1));
         let mut killed = vacuity_report(&[], false, None);
         killed.timed_out = true;
-        killed.stderr_tail = "shuru exec TIMEOUT after 120s".to_string();
+        killed.stderr_tail = "shuru exec TIMEOUT after 600s".to_string();
+        let patched = vacuity_report(&["a", "b"], true, Some(1));
 
-        let reason = native_vacuous_reason(88642, 1461, &full, &killed);
+        let reason = native_vacuous_reason(88642, 600, &killed, &patched);
 
         assert!(reason.contains("native_timeout=true"), "{reason}");
         assert!(
@@ -3614,17 +3630,21 @@ mod tests {
             "a timeout is its own reason, not the generic one: {reason}"
         );
         assert!(
-            reason.contains("native_timeout_secs=1461"),
+            reason.contains("native_timeout_secs=600"),
             "the cap the run used must be named: {reason}"
         );
-        assert!(reason.contains("the patch side"), "{reason}");
+        assert!(reason.contains("the original side"), "{reason}");
         assert!(
-            reason.contains("patched=not_run timed_out (tests=0 exit_code=unset"),
+            !reason.contains("raise the derived cap"),
+            "v1-m3.1's cap is 10× prepare's own measurement, not a value to raise: {reason}"
+        );
+        assert!(
+            reason.contains("original=not_run timed_out (tests=0 exit_code=unset"),
             "the killed side and its state must be reported: {reason}"
         );
         assert!(
-            native_gate_vacuous(88642, &full, &killed),
-            "the guard's force is unchanged: a killed side is still vacuous"
+            native_gate_vacuous(88642, &killed),
+            "the guard's force is unchanged: an empty original is still vacuous"
         );
     }
 

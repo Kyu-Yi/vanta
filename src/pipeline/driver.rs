@@ -849,6 +849,20 @@ fn native_vacuous_exit(gate_clamped: bool, original_timed_out: bool) -> Governor
     }
 }
 
+/// Does a VACUOUS native gate set the run-level INFRASTRUCTURE-vacuity flag
+/// (`run.summary`'s `native_vacuous`)?
+///
+/// [VANTA-WHY] v1-m3.1 F3 — that flag documents one thing: the base tree could not
+/// be graded, so the native check could not be performed (`InfraFailure`). A gate
+/// made vacuous by the DEADLINE CLAMP takes the deadline exit
+/// (`budget_exhausted`/`NeedsReview`) instead — a fact about the run's clock, not
+/// the machine — so it must NOT set the flag; it records `native_vacuous=false`
+/// and `native_gate_clamped=true`. This is the exact complement of
+/// `native_vacuous_exit`: the flag is set iff that function picks `InfraFailure`.
+fn native_vacuous_is_infrastructure(gate_clamped: bool, original_timed_out: bool) -> bool {
+    native_vacuous_exit(gate_clamped, original_timed_out) != GovernorDecision::NeedsReview
+}
+
 /// Render one effective sampling value for the `run.summary` provenance keys.
 ///
 /// [VANTA-WHY] `unset` (not `null`, not a plausible default) is what an absent
@@ -2050,6 +2064,15 @@ pub async fn run(
     let mut native_patched_secs: Option<f64> = None;
     let mut native_original_timed_out = false;
     let mut native_patched_timed_out = false;
+    // [VANTA-WHY] v1-m3.1 F3 — was the LAST native gate run under a cap that the
+    // deadline clamp LOWERED below the resolved `native_cap`? Run-level, like the
+    // per-side fields above, and separate from `native_vacuous_seen` on purpose:
+    // an original side cut by the clamp takes the deadline exit
+    // (`budget_exhausted`/`NeedsReview`), NOT the infrastructure exit, so it must
+    // record `native_vacuous=false` and this flag instead. Without it the
+    // distinction is invisible: a clamped `budget_exhausted` row would look like a
+    // machine fault that could not grade the base tree.
+    let mut native_gate_clamped = false;
     // [VANTA-WHY] M3 item S1 — every native gate call's cache note, per attempt
     // and per side, so the reuse is auditable from the run's own artifacts: which
     // results were served from an earlier row, under which key, and from whose
@@ -3687,6 +3710,10 @@ pub async fn run(
             }
         };
         let gate_clamped = gate_cap < native_cap;
+        // [VANTA-WHY] v1-m3.1 F3 — the last gate's clamp state rides out to
+        // `run.summary` (`native_gate_clamped`), so a reader can tell a clamped
+        // gate from an unclamped one without comparing caps across rows.
+        native_gate_clamped = gate_clamped;
         let original_origin = format!("{}/a{}/original", session_id.as_str(), attempt + 1);
         let patched_origin = format!("{}/a{}/patched", session_id.as_str(), attempt + 1);
         let ((native_original, original_cache), (native_patched, patched_cache)) = tokio::join!(
@@ -3745,7 +3772,13 @@ pub async fn run(
         // counts a patch-caused import error as a `fail`, not censored.
         let native_expected = config.native_expected_tests.unwrap_or(0);
         let native_vacuous = harness::native_gate_vacuous(native_expected, &native_original);
-        native_vacuous_seen |= native_vacuous;
+        // [VANTA-WHY] v1-m3.1 F3 — `native_vacuous_seen` documents an
+        // INFRASTRUCTURE fault (the base tree could not be graded), so it is set
+        // where that exit is actually taken, below — NOT here. A gate made vacuous
+        // by the DEADLINE clamp takes the `budget_exhausted`/`NeedsReview` exit a
+        // few lines down, and setting the flag here first would make a clamped row
+        // read as `native_vacuous=true`, i.e. a machine fault it is not. The clamp
+        // is recorded by `native_gate_clamped` instead.
         // [VANTA-WHY] M3 item D1 — record that the cause was a KILL, not a tree
         // that collected nothing. Only meaningful when the gate is actually
         // vacuous; a timed-out side on a non-vacuous gate would mean the suite
@@ -3871,9 +3904,7 @@ pub async fn run(
         // clamp that did not kill the original side, and a run under the full cap,
         // both stay `InfraFailure`.
         if native_vacuous {
-            if native_vacuous_exit(gate_clamped, native_original.timed_out)
-                == GovernorDecision::NeedsReview
-            {
+            if !native_vacuous_is_infrastructure(gate_clamped, native_original.timed_out) {
                 stop_reason = Some(BUDGET_EXHAUSTED);
                 println!(
                     "\n  ⏱ the native gate's original side was cut by the deadline clamp \
@@ -3889,6 +3920,12 @@ pub async fn run(
                 &native_original,
                 &native_patched,
             );
+            // [VANTA-WHY] v1-m3.1 F3 — this is the INFRASTRUCTURE exit (the base
+            // tree could not be graded), so it is here, and only here, that the
+            // run-level vacuity flag is set. The clamp-caused exit above returns
+            // before this line, so it records `native_vacuous=false` and
+            // `native_gate_clamped=true`.
+            native_vacuous_seen = true;
             println!("  ✗ NATIVE VACUOUS (original side collected nothing): {reason}");
             infra_failure_error = Some(reason);
             break 'attempts GovernorDecision::InfraFailure;
@@ -5217,7 +5254,7 @@ pub async fn run(
              native_timeout_secs={} native_timeout={} native_cache_hits={} \
              native_original_secs={} native_patched_secs={} \
              native_original_timed_out={} native_patched_timed_out={} \
-             native_session_cap_secs={} \
+             native_session_cap_secs={} native_gate_clamped={} \
              peak_sandboxes={} sandbox_backend={} model_version={}",
             attempts_run,
             fixed_at_attempt_1,
@@ -5555,6 +5592,13 @@ pub async fn run(
             native_original_timed_out,
             native_patched_timed_out,
             native_cap,
+            // [VANTA-WHY] v1-m3.1 F3 — whether the LAST native gate ran under a
+            // clamp-lowered cap. `true` records the deadline clamp, which is how a
+            // `budget_exhausted`/`NeedsReview` row whose ORIGINAL side was cut
+            // differs from a real infrastructure fault: its `native_vacuous` stays
+            // false and this flag carries the clamp instead. Appended after every
+            // pre-existing key so an older row's reader is unaffected.
+            native_gate_clamped,
             // [VANTA-WHY] M3 item S6 — the exact peak of simultaneous live
             // microVMs this run booted (`sandbox::peak_sandboxes`), space-free so
             // it survives the `key=value` reader. The scheduler charges a row
@@ -7571,7 +7615,8 @@ mod tests {
         harness_infrastructure_collapse,
         is_judge_site,
         ledger_text,
-        modified_test_config_records, native_gate_cap, native_vacuous_exit, new_files_from_patch,
+        modified_test_config_records, native_gate_cap, native_vacuous_exit,
+        native_vacuous_is_infrastructure, new_files_from_patch,
         open_fixed_round_record,
         patch_attempt_id_for_patch,
         prompt_over_budget_reason,
@@ -9651,6 +9696,46 @@ mod tests {
             native_vacuous_exit(false, false),
             GovernorDecision::InfraFailure
         );
+    }
+
+    // [VANTA-WHY] v1-m3.1 F3 — `native_vacuous_seen` (run.summary's
+    // `native_vacuous`) documents an INFRASTRUCTURE fault, so it is set ONLY on the
+    // `InfraFailure` exit. A gate made vacuous by the deadline clamp takes the
+    // deadline exit (`budget_exhausted`/`NeedsReview`) and records
+    // `native_vacuous=false` plus `native_gate_clamped=true`. Test both.
+    #[test]
+    fn a_vacuous_gate_sets_the_infra_flag_only_on_the_infrastructure_exit() {
+        // The clamp case: 3000 s left under a 7250 s cap IS a clamp, and an
+        // original side killed by it is a DEADLINE event.
+        let gate_cap = native_gate_cap(7250, Some(3000)).expect("time remains, so the gate runs");
+        let gate_clamped = gate_cap < 7250;
+        assert!(gate_clamped, "3000 s left under a 7250 s cap is a clamp");
+        assert_eq!(
+            native_vacuous_exit(gate_clamped, true),
+            GovernorDecision::NeedsReview
+        );
+        assert!(
+            !native_vacuous_is_infrastructure(gate_clamped, true),
+            "a clamp-caused vacuity must NOT set native_vacuous_seen"
+        );
+
+        // The infrastructure cases: a real collection error inside the shortened
+        // window (clamped but the side was not killed) and a run under the full cap
+        // both set the flag.
+        assert!(native_vacuous_is_infrastructure(gate_clamped, false));
+        assert!(native_vacuous_is_infrastructure(false, false));
+        assert!(native_vacuous_is_infrastructure(false, true));
+
+        // And the flag is the exact complement of the exit the gate takes.
+        for gate_clamped in [false, true] {
+            for original_timed_out in [false, true] {
+                assert_eq!(
+                    native_vacuous_is_infrastructure(gate_clamped, original_timed_out),
+                    native_vacuous_exit(gate_clamped, original_timed_out)
+                        != GovernorDecision::NeedsReview,
+                );
+            }
+        }
     }
 
     // [VANTA-WHY] v1-m3.1 (§8.1/§8.5, case a) — a PATCHED side KILLED by the clamp

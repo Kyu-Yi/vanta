@@ -2899,6 +2899,13 @@ def build_record(
         "native_original_timed_out": _bool(summary.get("native_original_timed_out")),
         "native_patched_timed_out": _bool(summary.get("native_patched_timed_out")),
         "native_session_cap_secs": _int(summary.get("native_session_cap_secs")),
+        # [VANTA-WHY] v1-m3.1 F3 — whether the run's LAST native gate ran under a
+        # cap the deadline clamp lowered. Read back from `run.summary` so a
+        # `budget_exhausted`/`NeedsReview` row whose ORIGINAL side was cut by the
+        # clamp (a deadline event, `native_vacuous=false`) is tellable from a real
+        # infrastructure fault (`native_vacuous=true`). `false` for a row older
+        # than the field.
+        "native_gate_clamped": _bool(summary.get("native_gate_clamped")),
         "oracle": oracle.as_dict(),
         "label": label_for(outcome.decision, oracle),
         # Item Q — the reason a label needs one. `unresolved` for a run whose final

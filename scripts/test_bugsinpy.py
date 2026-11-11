@@ -32082,7 +32082,9 @@ class TestRunJob:
         `native_original_secs`/`native_patched_secs` are seconds (float) or `None`
         when a side produced no wall time; the two `*_timed_out` flags are bools;
         `native_session_cap_secs` is the resolved cap (the `native_cap` the driver
-        declared once and passed to both native-suite call sites).
+        declared once and passed to both native-suite call sites), and
+        `native_gate_clamped` says whether the LAST gate ran under a cap the
+        deadline clamp lowered (F3).
         """
         base = _outcome(tmp_path)
         monkeypatch.setattr(
@@ -32099,6 +32101,7 @@ class TestRunJob:
                     native_original_timed_out="false",
                     native_patched_timed_out="true",
                     native_session_cap_secs="600",
+                    native_gate_clamped="true",
                 ),
             ),
         )
@@ -32114,6 +32117,8 @@ class TestRunJob:
         assert measured["native_original_timed_out"] is False
         assert measured["native_patched_timed_out"] is True
         assert measured["native_session_cap_secs"] == 600
+        # F3 — the run's last native gate ran under a clamp-lowered cap.
+        assert measured["native_gate_clamped"] is True
 
         # A row whose run.summary predates v1-m3.1 records `None`, never a guess.
         monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
@@ -32128,6 +32133,7 @@ class TestRunJob:
         assert old["native_original_timed_out"] is None
         assert old["native_patched_timed_out"] is None
         assert old["native_session_cap_secs"] is None
+        assert old["native_gate_clamped"] is None
 
     def test_a_missing_final_patch_is_a_measurement_failure_not_a_creator_failure(
         self, tmp_path, monkeypatch

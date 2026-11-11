@@ -2918,6 +2918,21 @@ pub async fn run(
                     infra_failure_error = Some(reason);
                     break 'attempts GovernorDecision::InfraFailure;
                 }
+                // [VANTA-WHY] Finding B (PR #4 review) — the CLAMPED suite above may
+                // have consumed the last of the run's clock (the cap is derived from
+                // what is left, §8.4), so the deadline is honoured HERE, before the
+                // judge's model call: a run with nothing left takes the deadline exit
+                // instead of a refused call being read as an infrastructure failure.
+                // This is the same exit the top of the attempt loop takes.
+                if crate::llm::deadline_past() {
+                    stop_reason = Some(BUDGET_EXHAUSTED);
+                    println!(
+                        "\n  ⏱ The wall-clock deadline passed while the judge's native suite ran \
+                         — ending the run as NeedsReview ({BUDGET_EXHAUSTED}); the candidate has \
+                         been neither approved nor rejected."
+                    );
+                    break 'attempts GovernorDecision::NeedsReview;
+                }
                 Some(render_judge_suite_result(&report))
             } else {
                 None
@@ -2965,6 +2980,25 @@ pub async fn run(
                     GovernorDecision::JudgeFailed
                 }
                 Err(JudgeError::Call(message)) => {
+                    // [VANTA-WHY] §14.15 / Finding B (PR #4 review) — a call the
+                    // deadline refused is NOT an infrastructure failure. "The machine
+                    // broke" and "the run ran out of clock" are opposite claims, and
+                    // the judge's native suite (just above) is a sized step that can
+                    // consume the remaining clock, so the judge call can be refused
+                    // with the same `deadline_exceeded` marker the Creator call
+                    // carries. Matched BEFORE the arm that would blame the server, and
+                    // it takes the identical exit: `stop_reason=budget_exhausted` with
+                    // `NeedsReview` (see the `creator_generate_patch` arm above).
+                    // Every OTHER judge call error stays `InfraFailure`.
+                    if message.contains(crate::llm::DEADLINE_EXCEEDED_MARKER) {
+                        stop_reason = Some(BUDGET_EXHAUSTED);
+                        println!(
+                            "\n  ⏱ The wall-clock deadline passed before the Judge call — ending \
+                             the run as NeedsReview ({BUDGET_EXHAUSTED}), not as an infrastructure \
+                             failure."
+                        );
+                        break 'attempts GovernorDecision::NeedsReview;
+                    }
                     infra_failure_error = Some(format!("Judge LLM call failed: {message}"));
                     GovernorDecision::InfraFailure
                 }
@@ -9798,6 +9832,33 @@ mod tests {
             source.contains("let judge_suite_cap = match native_gate_cap(native_cap, remaining) {"),
             "the judge's native run must take `native_gate_cap`, exactly as the gate \
              does; this file has no clamped judge-suite call site"
+        );
+    }
+
+    // [VANTA-WHY] Finding B (PR #4 review) — the judge's native suite is a sized
+    // step that can consume the remaining clock, so the judge's model call can be
+    // refused by the deadline. A refusal is "the run ran out of clock", not "the
+    // machine broke", and it must take the SAME exit the Creator path takes
+    // (`stop_reason=budget_exhausted` with `NeedsReview`) — never `InfraFailure`.
+    // Pin the arm (it is evaluated before the server-blaming line) and the deadline
+    // check that runs right after the clamped suite.
+    #[test]
+    fn the_judge_call_honours_the_deadline_as_budget_exhausted_not_infra_failure() {
+        let source = include_str!("driver.rs");
+        let marker = source
+            .find("if message.contains(crate::llm::DEADLINE_EXCEEDED_MARKER) {")
+            .expect("the judge's `JudgeError::Call` arm must recognise the deadline refusal");
+        let blames_server = source
+            .find("infra_failure_error = Some(format!(\"Judge LLM call failed: {message}\"));")
+            .expect("the judge's call arm must still record a real call failure");
+        assert!(
+            marker < blames_server,
+            "the deadline marker must be matched BEFORE the judge call is reported as an \
+             infrastructure failure, or a `budget_exhausted` row reads as a machine fault"
+        );
+        assert!(
+            source.contains("The wall-clock deadline passed while the judge's native suite ran"),
+            "the deadline must be checked right after the judge's native suite, before the call"
         );
     }
 

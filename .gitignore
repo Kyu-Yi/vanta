@@ -35,6 +35,10 @@ plans/private/
 # Scratch directories the sandbox backends create inside the working tree.
 .tmp*/
 .shurutest/
+# Seed trees harness::prepare_seed_tree stages in the repo root. Left behind while a
+# run is in flight; unignored they make `git status --porcelain` non-empty, so
+# runner.git_revision() records harness_dirty=True with no source edit.
+vanta-seed-*/
 # Bytecode caches from the analysis scripts (scripts/metrics.py and its tests).
 __pycache__/
 # BugsInPy harness artefacts: the BugsInPy clone, cached project clones, per-bug

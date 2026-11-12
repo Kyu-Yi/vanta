@@ -2328,6 +2328,17 @@ pub async fn run(
                  NeedsReview ({BUDGET_EXHAUSTED}); the candidate has been neither approved nor \
                  rejected."
             );
+            // [VANTA-WHY] v1-m3.1 item 1 — a deadline exit is a terminal verdict, so
+            // it leaves a `final.patch` like every other: the run's last PRODUCED
+            // tree, picked by EXACTLY the rule `MaxAttemptsReached` uses
+            // (`final_patched_files = Some(patched_files)`, the attempt's own
+            // applied tree). Here the attempt top is reached BEFORE this round's
+            // apply, so the most recent produced tree is `last_applied_patched_files`
+            // — `None` until the first apply, which is what keeps a run that never
+            // produced one (`unobservable`) censored and halting, as intended.
+            // Without this the runner censors the oracle and a single deadline halts
+            // the whole wave.
+            final_patched_files = last_applied_patched_files.clone();
             break 'attempts GovernorDecision::NeedsReview;
         }
         let attempt = governor.current_attempt();
@@ -2477,6 +2488,13 @@ pub async fn run(
                          the run as NeedsReview ({BUDGET_EXHAUSTED}), not as an infrastructure \
                          failure."
                     );
+                    // [VANTA-WHY] v1-m3.1 item 1 — same rule as the attempt-top deadline
+                    // exit above: attach the run's last PRODUCED tree (the same one
+                    // `MaxAttemptsReached` attaches). This attempt's Creator was
+                    // refused, so no tree was produced THIS round; `last_applied_patched_files`
+                    // is the previous attempt's tree, and stays `None` on attempt 1 —
+                    // there the row is genuinely unobservable and halts, as intended.
+                    final_patched_files = last_applied_patched_files.clone();
                     break 'attempts GovernorDecision::NeedsReview;
                 }
                 Err(error) => {
@@ -2907,6 +2925,13 @@ pub async fn run(
                              skipping it and ending the run as NeedsReview ({BUDGET_EXHAUSTED}); \
                              the candidate has been neither approved nor rejected."
                         );
+                        // [VANTA-WHY] v1-m3.1 item 1 — a deadline exit leaves a
+                        // `final.patch`, exactly as `MaxAttemptsReached` does
+                        // (`final_patched_files = Some(patched_files)`). This is the
+                        // judge arm, so the most recent produced tree IS the candidate
+                        // patch; attaching it lets the oracle grade the row instead of
+                        // censoring it to `unobservable` and halting the wave.
+                        final_patched_files = Some(patched_files);
                         break 'attempts GovernorDecision::NeedsReview;
                     }
                 };
@@ -2960,6 +2985,11 @@ pub async fn run(
                          — ending the run as NeedsReview ({BUDGET_EXHAUSTED}); the candidate has \
                          been neither approved nor rejected."
                     );
+                    // [VANTA-WHY] v1-m3.1 item 1 — deadline exit; attach the candidate
+                    // patch under the same rule `MaxAttemptsReached` uses
+                    // (`final_patched_files = Some(patched_files)`), so the oracle
+                    // grades the row instead of the runner censoring it.
+                    final_patched_files = Some(patched_files);
                     break 'attempts GovernorDecision::NeedsReview;
                 }
                 Some(render_judge_suite_result(&report))
@@ -3026,6 +3056,12 @@ pub async fn run(
                              the run as NeedsReview ({BUDGET_EXHAUSTED}), not as an infrastructure \
                              failure."
                         );
+                        // [VANTA-WHY] v1-m3.1 item 1 — deadline exit; attach the
+                        // candidate patch under the same rule `MaxAttemptsReached`
+                        // uses (`final_patched_files = Some(patched_files)`), so the
+                        // row is graded instead of censored to `unobservable` (which
+                        // would halt the wave).
+                        final_patched_files = Some(patched_files);
                         break 'attempts GovernorDecision::NeedsReview;
                     }
                     infra_failure_error = Some(format!("Judge LLM call failed: {message}"));
@@ -3160,6 +3196,13 @@ pub async fn run(
                          the run as NeedsReview ({BUDGET_EXHAUSTED}); this round contributes no \
                          test."
                     );
+                    // [VANTA-WHY] v1-m3.1 item 1 — deadline exit; attach this
+                    // attempt's applied tree under the same rule `MaxAttemptsReached`
+                    // uses (`final_patched_files = Some(patched_files)`). The patch
+                    // already applied (the Attacker runs after it), so this IS the
+                    // run's most recent produced tree, and the row is graded rather
+                    // than censored.
+                    final_patched_files = Some(patched_files);
                     break 'attempts GovernorDecision::NeedsReview;
                 }
                 Err(error) => {
@@ -3850,6 +3893,12 @@ pub async fn run(
                      ending the run as NeedsReview ({BUDGET_EXHAUSTED}); the candidate has been \
                      neither approved nor rejected."
                 );
+                // [VANTA-WHY] v1-m3.1 item 1 — deadline exit; attach this attempt's
+                // applied tree under the same rule `MaxAttemptsReached` uses
+                // (`final_patched_files = Some(patched_files)`). The gate runs after
+                // the apply, so this is the run's most recent produced tree and the
+                // row is graded rather than censored to `unobservable`.
+                final_patched_files = Some(patched_files);
                 break 'attempts GovernorDecision::NeedsReview;
             }
         };
@@ -4091,6 +4140,12 @@ pub async fn run(
                      NeedsReview ({BUDGET_EXHAUSTED}), not an infrastructure fault; the candidate \
                      has been neither approved nor rejected."
                 );
+                // [VANTA-WHY] v1-m3.1 item 1 — deadline exit; attach this attempt's
+                // applied tree under the same rule `MaxAttemptsReached` uses
+                // (`final_patched_files = Some(patched_files)`). The gate ran after
+                // the apply, so the candidate tree is the run's most recent produced
+                // one — attaching it makes the row gradeable instead of censored.
+                final_patched_files = Some(patched_files);
                 break 'attempts GovernorDecision::NeedsReview;
             }
             let reason = harness::native_vacuous_reason(
@@ -5866,12 +5921,17 @@ pub async fn run(
                 false
             }
         },
-        // [VANTA-WHY] M3 item E — only `HarnessFailure` / `InfraFailure` still
-        // leave this `None`: the setup never ran or an LLM call failed, so no
-        // tree exists to diff and the row is genuinely unmeasurable
-        // (`unobservable`). Every other terminal verdict — including a
+        // [VANTA-WHY] M3 item E / v1-m3.1 item 1 — `None` here means the run never
+        // had a tree to diff, and that is exactly two histories: a setup / LLM
+        // fault stopped the run before anything applied (`HarnessFailure`,
+        // `InfraFailure`), OR a `budget_exhausted` deadline exit fired while no
+        // attempt had yet produced a tree (attempt 1's Creator was refused by the
+        // clock, say). Both are genuinely unmeasurable and stay `unobservable`.
+        // Note the deadline exits are the deadline exits: they attach
+        // `last_applied_patched_files` (or this attempt's `patched_files`), NOT the
+        // fabricated original. Every OTHER terminal verdict — including
         // `PatchApplicationFailed`, and a repair run that ended on a malformed
-        // patch — now attaches a tree (the last one produced, or the original when
+        // patch — attaches a tree (the last one produced, or the original when
         // nothing ever applied), so the oracle grades it instead of censoring it.
         None => false,
     };
@@ -9926,6 +9986,94 @@ mod tests {
         assert!(
             source.contains("The wall-clock deadline passed while the judge's native suite ran"),
             "the deadline must be checked right after the judge's native suite, before the call"
+        );
+    }
+
+    // [VANTA-WHY] v1-m3.1 item 1 — every deadline exit is a TERMINAL verdict, so it
+    // must leave a `final.patch` exactly as `MaxAttemptsReached` does
+    // (`final_patched_files = Some(patched_files)`). Before this fix all eight
+    // `break 'attempts GovernorDecision::NeedsReview` sites broke BEFORE the
+    // terminal `match decision` — the one place a plain `NeedsReview` attaches the
+    // patch — so no `final.patch` was written, the runner censored the oracle, the
+    // row read `unobservable`, and the wave gate halted on that ONE row (§8.2). Pin
+    // all eight: each must assign `final_patched_files` between its
+    // `stop_reason = Some(BUDGET_EXHAUSTED)` and its break, so a graded deadline row
+    // can never regress to an ungraded one.
+    #[test]
+    fn every_deadline_exit_attaches_the_last_produced_tree() {
+        let source = include_str!("driver.rs");
+        // Built with `concat!` so this test's OWN source does not contain the
+        // literal it counts (`include_str!` reads the whole file, tests included).
+        let brk = concat!("break 'attempts GovernorDecision::NeedsReview", ";");
+        let budget = concat!("stop_reason = Some(BUDGET_EXHAUSTED)", ";");
+        let attach = concat!("final_patched_files = ", "");
+        let breaks: Vec<usize> = source.match_indices(brk).map(|(i, _)| i).collect();
+        assert_eq!(
+            breaks.len(),
+            8,
+            "this file must carry exactly the eight deadline `NeedsReview` breaks \
+             (attempt top, Creator refusal, Attacker refusal, two clamp skips, \
+             clamp-cut original, judge-suite deadline, judge-call refusal)"
+        );
+        let mut prev = 0usize;
+        for (n, &b) in breaks.iter().enumerate() {
+            let segment = &source[prev..b];
+            assert!(
+                segment.contains(budget),
+                "deadline break #{n} does not follow a budget_exhausted stop_reason"
+            );
+            assert!(
+                segment.contains(attach),
+                "deadline break #{n} skips the terminal patch attach, so the runner \
+                 would censor the oracle and the wave gate would halt on this row"
+            );
+            prev = b + brk.len();
+        }
+    }
+
+    // [VANTA-WHY] v1-m3.1 item 1 — the attached tree is the run's most recent
+    // PRODUCED one, never a fabricated original. The six post-apply deadline exits
+    // (Attacker refusal, both clamp skips, clamp-cut original, both judge deadline
+    // exits) attach this attempt's `patched_files`, the same value
+    // `MaxAttemptsReached` attaches; the two PRE-apply exits (attempt top, Creator
+    // refusal) attach `last_applied_patched_files`, which is `None` until the first
+    // apply. That `None` is what keeps a run which never produced a tree
+    // `unobservable` (it halts, as intended) — a `final_patch_tree` fallback to the
+    // original here would fabricate a gradeable tree for an experiment that did not
+    // run.
+    #[test]
+    fn the_deadline_exit_attaches_the_produced_tree_never_a_fabricated_original() {
+        let source = include_str!("driver.rs");
+        let brk = concat!("break 'attempts GovernorDecision::NeedsReview", ";");
+        // `concat!` again: this literal must not appear verbatim in the test source.
+        let pre_apply = concat!(
+            "final_patched_files = last_applied_patched_files.clone()",
+            ";"
+        );
+        let breaks: Vec<usize> = source.match_indices(brk).map(|(i, _)| i).collect();
+        let mut prev = 0usize;
+        for (n, &b) in breaks.iter().enumerate() {
+            let segment = &source[prev..b];
+            if n < 2 {
+                // The two pre-apply sites, in file order: attempt top, Creator refusal.
+                assert!(
+                    segment.contains(pre_apply),
+                    "deadline break #{n} (pre-apply) must attach \
+                     `last_applied_patched_files`, the run's last produced tree"
+                );
+            } else {
+                assert!(
+                    !segment.contains(pre_apply),
+                    "deadline break #{n} (post-apply) must attach THIS attempt's tree, \
+                     not `last_applied_patched_files`"
+                );
+            }
+            prev = b + brk.len();
+        }
+        assert_eq!(
+            source.matches(pre_apply).count(),
+            2,
+            "exactly the two pre-apply deadline exits read `last_applied_patched_files`"
         );
     }
 

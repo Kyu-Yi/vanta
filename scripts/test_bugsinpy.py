@@ -29808,6 +29808,53 @@ class TestWaveGate:
             "unobservable" in problem and "no final.patch" in problem for problem in problems
         )
 
+    def test_a_graded_budget_exhausted_row_does_not_stop_the_wave(self):
+        """v1-m3.1 item 1: a deadline exit leaves a `final.patch`, so it is graded.
+
+        [WHY] Every driver deadline exit used to break out of the attempt loop
+        before the terminal `match decision` — the one place a plain `NeedsReview`
+        attaches the patch — so the runner censored the oracle, the row read
+        `unobservable`, and ONE clock expiry halted the whole wave (§8.2). With the
+        last produced tree attached, `label_for` names the row
+        `needs_review_on_good`/`needs_review_on_bad` and §14.6's NeedsReview
+        exemption applies exactly as it does to any other refusal. The gate reads
+        the LABEL, never `stop_reason`: the same row left with no patch stays
+        `unobservable` and is still gated (the test above).
+        """
+        labels = set()
+        for good in (True, False):
+            rows = _healthy_wave()
+            for row in rows:
+                if row["candidate"] and row["candidate"]["kind"] == runner_mod.DEV_FIX:
+                    row["verdict"] = "NeedsReview"
+                    row["stop_reason"] = "budget_exhausted"
+                    row["label"] = runner_mod.label_for(
+                        "NeedsReview", oracle_mod.OracleResult(apply_ok=True, patch_good=good)
+                    )
+                    labels.add(row["label"])
+            assert runner_mod.wave_gate_failures(rows) == []
+        assert labels == {"needs_review_on_good", "needs_review_on_bad"}
+
+    def test_a_budget_exhausted_row_with_no_tree_stays_ungraded_and_gated(self):
+        """The other half of item 1: no tree was ever produced, so nothing to grade.
+
+        [WHY] An attempt-1 deadline that refuses the Creator before any apply
+        leaves `last_applied_patched_files = None`, so the driver writes no
+        `final.patch`. That row is genuinely unobservable — the plumbing, not the
+        candidate — and the wave gate must keep halting on it, exactly as it does
+        for any ungraded `NeedsReview`.
+        """
+        rows = _healthy_wave()
+        rows[0]["verdict"] = "NeedsReview"
+        rows[0]["stop_reason"] = "budget_exhausted"
+        rows[0]["label"] = "unobservable"
+        rows[0]["oracle"]["apply_ok"] = False
+        rows[0]["oracle"]["apply_detail"] = "no final.patch for verdict NeedsReview"
+        problems = runner_mod.wave_gate_failures(rows)
+        assert any(
+            "unobservable" in problem and "no final.patch" in problem for problem in problems
+        )
+
 
 class TestDigestAndLabels:
     """The report is a view of the rows, built from the rows and nothing else."""

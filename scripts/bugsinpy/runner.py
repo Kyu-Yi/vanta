@@ -3350,6 +3350,19 @@ def run_job(
         else None
     )
     row_retries = 0
+    # [VANTA-WHY] PR review item #1 — the artifact suffix is derived from how many
+    # rows are ALREADY on disk for this key, not from the in-run attempt index
+    # alone. A `--rerun-infra` run starts its own attempt index at 0, so an index-
+    # only suffix would hand the re-run the bare name the superseded row still
+    # records in `run_log`/`oracle_json` — `invoke_vanta` opens the log ``"w"``, so
+    # the retained row's evidence would be overwritten by its replacement. Counting
+    # the rows already recorded for the key (append-only, so this includes the row
+    # being superseded) makes every name distinct from every name already on disk,
+    # while a key's first run still counts 0 rows and keeps the bare name byte for
+    # byte. The count is taken ONCE, outside the loop: it is the same list
+    # `supersede` came from, and the in-run auto-retries added below are already
+    # offset by ``attempt``.
+    rows_recorded = sum(1 for row in manifest.records() if row.get("key") == job.key)
     while True:
         record = _run_job_attempt(
             job=job,
@@ -3361,6 +3374,7 @@ def run_job(
             python_version=python_version,
             scheduler=scheduler,
             attempt=row_retries,
+            rows_recorded=rows_recorded,
             supersede=supersede,
             supersede_reason=reason,
         )
@@ -3401,6 +3415,7 @@ def _run_job_attempt(
     python_version: str,
     scheduler: Optional[dict[str, Any]],
     attempt: int,
+    rows_recorded: int,
     supersede: Optional[dict[str, Any]],
     supersede_reason: Optional[str],
 ) -> Optional[dict[str, Any]]:
@@ -3413,13 +3428,17 @@ def _run_job_attempt(
     writes ``failures.jsonl`` and marks itself ``failed`` here: it has no row to
     hand back, so there is nothing for the loop to retry.
 
-    ``attempt`` is the 0-based index of this attempt, used only to keep each
-    attempt's log and oracle sidecar apart (``.retryN``), so a superseded
-    attempt's artefacts are not overwritten by the one that replaced it.
-    ``supersede`` is the row this attempt replaces (named in the record's
-    ``supersedes`` block) and ``supersede_reason`` is ``None`` for item E6's
-    inconclusive re-run — the shape that predates this item — and ``auto-retry`` /
-    ``rerun-infra`` for the two this item adds.
+    ``attempt`` is the 0-based index of this attempt within this invocation, and
+    ``rows_recorded`` is how many rows this key already had on disk when the
+    invocation began (0 for a key's first run). Together they name this attempt's
+    log and oracle sidecar: ``.retryN`` where ``N`` is their sum, and the bare name
+    only when that sum is 0 (PR review item #1). An index-only suffix would give a
+    ``--rerun-infra`` re-run — whose index also starts at 0 — the bare name the
+    superseded row still records, so the re-run would overwrite its own
+    predecessor's evidence. ``supersede`` is the row this attempt replaces (named
+    in the record's ``supersedes`` block) and ``supersede_reason`` is ``None`` for
+    item E6's inconclusive re-run — the shape that predates this item — and
+    ``auto-retry`` / ``rerun-infra`` for the two this item adds.
     """
     prep = job.prep
     # [VANTA-WHY] M3 item V1 — the issue file is keyed by the JOB, not the bug.
@@ -3440,8 +3459,13 @@ def _run_job_attempt(
 
     # Item D — each attempt of one job gets its own log and oracle sidecar, so a
     # superseded attempt's artefacts are not overwritten by the attempt that
-    # replaced it. Attempt 0 keeps the bare name every row on disk already has.
-    suffix = "" if attempt == 0 else f".retry{attempt}"
+    # replaced it. The name is offset by the rows already on disk for this key (PR
+    # review item #1), so a `--rerun-infra` re-run — whose own attempt index also
+    # starts at 0 — lands on `.retryN` rather than back on the bare name its
+    # superseded predecessor's row still records; a key's first run counts 0 rows
+    # and keeps the bare name every row on disk already has.
+    attempt_number = rows_recorded + attempt
+    suffix = "" if attempt_number == 0 else f".retry{attempt_number}"
     log_path = paths.logs / f"{_stem(job.key)}{suffix}.log"
     env = vanta_env(
         arm=job.arm,

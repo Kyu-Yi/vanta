@@ -33093,6 +33093,54 @@ class TestRerunInfra:
             record["session_id"]
         ]
 
+    def test_a_rerun_does_not_reuse_the_superseded_rows_artifact_names(
+        self, tmp_path, monkeypatch
+    ):
+        """A re-run must not overwrite the evidence of the row it supersedes.
+
+        A ``--rerun-infra`` run starts its own attempt index at 0, so an index-only
+        suffix would hand it the bare name its predecessor's row still records in
+        ``run_log``/``oracle_json`` — and ``invoke_vanta`` opens the log ``"w"``.
+        The name is offset by the rows already on disk for the key instead (PR
+        review item #1), so the predecessor's bare-named log and sidecar survive
+        and the re-run lands on ``.retry1``.
+        """
+        manifest = self._seed_done(tmp_path, "InfraFailure", "old")
+        job = _job(prep(root=tmp_path / "root"))
+        paths = self._paths(tmp_path)
+        stem = runner_mod._stem(job.key)
+        # The superseded row's own artefacts: the bare names its row records.
+        paths.logs.mkdir(parents=True, exist_ok=True)
+        paths.oracle.mkdir(parents=True, exist_ok=True)
+        (paths.logs / f"{stem}.log").write_text("old run\n", encoding="utf-8")
+        (paths.oracle / f"{stem}.json").write_text('{"old": true}\n', encoding="utf-8")
+
+        invoke, calls = _scripted_outcome(tmp_path, ["Rejected"])
+        monkeypatch.setattr(runner_mod, "invoke_vanta", invoke)
+        monkeypatch.setattr(
+            oracle_mod, "grade",
+            lambda **kwargs: oracle_mod.OracleResult(apply_ok=True, apply_detail="applied"),
+        )
+        record = runner_mod.run_job(
+            job=job, paths=paths, manifest=manifest,
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20", rerun_infra=True,
+        )
+        assert calls["n"] == 1
+        assert record["verdict"] == "Rejected"
+        # The predecessor's bare-named evidence is untouched...
+        assert (paths.logs / f"{stem}.log").read_text(encoding="utf-8") == "old run\n", (
+            "the re-run overwrote the log its superseded row still records"
+        )
+        assert (
+            paths.oracle / f"{stem}.json"
+        ).read_text(encoding="utf-8") == '{"old": true}\n', (
+            "the re-run overwrote the oracle sidecar its superseded row still records"
+        )
+        # ...and the re-run wrote its own, distinct names.
+        assert (paths.logs / f"{stem}.retry1.log").is_file()
+        assert (paths.oracle / f"{stem}.retry1.json").is_file()
+
     def test_without_the_flag_a_predecessor_is_not_named(self, tmp_path, monkeypatch):
         """`supersedes` is a claim about a re-run, so it is written only when one happened.
 

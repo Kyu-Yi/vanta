@@ -907,17 +907,18 @@ fn native_setup_failure(
 }
 
 /// The run-level per-side NATIVE-gate facts that ride `run.summary` and
-/// `evidence.json` (v1-m3.1 §4 and F3 of the PR #4 review).
+/// `evidence.json` (v1-m3.1 §4, F2/F3 of the PR #4 review).
 ///
 /// [VANTA-WHY] F3 (PR #4 review) — `original_secs`/`patched_secs`, the
 /// `*_timed_out_last` pair and `effective_cap_secs` all describe the SAME (last)
 /// gate the run reached, so a reader comparing them never pairs one attempt's
-/// wall time or cap with another attempt's kill. `*_timed_out_any` keeps the
-/// WIDER meaning the `native_original_timed_out`/`native_patched_timed_out`
-/// fields always had — a kill on ANY attempt — so a kill is not lost when a later
-/// attempt happens to finish. The `secs` take the last `Some` seen: a side that
-/// produced no wall time (`None` — a timeout, or a side the harness could not set
-/// up) never erases an earlier measurement.
+/// wall time or cap with another attempt's kill. The `secs` are exactly the LAST
+/// gate's: a side's measured seconds when it completed, or `None` when it did not
+/// (timed out, failed to set up, or never ran) — never an earlier attempt's value.
+/// `*_timed_out_any` keeps the WIDER meaning the
+/// `native_original_timed_out`/`native_patched_timed_out` fields always had — a
+/// kill on ANY attempt — so a kill is not lost when a later attempt happens to
+/// finish.
 #[derive(Default)]
 struct NativeGateFacts {
     original_secs: Option<f64>,
@@ -937,20 +938,22 @@ impl NativeGateFacts {
     /// the point: a gate whose ORIGINAL side completed while the PATCHED side
     /// failed to set up still obtained an original-side measurement, and recording
     /// it here keeps that measurement on the row even though the guard ends the run
-    /// as `InfraFailure`. Each side is recorded only when it actually produced a
-    /// wall time, so a side that never completed never overwrites a real one.
+    /// as `InfraFailure`.
+    ///
+    /// Each call REPLACES both sides' seconds with THIS gate's own value, so the
+    /// last-gate fields always describe one gate: a side that completed contributes
+    /// its measured seconds, a side that did not (timed out, failed to set up, never
+    /// ran) contributes `None`. A previous attempt's measurement is never carried
+    /// forward, because a reader must never pair the last gate's `*_timed_out_last`
+    /// or `effective_cap_secs` with an earlier attempt's wall time.
     fn record(
         &mut self,
         cap: u64,
         original: &harness::NativeSuiteReport,
         patched: &harness::NativeSuiteReport,
     ) {
-        if original.secs.is_some() {
-            self.original_secs = original.secs;
-        }
-        if patched.secs.is_some() {
-            self.patched_secs = patched.secs;
-        }
+        self.original_secs = original.secs;
+        self.patched_secs = patched.secs;
         self.original_timed_out_last = original.timed_out;
         self.patched_timed_out_last = patched.timed_out;
         self.original_timed_out_any |= original.timed_out;
@@ -10184,8 +10187,9 @@ mod tests {
     // the PATCHED side never set up still obtained an original-side measurement.
     // `NativeGateFacts::record` is called BEFORE the `native_setup_failure` guard,
     // so that measurement reaches the row instead of being discarded by the
-    // `InfraFailure` exit, and a side that produced no wall time never overwrites a
-    // real one.
+    // `InfraFailure` exit. And because F3 makes the `*_secs` fields the LAST gate's
+    // own values, a side that did not complete in a later gate records `None` — the
+    // earlier measurement is not carried forward.
     #[test]
     fn a_completed_side_is_recorded_even_when_the_other_side_never_completed() {
         let mut facts = NativeGateFacts::default();
@@ -10210,16 +10214,61 @@ mod tests {
             "a setup failure is not a timeout"
         );
 
-        // A later gate whose PATCHED side completes and whose ORIGINAL side fails
-        // setup must not erase the earlier original measurement, and records the
-        // patched one: each side keeps its own last real measurement.
+        // A later gate whose ORIGINAL side fails setup and whose PATCHED side
+        // completes: each side takes THIS gate's own value, so the earlier original
+        // measurement is gone and only the patched one is recorded.
         facts.record(
             1200,
             &gate_report(None, false, true),
             &gate_report(Some(119.0), false, false),
         );
-        assert_eq!(facts.original_secs, Some(33.0));
+        assert_eq!(
+            facts.original_secs, None,
+            "the last gate's original side did not complete, so no secs carries over"
+        );
         assert_eq!(facts.patched_secs, Some(119.0));
+    }
+
+    // [VANTA-WHY] F2/F3 (PR #4 review) — a side killed in the LAST gate must not
+    // keep its earlier attempt's wall time: the row would then pair the last gate's
+    // kill and effective cap with a previous attempt's measurement. The any-attempt
+    // kill flag still records the earlier completion's opposite, and the last-gate
+    // kill flag is the last gate's.
+    #[test]
+    fn a_side_killed_in_the_last_gate_does_not_keep_an_earlier_attempts_secs() {
+        let mut facts = NativeGateFacts::default();
+        // Attempt 1: both sides complete; the patched side measured 500 s under the
+        // full 1200 s cap, so the row would otherwise carry 500 s forward.
+        facts.record(
+            1200,
+            &gate_report(Some(33.0), false, false),
+            &gate_report(Some(500.0), false, false),
+        );
+        assert_eq!(facts.patched_secs, Some(500.0));
+        assert!(!facts.patched_timed_out_last);
+        assert!(!facts.patched_timed_out_any);
+
+        // Attempt 2 (the LAST gate): the patched side is killed by the clamp to
+        // 240 s — no wall time, timed_out.
+        facts.record(
+            240,
+            &gate_report(Some(31.0), false, false),
+            &gate_report(None, true, false),
+        );
+        assert_eq!(
+            facts.patched_secs, None,
+            "the last gate's patched side produced no secs, so the earlier 500 s is gone"
+        );
+        assert!(
+            facts.patched_timed_out_last,
+            "the LAST gate's patched side hit the cap"
+        );
+        assert!(
+            facts.patched_timed_out_any,
+            "the any-attempt flag records the kill"
+        );
+        assert_eq!(facts.effective_cap_secs, Some(240));
+        assert_eq!(facts.original_secs, Some(31.0));
     }
 
     // [VANTA-WHY] F3 (PR #4 review) — the last-gate trio (`*_secs`,

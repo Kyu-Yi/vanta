@@ -2896,16 +2896,21 @@ def build_record(
         "native_secs": prep.native_secs,
         "native_timeout_secs": _int(summary.get("native_timeout_secs")),
         "native_timeout": _bool(summary.get("native_timeout")),
-        # [VANTA-WHY] v1-m3.1 §4 — the per-side in-session wall time, the per-side
-        # kill flag and the cap those runs actually ran under. Read back from
-        # `run.summary` so the §8.1 rule (original side empty ⇒ infra failure;
-        # original ran + patched empty ⇒ failed attempt) and the cap that produced
-        # them are both auditable from the row. `unset` → `None` for a side that
-        # produced no wall time; the cap is always present (a resolved number).
+        # [VANTA-WHY] v1-m3.1 §4 and F3 (PR #4 review) — the per-side in-session
+        # wall time, the per-side kill flags and the cap those runs actually ran
+        # under. Read back from `run.summary` so the §8.1 rule (original side empty
+        # ⇒ infra failure; original ran + patched empty ⇒ failed attempt) and the
+        # cap that produced them are both auditable from the row. `unset` → `None`
+        # for a side that produced no wall time; the cap is always present (a
+        # resolved number). The `*_timed_out_last` pair describes the SAME (last)
+        # gate as `*_secs` and the effective cap; `native_original_timed_out` /
+        # `native_patched_timed_out` keep the wider ANY-attempt meaning.
         "native_original_secs": _secs(summary.get("native_original_secs")),
         "native_patched_secs": _secs(summary.get("native_patched_secs")),
         "native_original_timed_out": _bool(summary.get("native_original_timed_out")),
         "native_patched_timed_out": _bool(summary.get("native_patched_timed_out")),
+        "native_original_timed_out_last": _bool(summary.get("native_original_timed_out_last")),
+        "native_patched_timed_out_last": _bool(summary.get("native_patched_timed_out_last")),
         "native_session_cap_secs": _int(summary.get("native_session_cap_secs")),
         # [VANTA-WHY] v1-m3.1 F5 — the cap the run's LAST native gate ACTUALLY ran
         # under, after the deadline clamp lowered it. `native_session_cap_secs`

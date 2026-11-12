@@ -906,6 +906,59 @@ fn native_setup_failure(
     original_setup_failed || (patched_setup_failed && !original_vacuous)
 }
 
+/// The run-level per-side NATIVE-gate facts that ride `run.summary` and
+/// `evidence.json` (v1-m3.1 §4 and F3 of the PR #4 review).
+///
+/// [VANTA-WHY] F3 (PR #4 review) — `original_secs`/`patched_secs`, the
+/// `*_timed_out_last` pair and `effective_cap_secs` all describe the SAME (last)
+/// gate the run reached, so a reader comparing them never pairs one attempt's
+/// wall time or cap with another attempt's kill. `*_timed_out_any` keeps the
+/// WIDER meaning the `native_original_timed_out`/`native_patched_timed_out`
+/// fields always had — a kill on ANY attempt — so a kill is not lost when a later
+/// attempt happens to finish. The `secs` take the last `Some` seen: a side that
+/// produced no wall time (`None` — a timeout, or a side the harness could not set
+/// up) never erases an earlier measurement.
+#[derive(Default)]
+struct NativeGateFacts {
+    original_secs: Option<f64>,
+    patched_secs: Option<f64>,
+    original_timed_out_last: bool,
+    patched_timed_out_last: bool,
+    original_timed_out_any: bool,
+    patched_timed_out_any: bool,
+    effective_cap_secs: Option<u64>,
+}
+
+impl NativeGateFacts {
+    /// Fold ONE native gate's per-side results in.
+    ///
+    /// [VANTA-WHY] F2 (PR #4 review) — called immediately after the two sides
+    /// `tokio::join!` and BEFORE the `native_setup_failure` guard. That ordering is
+    /// the point: a gate whose ORIGINAL side completed while the PATCHED side
+    /// failed to set up still obtained an original-side measurement, and recording
+    /// it here keeps that measurement on the row even though the guard ends the run
+    /// as `InfraFailure`. Each side is recorded only when it actually produced a
+    /// wall time, so a side that never completed never overwrites a real one.
+    fn record(
+        &mut self,
+        cap: u64,
+        original: &harness::NativeSuiteReport,
+        patched: &harness::NativeSuiteReport,
+    ) {
+        if original.secs.is_some() {
+            self.original_secs = original.secs;
+        }
+        if patched.secs.is_some() {
+            self.patched_secs = patched.secs;
+        }
+        self.original_timed_out_last = original.timed_out;
+        self.patched_timed_out_last = patched.timed_out;
+        self.original_timed_out_any |= original.timed_out;
+        self.patched_timed_out_any |= patched.timed_out;
+        self.effective_cap_secs = Some(cap);
+    }
+}
+
 /// Render one effective sampling value for the `run.summary` provenance keys.
 ///
 /// [VANTA-WHY] `unset` (not `null`, not a plausible default) is what an absent
@@ -2103,19 +2156,15 @@ pub async fn run(
     // under. The flag still implies `native_vacuous_seen` (it is set only when the
     // gate is vacuous), which is what every consumer below relies on.
     let mut native_timeout_seen = false;
-    // [VANTA-WHY] v1-m3.1 (§4) — the last attempt's PER-SIDE in-session wall time
-    // and kill flag, carried out of the loop onto `run.summary` so the §8.1 reading
-    // is auditable from the artifact. `native_original_secs` is the original side's
-    // own seconds (a cache hit carries the served report's measurement, which is
-    // still a measurement of identical bytes — `native_cache` names the source
-    // row); `native_patched_secs` the patched side's. The `*_timed_out` flags are
-    // OR'd across attempts (like `native_timeout_seen`) so a kill on ANY attempt is
-    // not lost when a later attempt happens to finish; the `*_secs` values take the
-    // last Some seen.
-    let mut native_original_secs: Option<f64> = None;
-    let mut native_patched_secs: Option<f64> = None;
-    let mut native_original_timed_out = false;
-    let mut native_patched_timed_out = false;
+    // [VANTA-WHY] v1-m3.1 (§4) and F3 (PR #4 review) — the per-side facts of the
+    // last native gate the run reached (its seconds, its kill flags, the cap it ran
+    // under) plus the any-attempt kill flags, carried out of the loop onto
+    // `run.summary` and `evidence.json` so the §8.1 reading is auditable from the
+    // artifact. `secs` are the side's own seconds (a cache hit carries the served
+    // report's measurement, which is still a measurement of identical bytes —
+    // `native_cache` names the source row). See `NativeGateFacts` for why the
+    // last-gate trio and the any-attempt pair are kept apart.
+    let mut native_gate = NativeGateFacts::default();
     // [VANTA-WHY] v1-m3.1 F3 — was the LAST native gate run under a cap that the
     // deadline clamp LOWERED below the resolved `native_cap`? Run-level, like the
     // per-side fields above, and separate from `native_vacuous_seen` on purpose:
@@ -2125,13 +2174,6 @@ pub async fn run(
     // distinction is invisible: a clamped `budget_exhausted` row would look like a
     // machine fault that could not grade the base tree.
     let mut native_gate_clamped = false;
-    // [VANTA-WHY] v1-m3.1 F5 — the cap the LAST native gate ACTUALLY ran under,
-    // after the deadline clamp. `native_session_cap_secs` keeps its documented
-    // meaning (the resolved/configured cap, the rule); this field is what the
-    // suite was really given, so a clamped timeout can be attributed to the limit
-    // it ran under rather than to the longer one the run was configured with.
-    // `None` (`unset` on the row) when no gate ran at all.
-    let mut native_gate_effective_cap_secs: Option<u64> = None;
     // [VANTA-WHY] M3 item S1 — every native gate call's cache note, per attempt
     // and per side, so the reuse is auditable from the run's own artifacts: which
     // results were served from an earlier row, under which key, and from whose
@@ -3909,8 +3951,9 @@ pub async fn run(
         native_gate_clamped = gate_clamped;
         // [VANTA-WHY] v1-m3.1 F5 — and the cap the gate ACTUALLY ran under
         // (`native_gate_effective_cap_secs`), which the clamp may have lowered
-        // below the resolved `native_cap`. Last gate wins, like the per-side secs.
-        native_gate_effective_cap_secs = Some(gate_cap);
+        // below the resolved `native_cap`. Last gate wins, like the per-side secs;
+        // it is recorded with them by `native_gate.record` right after the two
+        // sides join, below.
         let original_origin = format!("{}/a{}/original", session_id.as_str(), attempt + 1);
         let patched_origin = format!("{}/a{}/patched", session_id.as_str(), attempt + 1);
         let ((native_original, original_cache), (native_patched, patched_cache)) = tokio::join!(
@@ -3929,6 +3972,14 @@ pub async fn run(
                 &patched_origin,
             ),
         );
+        // [VANTA-WHY] F2/F3 (PR #4 review) — fold this gate's per-side facts in
+        // NOW, before the `native_setup_failure` guard below can exit as
+        // `InfraFailure`: a gate whose ORIGINAL side completed but whose PATCHED
+        // side never set up still obtained an original-side measurement, and the
+        // guard must not discard it. Recording here (rather than after the guard)
+        // is also what keeps the last-gate seconds, kill flags and effective cap on
+        // the SAME gate.
+        native_gate.record(gate_cap, &native_original, &native_patched);
         for (side, note) in [("original", &original_cache), ("patched", &patched_cache)] {
             if note.state == "hit" {
                 native_cache_hits += 1;
@@ -4012,18 +4063,6 @@ pub async fn run(
             native_original.timed_out,
             native_patched.timed_out,
         );
-        // [VANTA-WHY] v1-m3.1 (§4) — the per-side seconds and kill flags leave the
-        // attempt here. The `*_secs` take the last Some seen (a `None` — an
-        // unmeasured report — never erases an earlier measurement); the
-        // `*_timed_out` flags only ever set true.
-        if native_original.secs.is_some() {
-            native_original_secs = native_original.secs;
-        }
-        if native_patched.secs.is_some() {
-            native_patched_secs = native_patched.secs;
-        }
-        native_original_timed_out |= native_original.timed_out;
-        native_patched_timed_out |= native_patched.timed_out;
         let mut native_regressions =
             harness::native_regressions(&native_original.tests, &native_patched.tests);
         // [VANTA-WHY] A suite that ran N>0 tests on the original and collects
@@ -5488,6 +5527,7 @@ pub async fn run(
              native_timeout_secs={} native_timeout={} native_cache_hits={} \
              native_original_secs={} native_patched_secs={} \
              native_original_timed_out={} native_patched_timed_out={} \
+             native_original_timed_out_last={} native_patched_timed_out_last={} \
              native_session_cap_secs={} native_gate_effective_cap_secs={} native_gate_clamped={} \
              peak_sandboxes={} sandbox_backend={} model_version={}",
             attempts_run,
@@ -5817,26 +5857,34 @@ pub async fn run(
             // (nothing reads it), appended after `native_timeout` so an older
             // row's reader sees the same fields in the same order.
             native_cache_hits,
-            // [VANTA-WHY] v1-m3.1 (§4) — the per-side in-session seconds, the
-            // per-side kill flags and the cap those runs actually used. `unset`
-            // (never a bare `None`) for a side that produced no wall time, so a
-            // `key=value` reader sees a token, not a Rust Debug string. Appended
-            // after `native_cache_hits` so an older row's reader is unaffected.
-            native_original_secs
+            // [VANTA-WHY] v1-m3.1 (§4) and F3 (PR #4 review) — the per-side
+            // in-session seconds, the per-side kill flags and the cap those runs
+            // actually used. `unset` (never a bare `None`) for a side that produced
+            // no wall time, so a `key=value` reader sees a token, not a Rust Debug
+            // string. The `*_secs`, the `*_timed_out_last` pair and
+            // `native_gate_effective_cap_secs` describe the SAME (last) gate; the
+            // `*_timed_out` pair keeps the wider ANY-attempt meaning. Appended after
+            // `native_cache_hits` so an older row's reader is unaffected.
+            native_gate
+                .original_secs
                 .map(|s| format!("{:.3}", s))
                 .unwrap_or_else(|| "unset".to_string()),
-            native_patched_secs
+            native_gate
+                .patched_secs
                 .map(|s| format!("{:.3}", s))
                 .unwrap_or_else(|| "unset".to_string()),
-            native_original_timed_out,
-            native_patched_timed_out,
+            native_gate.original_timed_out_any,
+            native_gate.patched_timed_out_any,
+            native_gate.original_timed_out_last,
+            native_gate.patched_timed_out_last,
             native_cap,
             // [VANTA-WHY] v1-m3.1 F5 — the cap the LAST native gate actually ran
             // under (after the deadline clamp), which is what a clamped timeout
             // must be attributed to. `native_session_cap_secs` above keeps its own
             // meaning (the resolved/configured cap, the rule). `unset` when no gate
             // ran, so a reader sees a token, never a bare `None`.
-            native_gate_effective_cap_secs
+            native_gate
+                .effective_cap_secs
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "unset".to_string()),
             // [VANTA-WHY] v1-m3.1 F3 — whether the LAST native gate ran under a
@@ -6081,15 +6129,20 @@ pub async fn run(
             // recorded by `native_gate_clamped` on the row instead.
             "native_timeout_secs": config.native_timeout_secs,
             "native_timeout": native_timeout_seen,
-            // [VANTA-WHY] v1-m3.1 (§4) — the per-side in-session wall time, the
-            // per-side kill flag and the cap those runs actually ran under, so the
-            // §8.1 reading and the number that produced it are both in the
-            // artifact. `None` = a side that produced no wall time. Appended after
+            // [VANTA-WHY] v1-m3.1 (§4) and F3 (PR #4 review) — the per-side
+            // in-session wall time, the per-side kill flags and the cap those runs
+            // actually ran under, so the §8.1 reading and the number that produced
+            // it are both in the artifact. `None` = a side that produced no wall
+            // time. The `*_secs` and the `*_timed_out_last` pair describe the SAME
+            // (last) gate; `native_original_timed_out`/`native_patched_timed_out`
+            // (the any-attempt pair) keep the wider meaning. Appended after
             // `native_timeout` so an older row's reader is unaffected.
-            "native_original_secs": native_original_secs,
-            "native_patched_secs": native_patched_secs,
-            "native_original_timed_out": native_original_timed_out,
-            "native_patched_timed_out": native_patched_timed_out,
+            "native_original_secs": native_gate.original_secs,
+            "native_patched_secs": native_gate.patched_secs,
+            "native_original_timed_out": native_gate.original_timed_out_any,
+            "native_patched_timed_out": native_gate.patched_timed_out_any,
+            "native_original_timed_out_last": native_gate.original_timed_out_last,
+            "native_patched_timed_out_last": native_gate.patched_timed_out_last,
             "native_session_cap_secs": native_cap,
             // [VANTA-WHY] M3 item S1 — one entry per native gate call (attempt ×
             // side) recording whether the result was measured or served from the
@@ -7888,7 +7941,8 @@ mod tests {
         harness_infrastructure_collapse,
         is_judge_site,
         ledger_text,
-        modified_test_config_records, native_gate_cap, native_setup_failure, native_vacuous_exit,
+        modified_test_config_records, native_gate_cap, NativeGateFacts, native_setup_failure,
+        native_vacuous_exit,
         native_vacuous_is_infrastructure, native_timeout_flag, new_files_from_patch,
         open_fixed_round_record,
         patch_attempt_id_for_patch,
@@ -10103,6 +10157,112 @@ mod tests {
             collection: None,
             setup_failed: false,
         }
+    }
+
+    /// A `NativeSuiteReport` for the `NativeGateFacts` tests: only the fields the
+    /// fold reads (`secs`, `timed_out`, `setup_failed`) are spelled out, so a test
+    /// can build a completed side, a capped side, and a side that never set up.
+    fn gate_report(
+        secs: Option<f64>,
+        timed_out: bool,
+        setup_failed: bool,
+    ) -> crate::pipeline::harness::NativeSuiteReport {
+        crate::pipeline::harness::NativeSuiteReport {
+            tests: Vec::new(),
+            failure_outputs: HashMap::new(),
+            ran: secs.is_some(),
+            timed_out,
+            secs,
+            exit_code: None,
+            stderr_tail: String::new(),
+            collection: None,
+            setup_failed,
+        }
+    }
+
+    // [VANTA-WHY] F2 (PR #4 review) — a gate whose ORIGINAL side completed while
+    // the PATCHED side never set up still obtained an original-side measurement.
+    // `NativeGateFacts::record` is called BEFORE the `native_setup_failure` guard,
+    // so that measurement reaches the row instead of being discarded by the
+    // `InfraFailure` exit, and a side that produced no wall time never overwrites a
+    // real one.
+    #[test]
+    fn a_completed_side_is_recorded_even_when_the_other_side_never_completed() {
+        let mut facts = NativeGateFacts::default();
+        // Original completed with wall time; patched failed SETUP (no secs, not a
+        // timeout — the `failed_run(None, …)` shape).
+        facts.record(
+            1200,
+            &gate_report(Some(33.0), false, false),
+            &gate_report(None, false, true),
+        );
+        assert_eq!(
+            facts.original_secs,
+            Some(33.0),
+            "the completed side's secs is kept despite the setup-failure exit"
+        );
+        assert_eq!(
+            facts.patched_secs, None,
+            "a side that never completed records no secs"
+        );
+        assert!(
+            !facts.patched_timed_out_last && !facts.patched_timed_out_any,
+            "a setup failure is not a timeout"
+        );
+
+        // A later gate whose PATCHED side completes and whose ORIGINAL side fails
+        // setup must not erase the earlier original measurement, and records the
+        // patched one: each side keeps its own last real measurement.
+        facts.record(
+            1200,
+            &gate_report(None, false, true),
+            &gate_report(Some(119.0), false, false),
+        );
+        assert_eq!(facts.original_secs, Some(33.0));
+        assert_eq!(facts.patched_secs, Some(119.0));
+    }
+
+    // [VANTA-WHY] F3 (PR #4 review) — the last-gate trio (`*_secs`,
+    // `*_timed_out_last`, `effective_cap_secs`) describes the LAST gate only, so a
+    // reader comparing them never pairs one attempt's seconds with another
+    // attempt's kill; `*_timed_out_any` keeps the wider "any attempt" meaning so a
+    // kill is not lost when a later attempt finishes.
+    #[test]
+    fn the_last_gate_fields_describe_the_last_gate_not_an_earlier_attempt() {
+        let mut facts = NativeGateFacts::default();
+        // Attempt 1: the PATCHED side hits the cap (no secs, timed_out), the
+        // original side completes.
+        facts.record(
+            600,
+            &gate_report(Some(33.0), false, false),
+            &gate_report(None, true, false),
+        );
+        assert!(facts.patched_timed_out_last);
+        assert!(facts.patched_timed_out_any);
+        assert_eq!(facts.effective_cap_secs, Some(600));
+
+        // Attempt 2 (the LAST gate): both sides complete and the patched side now
+        // measures a time.
+        facts.record(
+            1200,
+            &gate_report(Some(31.0), false, false),
+            &gate_report(Some(119.0), false, false),
+        );
+        assert!(
+            !facts.patched_timed_out_last,
+            "the LAST gate did not time out"
+        );
+        assert!(
+            facts.patched_timed_out_any,
+            "but an earlier attempt did, and that is not lost"
+        );
+        assert_eq!(
+            facts.patched_secs,
+            Some(119.0),
+            "the seconds are the LAST gate's, not the capped one's"
+        );
+        assert_eq!(facts.original_secs, Some(31.0));
+        assert_eq!(facts.effective_cap_secs, Some(1200));
     }
 
     // [VANTA-WHY] v1-m3.1 (§8.5, case b) — an ORIGINAL side KILLED by the clamp

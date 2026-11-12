@@ -64,7 +64,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CONFIG_PATH = REPO_ROOT / "configs" / "v1-m3.1.toml"
+CONFIG_PATH = REPO_ROOT / "configs" / "v1-m3.2.toml"
 
 FROZEN_SECTION = "env"
 RECORDED_SECTION = "recorded"

@@ -42030,7 +42030,7 @@ class TestFrozenConfig:
 
     def test_the_committed_config_loads_and_validates(self):
         config = frozen_mod.load()
-        assert config.name == "v1-m3.1"
+        assert config.name == "v1-m3.2"
         assert len(config.sha256) == 64
         assert config.sha256 == config.sha256.lower()
         # The two kinds of `[env]` statement: a literal the harness applies, and
@@ -42326,7 +42326,7 @@ class TestFrozenConfigResolution:
         config = self._config()
         block, _ = frozen_mod.resolve(config, environ={}, allow_override=False)
         assert block["config_hash"] == config.sha256
-        assert block["config_path"] == "configs/v1-m3.1.toml"
+        assert block["config_path"] == "configs/v1-m3.2.toml"
 
 
 class TestFrozenConfigWiring:
@@ -42524,7 +42524,7 @@ class TestPrepareFrozenConfig:
         assert payload["n_ctx"] == 262144
         assert payload["n_ctx_source"] == "VANTA_LLM_CONTEXT_TOKENS"
         # Q3 — the configuration block is recorded, the same four keys as a row.
-        assert payload["config_path"] == "configs/v1-m3.1.toml"
+        assert payload["config_path"] == "configs/v1-m3.2.toml"
         assert payload["config_hash"] == frozen_mod.load().sha256
         assert payload["config_override"] is False
         assert payload["config_overrides"] == []

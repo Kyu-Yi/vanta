@@ -29853,6 +29853,34 @@ class TestWaveGate:
         problems = runner_mod.wave_gate_failures(rows)
         assert any("InfraFailure" in problem for problem in problems)
 
+    def test_a_superseded_infra_failure_no_longer_stops_the_wave(self):
+        """Item D — the gate reads the EFFECTIVE rows, so a replaced InfraFailure is gone.
+
+        [WHY] `manifest.jsonl` is append-only, so an auto-retried `InfraFailure`
+        re-run leaves the OLD `InfraFailure` row on disk beside the row that names
+        it in `supersedes`. If the gate counted raw rows it would stop the wave over
+        a machine fault the batch has already replaced — and worse, it would report a
+        verdict the current evidence no longer holds. The replacement row here is a
+        healthy one, so the wave must pass with BOTH rows present.
+        """
+        good = _healthy_wave()
+        # The vanta repair row of the healthy wave, replaced by a clean re-run: the
+        # OLD row is an `InfraFailure`, the NEW one is healthy and names the old
+        # session in `supersedes`. Both sit on disk, as they would after item D.
+        replacement = _gate_row(config="vanta", mode="repair")
+        failure = dict(
+            replacement, session_id="vanta-repair-old", verdict="InfraFailure",
+            label="infra_failure",
+        )
+        replacement = dict(
+            replacement, session_id="vanta-repair-new",
+            supersedes={"session_id": "vanta-repair-old", "key": "k"},
+        )
+        rows = [failure, replacement] + [
+            row for row in good if not (row["config"] == "vanta" and row["mode"] == "repair")
+        ]
+        assert runner_mod.wave_gate_failures(rows) == []
+
     def test_a_censored_row_stops_the_wave_and_names_the_reason(self):
         rows = _healthy_wave()
         rows[0]["verdict"] = "PatchApplicationFailed"
@@ -32890,6 +32918,113 @@ class TestRunJob:
         assert not (paths.issues / f"{jobs[0].prep.slug}.txt").exists(), (
             "no row may write a file named after the shared bug slug"
         )
+
+
+def _scripted_outcome(tmp_path: Path, verdicts: Sequence[str]):
+    """An ``invoke_vanta`` stub that answers the given verdicts, one per call.
+
+    Each call gets its own session id, so a superseded attempt and the row that
+    replaces it are two distinct sessions — which is what the ``supersedes``
+    mechanism keys on.
+    """
+    calls = {"n": 0}
+
+    def invoke(**kwargs):
+        n = calls["n"]
+        calls["n"] += 1
+        verdict = verdicts[min(n, len(verdicts) - 1)]
+        # The real `invoke_vanta` writes the child's log at the path it was handed;
+        # stand in for that here so a test can see whether each attempt got its own.
+        log_path = kwargs.get("log_path")
+        if log_path is not None:
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(log_path).write_text(f"attempt {n}\n", encoding="utf-8")
+        return _outcome(tmp_path, session_id=f"sess-{n}", decision=verdict)
+
+    return invoke, calls
+
+
+class TestRowAutoRetry:
+    """Item D — an automatic retry for a row that ends ``InfraFailure``.
+
+    [WHY] An ``InfraFailure`` is the one verdict a re-run can change: it names the
+    environment, not the model. So the runner attempts such a row again, at most
+    ``ROW_RETRY_EXTRA`` extra times, keeps every earlier attempt on disk (named by
+    the next one's ``supersedes``, reason ``auto-retry``) and records the LAST
+    result. Every other verdict ends the loop, because re-running a *measurement*
+    would only repeat the experiment.
+    """
+
+    def _paths(self, tmp_path):
+        return runner_mod.BatchPaths.under(tmp_path)
+
+    def _run(self, tmp_path, monkeypatch, verdicts):
+        paths = self._paths(tmp_path)
+        manifest = manifest_mod.Manifest(tmp_path)
+        job = _job(prep(root=tmp_path / "root"))
+        invoke, calls = _scripted_outcome(tmp_path, list(verdicts))
+        monkeypatch.setattr(runner_mod, "invoke_vanta", invoke)
+        monkeypatch.setattr(
+            oracle_mod, "grade",
+            lambda **kwargs: oracle_mod.OracleResult(apply_ok=True, apply_detail="applied"),
+        )
+        record = runner_mod.run_job(
+            job=job, paths=paths, manifest=manifest, vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        return job, manifest, record, calls
+
+    def test_an_infra_failure_is_retried_and_the_last_result_is_the_row(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        job, manifest, record, calls = self._run(
+            tmp_path, monkeypatch, ["InfraFailure", "InfraFailure", "Rejected"]
+        )
+        assert calls["n"] == 3, "two InfraFailures then a verdict is three runs"
+        assert record["verdict"] == "Rejected"
+        assert record["row_retries"] == runner_mod.ROW_RETRY_EXTRA
+        rows = manifest.records()
+        assert [row["verdict"] for row in rows] == ["InfraFailure", "InfraFailure", "Rejected"]
+        assert [
+            row.get("supersedes", {}).get("reason") for row in rows
+        ] == [None, "auto-retry", "auto-retry"]
+        assert rows[1]["supersedes"]["session_id"] == "sess-0"
+        assert rows[2]["supersedes"]["session_id"] == "sess-1"
+        assert manifest.state()[job.key] == manifest_mod.DONE
+        # One line per retry, and no more: a retry is cheap to print and
+        # expensive to run, so the log must name each one exactly once.
+        assert capsys.readouterr().out.count("auto-retry") == runner_mod.ROW_RETRY_EXTRA
+
+    def test_a_verdict_other_than_infra_failure_is_never_retried(self, tmp_path, monkeypatch):
+        job, manifest, record, calls = self._run(tmp_path, monkeypatch, ["Rejected"])
+        assert calls["n"] == 1
+        assert record["verdict"] == "Rejected"
+        assert "row_retries" not in record, (
+            "a row that was not retried must not carry the field — absent means zero"
+        )
+        assert len(manifest.records()) == 1
+
+    def test_a_persistent_infra_failure_stops_after_the_extra_tries(
+        self, tmp_path, monkeypatch
+    ):
+        job, manifest, record, calls = self._run(
+            tmp_path, monkeypatch, ["InfraFailure"] * 10
+        )
+        assert calls["n"] == 1 + runner_mod.ROW_RETRY_EXTRA
+        assert record["verdict"] == "InfraFailure"
+        assert record["row_retries"] == runner_mod.ROW_RETRY_EXTRA
+        assert len(manifest.records()) == 1 + runner_mod.ROW_RETRY_EXTRA
+
+    def test_each_attempt_keeps_its_own_log_and_oracle_sidecar(self, tmp_path, monkeypatch):
+        """A superseded attempt's artefacts must survive the attempt that replaced it."""
+        job, manifest, record, calls = self._run(
+            tmp_path, monkeypatch, ["InfraFailure", "Rejected"]
+        )
+        stem = runner_mod._stem(job.key)
+        assert (self._paths(tmp_path).logs / f"{stem}.log").is_file()
+        assert (self._paths(tmp_path).logs / f"{stem}.retry1.log").is_file()
+        assert (self._paths(tmp_path).oracle / f"{stem}.json").is_file()
+        assert (self._paths(tmp_path).oracle / f"{stem}.retry1.json").is_file()
 
 
 class TestOracleBestAttempt:

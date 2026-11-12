@@ -104,6 +104,12 @@ FAILED = "failed"
 (no session id, no readable summary). It is re-run on resume, because a job that
 left no evidence has not been done."""
 
+INFRA_VERDICT = "InfraFailure"
+"""The driver's verdict for "the environment, not the model" (§5.2, ``label_for``'s
+``infra_failure``). Named here as well as in the runner because
+:meth:`Manifest.is_done` decides from it under ``--rerun-infra``: a second literal
+could not be kept in step with the table the label is read from."""
+
 MANIFEST_NAME = "manifest.jsonl"
 STATE_NAME = "state.json"
 
@@ -404,17 +410,32 @@ class Manifest:
             # re-runs, producing a duplicate row for work that is already on disk.
             os.replace(tmp, self.state_path)
 
-    def is_done(self, key: str) -> bool:
+    def is_done(self, key: str, *, rerun_infra: bool = False) -> bool:
         # Strictly `done`. `running` and `failed` both mean "no trustworthy row",
         # so both are re-run.
         if self.state().get(key) != DONE:
             return False
+        record = self.find(key)
         # [VANTA-WHY] Item E6 — a `done` row whose oracle is INCONCLUSIVE (the patch
         # applied but a run wrote no readable report) established no ground truth,
         # so a resume must re-run it rather than skip it. The row stays on disk
         # (append-only); the re-run appends a new row under the same key naming the
         # superseded session, and only then is the key `done` again.
-        return not oracle_inconclusive(self.find(key))
+        if oracle_inconclusive(record):
+            return False
+        # [VANTA-WHY] Item E — `--rerun-infra`: a `done` row whose verdict is
+        # `InfraFailure` is a measurement the ENVIRONMENT failed, and the flag is
+        # the caller's statement that it wants those re-run rather than skipped.
+        # Off (the default), the row is done exactly as before, and no other done
+        # row is ever re-run by this flag. Like the E6 case, the old row stays on
+        # disk and the re-run names it in `supersedes`.
+        if (
+            rerun_infra
+            and isinstance(record, dict)
+            and record.get("verdict") == INFRA_VERDICT
+        ):
+            return False
+        return True
 
     def pending(self, jobs: Iterable[Any]) -> list[Any]:
         return [job for job in jobs if not self.is_done(job.key)]

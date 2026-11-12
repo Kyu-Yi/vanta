@@ -1451,6 +1451,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         prep_config_block=batch.config_block,
         frozen_env=frozen_env,
         budget=budget,
+        # Item E — `--rerun-infra`: on resume, a `done` row whose verdict is
+        # `InfraFailure` is re-run instead of skipped. Off by default, so a run
+        # without the flag behaves exactly as it always did.
+        rerun_infra=args.rerun_infra,
     )
     if args.plan:
         return EXIT_OK
@@ -1799,6 +1803,9 @@ def _queue_pipeline(
         frozen_env=frozen_env,
         arm_spellings=arm_spellings,
         budget=budget,
+        # Item E — `--rerun-infra`, carried through to every per-bug `_run_task` so
+        # a pipelined bug re-runs its `InfraFailure` rows exactly as `queue` does.
+        rerun_infra=args.rerun_infra,
     )
 
     print(_render_pipeline_schedule(batch_dir.name, selected, spellings, seeds, waves))
@@ -2268,6 +2275,10 @@ def cmd_queue(args: argparse.Namespace) -> int:
         frozen_env=frozen_env,
         arm_spellings=arm_spellings,
         budget=budget,
+        # Item E — `--rerun-infra`: on resume, a `done` row whose verdict is
+        # `InfraFailure` is re-run instead of skipped. Off by default, so a queue
+        # without the flag behaves exactly as it always did.
+        rerun_infra=args.rerun_infra,
     )
     if args.plan:
         return EXIT_OK
@@ -3199,6 +3210,18 @@ def build_parser() -> argparse.ArgumentParser:
             "the default folder and never re-fetches a report live (§2.4)."
         ),
     )
+    run.add_argument(
+        "--rerun-infra",
+        action="store_true",
+        help=(
+            "on resume, RE-RUN every `done` row whose verdict is `InfraFailure` instead "
+            "of skipping it (item E). An InfraFailure names the environment, not the "
+            "model, so re-running it can change the verdict; the old row stays on disk "
+            "and the new one names it in `supersedes` with reason `rerun-infra`. No "
+            "other done row is ever re-run. Off by default, so without the flag a resume "
+            "behaves exactly as it always did."
+        ),
+    )
     run.set_defaults(func=cmd_run)
 
     queue = sub.add_parser(
@@ -3441,6 +3464,18 @@ def build_parser() -> argparse.ArgumentParser:
             "directory is REQUIRED: a report missing there refuses the bug by name — the "
             "run never falls back to the default folder and never re-fetches a report "
             "live (§2.4)."
+        ),
+    )
+    queue.add_argument(
+        "--rerun-infra",
+        action="store_true",
+        help=(
+            "on resume, RE-RUN every `done` row whose verdict is `InfraFailure` instead "
+            "of skipping it (item E). An InfraFailure names the environment, not the "
+            "model, so re-running it can change the verdict; the old row stays on disk "
+            "and the new one names it in `supersedes` with reason `rerun-infra`. No "
+            "other done row is ever re-run. Off by default, so without the flag a resume "
+            "behaves exactly as it always did."
         ),
     )
     queue.set_defaults(func=cmd_queue)

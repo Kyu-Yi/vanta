@@ -28104,6 +28104,30 @@ class TestManifest:
         manifest.append({"key": "k1", "session_id": "new", "oracle": {"inconclusive": False}})
         assert manifest.is_done("k1") is True
 
+    def test_a_done_infra_failure_is_re_run_only_under_rerun_infra(self, tmp_path):
+        """Item E — `--rerun-infra` re-runs a DONE `InfraFailure`, and nothing else.
+
+        [WHY] The verdict is a statement about the environment, which a re-run can
+        change; every other done row is a measurement, which a re-run would only
+        repeat. Off (the default) the flag changes nothing, so a batch on disk is
+        skipped exactly as it was before this item.
+        """
+        manifest = manifest_mod.Manifest(tmp_path)
+        manifest.append(
+            {"key": "infra", "session_id": "i", "verdict": "InfraFailure", "oracle": {}}
+        )
+        manifest.append(
+            {"key": "served", "session_id": "s", "verdict": "Rejected", "oracle": {}}
+        )
+        manifest.mark("infra", manifest_mod.DONE)
+        manifest.mark("served", manifest_mod.DONE)
+        # Off — unchanged: both are done.
+        assert manifest.is_done("infra") is True
+        assert manifest.is_done("served") is True
+        # On — only the InfraFailure row is claimable again.
+        assert manifest.is_done("infra", rerun_infra=True) is False
+        assert manifest.is_done("served", rerun_infra=True) is True
+
     def test_a_row_without_an_oracle_block_is_not_inconclusive(self, tmp_path):
         """A `failed` job and a non-run row carry no oracle; neither is inconclusive."""
         assert manifest_mod.oracle_inconclusive(None) is False
@@ -29854,9 +29878,9 @@ class TestWaveGate:
         assert any("InfraFailure" in problem for problem in problems)
 
     def test_a_superseded_infra_failure_no_longer_stops_the_wave(self):
-        """Item D — the gate reads the EFFECTIVE rows, so a replaced InfraFailure is gone.
+        """Item D/E — the gate reads the EFFECTIVE rows, so a replaced InfraFailure is gone.
 
-        [WHY] `manifest.jsonl` is append-only, so an auto-retried `InfraFailure`
+        [WHY] `manifest.jsonl` is append-only, so an auto-retried or `--rerun-infra`
         re-run leaves the OLD `InfraFailure` row on disk beside the row that names
         it in `supersedes`. If the gate counted raw rows it would stop the wave over
         a machine fault the batch has already replaced — and worse, it would report a
@@ -29866,7 +29890,7 @@ class TestWaveGate:
         good = _healthy_wave()
         # The vanta repair row of the healthy wave, replaced by a clean re-run: the
         # OLD row is an `InfraFailure`, the NEW one is healthy and names the old
-        # session in `supersedes`. Both sit on disk, as they would after item D.
+        # session in `supersedes`. Both sit on disk, as they would after item D/E.
         replacement = _gate_row(config="vanta", mode="repair")
         failure = dict(
             replacement, session_id="vanta-repair-old", verdict="InfraFailure",
@@ -32958,9 +32982,10 @@ class TestRowAutoRetry:
     def _paths(self, tmp_path):
         return runner_mod.BatchPaths.under(tmp_path)
 
-    def _run(self, tmp_path, monkeypatch, verdicts):
+    def _run(self, tmp_path, monkeypatch, verdicts, *, rerun_infra=False,
+             run_manifest=None):
         paths = self._paths(tmp_path)
-        manifest = manifest_mod.Manifest(tmp_path)
+        manifest = run_manifest if run_manifest is not None else manifest_mod.Manifest(tmp_path)
         job = _job(prep(root=tmp_path / "root"))
         invoke, calls = _scripted_outcome(tmp_path, list(verdicts))
         monkeypatch.setattr(runner_mod, "invoke_vanta", invoke)
@@ -32971,6 +32996,7 @@ class TestRowAutoRetry:
         record = runner_mod.run_job(
             job=job, paths=paths, manifest=manifest, vanta_bin=tmp_path / "vanta_m3",
             max_attempts=4, disk_mb=8192, python_version="3.8.20",
+            rerun_infra=rerun_infra,
         )
         return job, manifest, record, calls
 
@@ -33025,6 +33051,71 @@ class TestRowAutoRetry:
         assert (self._paths(tmp_path).logs / f"{stem}.retry1.log").is_file()
         assert (self._paths(tmp_path).oracle / f"{stem}.json").is_file()
         assert (self._paths(tmp_path).oracle / f"{stem}.retry1.json").is_file()
+
+
+class TestRerunInfra:
+    """Item E — ``--rerun-infra`` re-runs a DONE ``InfraFailure`` and nothing else."""
+
+    def _paths(self, tmp_path):
+        return runner_mod.BatchPaths.under(tmp_path)
+
+    def _seed_done(self, tmp_path, verdict: str, session_id: str) -> manifest_mod.Manifest:
+        manifest = manifest_mod.Manifest(tmp_path)
+        job = _job(prep(root=tmp_path / "root"))
+        manifest.append({"key": job.key, "session_id": session_id, "verdict": verdict,
+                         "oracle": {"apply_ok": True}})
+        manifest.mark(job.key, manifest_mod.DONE)
+        return manifest
+
+    def test_with_the_flag_the_infra_failure_is_re_run_and_superseded(
+        self, tmp_path, monkeypatch
+    ):
+        manifest = self._seed_done(tmp_path, "InfraFailure", "old")
+        job = _job(prep(root=tmp_path / "root"))
+        invoke, calls = _scripted_outcome(tmp_path, ["Rejected"])
+        monkeypatch.setattr(runner_mod, "invoke_vanta", invoke)
+        monkeypatch.setattr(
+            oracle_mod, "grade",
+            lambda **kwargs: oracle_mod.OracleResult(apply_ok=True, apply_detail="applied"),
+        )
+        record = runner_mod.run_job(
+            job=job, paths=self._paths(tmp_path), manifest=manifest,
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20", rerun_infra=True,
+        )
+        assert calls["n"] == 1
+        assert record["verdict"] == "Rejected"
+        assert record["supersedes"] == {
+            "session_id": "old", "key": job.key, "reason": "rerun-infra",
+        }
+        # The old row stays on disk (append-only); the effective rows drop it.
+        assert [row["session_id"] for row in manifest.effective_records()] == [
+            record["session_id"]
+        ]
+
+    def test_without_the_flag_a_predecessor_is_not_named(self, tmp_path, monkeypatch):
+        """`supersedes` is a claim about a re-run, so it is written only when one happened.
+
+        `run_job` replaces the row the CALLER asked it to re-run; with the flag off
+        the caller would have skipped the key, so a `run_job` reached without it must
+        write a plain row that names no predecessor.
+        """
+        manifest = self._seed_done(tmp_path, "InfraFailure", "old")
+        job = _job(prep(root=tmp_path / "root"))
+        invoke, calls = _scripted_outcome(tmp_path, ["Rejected"])
+        monkeypatch.setattr(runner_mod, "invoke_vanta", invoke)
+        monkeypatch.setattr(
+            oracle_mod, "grade",
+            lambda **kwargs: oracle_mod.OracleResult(apply_ok=True, apply_detail="applied"),
+        )
+        record = runner_mod.run_job(
+            job=job, paths=self._paths(tmp_path), manifest=manifest,
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        # The predecessor here is neither inconclusive nor explicitly re-run, so it
+        # is left unnamed — the shape every row had before item E.
+        assert "supersedes" not in record
 
 
 class TestOracleBestAttempt:
@@ -33227,7 +33318,7 @@ class TestRunBatchLoop:
 
         def stub(
             *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
-            scheduler=None,
+            scheduler=None, rerun_infra=None,
         ):
             calls.append(job)
             record = self._row(tmp_path, job)
@@ -33298,7 +33389,7 @@ class TestRunBatchLoop:
         return preps, entries, split, calls, tmp_path / "batch"
 
     def _run(self, preps, entries, split, batch_dir, *, show_hints=False, max_spend_usd=None,
-             pause_usd=None, preflight=None, max_attempts=4):
+             pause_usd=None, preflight=None, max_attempts=4, rerun_infra=False):
         return runner_mod.run_batch(
             batch_dir=batch_dir,
             batch_id="b1",
@@ -33314,6 +33405,7 @@ class TestRunBatchLoop:
             max_spend_usd=max_spend_usd,
             pause_usd=pause_usd,
             preflight=preflight,
+            rerun_infra=rerun_infra,
         )
 
     @staticmethod
@@ -33331,7 +33423,7 @@ class TestRunBatchLoop:
 
         def stub(
             *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
-            scheduler=None,
+            scheduler=None, rerun_infra=None,
         ):
             budgets.append((job.arm, max_attempts))
             record = self._row(tmp_path, job)
@@ -33374,7 +33466,7 @@ class TestRunBatchLoop:
 
         def stub(
             *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
-            scheduler=None,
+            scheduler=None, rerun_infra=None,
         ):
             calls.append(job)
             record = self._row(tmp_path, job)
@@ -33754,13 +33846,78 @@ class TestRunBatchLoop:
         assert not manifest_mod.Manifest(tmp_path / "batch-flaky").state().get(schedule[2])
 
 
+    # -- item E: --rerun-infra ---------------------------------------------
+    def _seed_done_infra(self, batch_dir, *, config="baseline"):
+        """A DONE `InfraFailure` row for bug 1's repair of ``config``, as a resume finds it."""
+        manifest = manifest_mod.Manifest(batch_dir)
+        key = manifest_mod.job_key(
+            batch_id="b1", bug="Demo/1", config=config, mode=runner_mod.REPAIR, seed=0
+        )
+        manifest.append(
+            {
+                "key": key,
+                "bug": "Demo/1",
+                "config": config,
+                "mode": runner_mod.REPAIR,
+                "seed": 0,
+                "session_id": f"Demo_1-{config}-infra",
+                "verdict": "InfraFailure",
+                "label": "infra_failure",
+                "oracle": {"apply_ok": True, "patch_good": False, "apply_detail": "", "error": ""},
+                "candidate": None,
+                "artifacts": {"final_patch": None, "session_dir": None, "oracle_json": None},
+            }
+        )
+        manifest.mark(key, manifest_mod.DONE)
+        return key
+
+    def test_rerun_infra_re_runs_a_done_infra_failure_and_the_gate_passes(
+        self, tmp_path, monkeypatch
+    ):
+        """Item E — under `--rerun-infra` the row is claimed again, and a clean re-run gates.
+
+        [WHY] The flag exists because a `done` `InfraFailure` is exactly the row a
+        plain resume skips forever: the environment failed, the cursor says done, and
+        the next run walks past it. With the flag the key is claimed, `run_job` runs
+        again, and — the re-run being clean here — the wave's rows pass the gate.
+        """
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        key = self._seed_done_infra(batch_dir)
+        code, _ = self._run(preps, entries, split, batch_dir, rerun_infra=True)
+        assert key in {job.key for job in calls}, "the InfraFailure row must be re-run"
+        assert code == 0, "a clean re-run leaves a gate-passing row"
+
+    def test_without_rerun_infra_a_done_infra_failure_is_skipped(self, tmp_path, monkeypatch):
+        """Off by default: the flag is what re-runs the row, and nothing else does."""
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        key = self._seed_done_infra(batch_dir)
+        self._run(preps, entries, split, batch_dir)
+        assert key not in {job.key for job in calls}, "without the flag it is skipped"
+
+    def test_rerun_infra_leaves_a_done_served_row_alone(self, tmp_path, monkeypatch):
+        """No other `done` row is ever re-run, flag or not — only `InfraFailure`."""
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        manifest = manifest_mod.Manifest(batch_dir)
+        key = manifest_mod.job_key(
+            batch_id="b1", bug="Demo/2", config="vanta", mode=runner_mod.REPAIR, seed=0
+        )
+        manifest.append(
+            {"key": key, "bug": "Demo/2", "config": "vanta", "mode": runner_mod.REPAIR,
+             "seed": 0, "session_id": "served", "verdict": "Rejected",
+             "label": "true_reject", "oracle": {"apply_ok": True},
+             "candidate": None, "artifacts": {"final_patch": None}}
+        )
+        manifest.mark(key, manifest_mod.DONE)
+        self._run(preps, entries, split, batch_dir, rerun_infra=True)
+        assert key not in {job.key for job in calls}, "a measured row is never re-run"
+
     # -- M3 item S6: the scheduler and the pooled phase ---------------------
     def _capturing_stub(self, tmp_path, calls, blocks):
         """A `run_job` that also records the `scheduler` block it was asked for."""
 
         def stub(
             *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
-            scheduler=None,
+            scheduler=None, rerun_infra=None,
         ):
             calls.append(job)
             blocks.append(scheduler)
@@ -33977,7 +34134,7 @@ class TestRunBatchLoop:
 
         def stub(
             *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
-            scheduler=None,
+            scheduler=None, rerun_infra=None,
         ):
             # Row 1: only once row 0 is committed to the wait, raise.
             assert in_the_slot_for_row_zero.wait(timeout=10)
@@ -34127,7 +34284,7 @@ class TestQueue:
 
         def stub(
             *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
-            scheduler=None,
+            scheduler=None, rerun_infra=None,
         ):
             calls.append(job)
             if on_call is not None:

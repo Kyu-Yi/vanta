@@ -215,7 +215,7 @@ class RunnerError(RuntimeError):
 # the session outcome and the failure record must not be able to disagree about the
 # spelling of the same condition.
 REPORT_UNREADABLE = "report_unreadable"
-INFRA_VERDICT = "InfraFailure"
+INFRA_VERDICT = manifest_mod.INFRA_VERDICT
 INFRA_LABEL = "infra_failure"
 """``label_for(INFRA_VERDICT, …)`` — pinned by a test so the failure record and the
 manifest's label table cannot drift apart about what an infrastructure failure is
@@ -3301,6 +3301,7 @@ def run_job(
     disk_mb: int,
     python_version: str,
     scheduler: Optional[dict[str, Any]] = None,
+    rerun_infra: bool = False,
 ) -> Optional[dict[str, Any]]:
     """Execute one job end to end, or return ``None`` if it left no evidence.
 
@@ -3314,6 +3315,10 @@ def run_job(
     ``None`` for a caller that had no budget. It is passed straight through to
     :func:`build_record`, which is the only place with the run's summary in hand;
     ``None`` leaves the row exactly as it was before this item.
+
+    ``rerun_infra`` is item E's ``--rerun-infra``: the caller reached this key
+    despite a ``done`` row because that row's verdict is ``InfraFailure``, so the
+    row this run writes names it in ``supersedes`` with reason ``rerun-infra``.
 
     [VANTA-WHY] Item D — a verdict of ``InfraFailure`` is a statement about the
     ENVIRONMENT, not the model, and the environment is the one thing a retry can
@@ -3330,10 +3335,20 @@ def run_job(
     manifest.mark(job.key, RUNNING)
     # The row this run replaces, if any, and why. An INCONCLUSIVE predecessor is
     # item E6's re-run and keeps the shape that predates this item (no reason).
-    # An in-run auto-retry (item D) replaces the attempt it just wrote, with
-    # reason `auto-retry`, inside the loop below.
+    # Under `--rerun-infra` the predecessor is the DONE `InfraFailure` the caller
+    # asked to re-run, and the new row names it with reason `rerun-infra`. An
+    # in-run auto-retry (item D) replaces the attempt it just wrote, with reason
+    # `auto-retry`, inside the loop below.
     supersede = manifest.find(job.key)
-    reason: Optional[str] = None
+    reason: Optional[str] = (
+        "rerun-infra"
+        if (
+            rerun_infra
+            and isinstance(supersede, dict)
+            and supersede.get("verdict") == INFRA_VERDICT
+        )
+        else None
+    )
     row_retries = 0
     while True:
         record = _run_job_attempt(
@@ -3403,8 +3418,8 @@ def _run_job_attempt(
     attempt's artefacts are not overwritten by the one that replaced it.
     ``supersede`` is the row this attempt replaces (named in the record's
     ``supersedes`` block) and ``supersede_reason`` is ``None`` for item E6's
-    inconclusive re-run — the shape that predates this item — and ``auto-retry``
-    for the one this item adds.
+    inconclusive re-run — the shape that predates this item — and ``auto-retry`` /
+    ``rerun-infra`` for the two this item adds.
     """
     prep = job.prep
     # [VANTA-WHY] M3 item V1 — the issue file is keyed by the JOB, not the bug.
@@ -3563,8 +3578,9 @@ def _run_job_attempt(
     # `metrics.oracle_by_session`, the batch digest, `write_labels`, the pool harvest
     # and the replay selector — drops that session through the one shared rule,
     # `manifest.effective_records` (F3). Item D adds the same mechanism for an
-    # auto-retried `InfraFailure` (reason `auto-retry`): the reason is recorded so
-    # a reader can tell the two apart, while a predecessor that is neither
+    # auto-retried `InfraFailure` (reason `auto-retry`) and item E for a
+    # `--rerun-infra` re-run (reason `rerun-infra`): the reason is recorded so a
+    # reader can tell the three apart, while a predecessor that is neither
     # inconclusive nor explicitly superseded is left unnamed, exactly as before.
     if (
         isinstance(supersede, dict)
@@ -4198,6 +4214,7 @@ def run_batch(
     arm_spellings: Optional[Sequence[str]] = None,
     budget: Optional[budget_mod.Budget] = None,
     issues_dir: Optional[Path] = None,
+    rerun_infra: bool = False,
 ) -> tuple[int, list[WaveResult]]:
     """The whole batch: per wave, D13's four phases, then the wave-1 gate.
 
@@ -4437,6 +4454,9 @@ def run_batch(
                     stop_file=stop_file,
                     pause_usd=pause_usd,
                     preflight=preflight,
+                    # Item E — the pooled path claims a key the same way the
+                    # sequential one does, so `--rerun-infra` has to reach it too.
+                    rerun_infra=rerun_infra,
                 )
                 result.records.extend(phase_records)
                 result.failed += phase_failed
@@ -4451,7 +4471,7 @@ def run_batch(
                     return 1, results
                 continue
             for job in jobs:
-                if manifest.is_done(job.key):
+                if manifest.is_done(job.key, rerun_infra=rerun_infra):
                     print(f"  {job.label()} done — skipping (resume)", flush=True)
                     found = manifest.find(job.key)
                     if found:
@@ -4565,6 +4585,11 @@ def run_batch(
                             if budget is not None and budget.concurrent
                             else None
                         ),
+                        # Item E — `--rerun-infra`: this key was claimed despite a
+                        # `done` row because `is_done` said so (the row's verdict
+                        # is `InfraFailure`), so the row this run writes names the
+                        # old one in `supersedes` with reason `rerun-infra`.
+                        rerun_infra=rerun_infra,
                     )
                 finally:
                     # Reconcile against the job's recorded cost by releasing:
@@ -4768,6 +4793,7 @@ def _run_jobs_concurrently(
     stop_file: Optional[Path],
     pause_usd: Optional[float],
     preflight: Optional[Callable[[], Optional[str]]],
+    rerun_infra: bool = False,
 ) -> tuple[str, list[dict[str, Any]], int]:
     """Run one phase's jobs on a pool, and report how the phase ended.
 
@@ -4782,7 +4808,9 @@ def _run_jobs_concurrently(
 
     Everything the serial path guarantees per row is kept per row here:
 
-    * the resume skip, which reads the row's key from the cursor before claiming;
+    * the resume skip, which reads the row's key from the cursor before claiming,
+      honouring item E's ``rerun_infra`` exactly as the sequential path does (an
+      ``InfraFailure`` row is re-run rather than skipped under ``--rerun-infra``);
     * item 13's stop file, checked before the claim and — H3 — again after the
       spend gate's ``acquire`` returns, because the file can appear while a worker
       sleeps;
@@ -4822,7 +4850,7 @@ def _run_jobs_concurrently(
     # row that does run then gets a `Manifest` of its own below.
     pending: list[tuple[int, "Job"]] = []
     for index, job in enumerate(jobs):
-        if manifest.is_done(job.key):
+        if manifest.is_done(job.key, rerun_infra=rerun_infra):
             print(f"  {job.label()} done — skipping (resume)", flush=True)
             slots[index] = ("skip", manifest.find(job.key))
             continue
@@ -4924,6 +4952,9 @@ def _run_jobs_concurrently(
                     scheduler=_scheduler_row_block(
                         budget, charge_mb=charge_mb, slot_wait_s=slot_wait_s
                     ),
+                    # Item E — the same `--rerun-infra` the serial path passes, so
+                    # a pooled phase re-runs an `InfraFailure` key the same way.
+                    rerun_infra=rerun_infra,
                 )
             slots[index] = ("failed" if record is None else "record", record)
         except BaseException as exc:  # noqa: BLE001 — stored and re-raised in order
@@ -5224,15 +5255,15 @@ def wave_gate_failures(records: Sequence[dict[str, Any]]) -> list[str]:
     its counts belong to `metrics.py`, which scores it as its own outcome.
     """
     problems: list[str] = []
-    # [VANTA-WHY] Item D — the gate reads the EFFECTIVE rows, not the raw list.
-    # `manifest.jsonl` is append-only, so an auto-retried `InfraFailure` leaves
-    # the OLD row on disk with the new one naming it in `supersedes`. Counting
-    # the old row would fail the gate on an `InfraFailure` the batch has already
-    # replaced — the gate would stop a wave over evidence that is no longer
-    # current. So the one shared filter (`manifest.effective_records`, F3) is
-    # applied here exactly as every report reader applies it. It is idempotent,
-    # and for rows with no `key` it is a no-op, so a wave written before this
-    # item gates exactly as it did.
+    # [VANTA-WHY] Item D/E — the gate reads the EFFECTIVE rows, not the raw list.
+    # `manifest.jsonl` is append-only, so an auto-retried `InfraFailure` (D) and a
+    # `--rerun-infra` re-run (E) both leave the OLD row on disk with the new one
+    # naming it in `supersedes`. Counting the old row would fail the gate on an
+    # `InfraFailure` the batch has already replaced — the gate would stop a wave
+    # over evidence that is no longer current. So the one shared filter
+    # (`manifest.effective_records`, F3) is applied here exactly as every report
+    # reader applies it. It is idempotent, and for rows with no `key` it is a
+    # no-op, so a wave written before this item gates exactly as it did.
     records = manifest_mod.effective_records(records)
     if not records:
         return ["the wave produced no records at all"]
@@ -6051,6 +6082,7 @@ def run_queue(
     arm_spellings: Optional[Sequence[str]] = None,
     budget: Optional[budget_mod.Budget] = None,
     issues_dir: Optional[Path] = None,
+    rerun_infra: bool = False,
 ) -> tuple[int, list[QueueOutcome]]:
     """Item 13 — run a prepared batch's bugs up to ``jobs`` at a time.
 
@@ -6119,6 +6151,9 @@ def run_queue(
             arm_spellings=arm_spellings,
             budget=budget,
             issues_dir=issues_dir,
+            # Item E — the queue is a resume of the same rows, so `--rerun-infra`
+            # has to reach every per-bug `run_batch` here.
+            rerun_infra=rerun_infra,
         )
     finally:
         owner.release()
@@ -6359,6 +6394,10 @@ def _run_task(
             # a caller that drives `_run_queue` with its own kwargs (a test) need not
             # name it; absent means the committed default, exactly as before.
             issues_dir=kwargs.get("issues_dir"),
+            # Item E — `--rerun-infra`, carried from the invocation. `.get` for the
+            # same reason as `pause_usd` and `issues_dir`: a test may drive
+            # `_run_queue` with its own kwargs, and absent means the flag is off.
+            rerun_infra=kwargs.get("rerun_infra"),
         )
     except Exception as exc:  # one bug must not take the queue down
         print(f"  [{prep.key}] FAILED — {type(exc).__name__}: {exc}", flush=True)

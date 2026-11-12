@@ -2616,6 +2616,21 @@ pub async fn run(
                             &apply_failed_attempt_indices,
                             &mut metric_rows,
                         )?;
+                        // [VANTA-WHY] v1-m3.2 CodeRabbit round 2 — the attempt is
+                        // SPENT (the Governor advanced on it) and `run.summary`
+                        // counts it, so the evidence must list it too; without this
+                        // the index read `"attempts": []` for a run whose Creator
+                        // never answered. The record carries this attempt's received
+                        // feedback and its Creator prompt hash, exactly as an
+                        // observed attempt's does, but names NO patch: none was
+                        // produced, and nothing here touches the attempt-to-patch
+                        // mapping or the comparison basis.
+                        record_unpatched_round(
+                            &mut fixed_round_records,
+                            attempt,
+                            prior_feedback.clone(),
+                            creator_prompt_hash.clone(),
+                        );
                         // [VANTA-WHY] v1-m3.2 CodeRabbit round 2 — the re-ask must
                         // state the shape the PARSER requires, not a different one:
                         // the old "return ONLY the corrected unified diff" asked for
@@ -7175,6 +7190,38 @@ fn open_fixed_round_record(
         "unchanged": unchanged,
     }));
     records.len() - 1
+}
+
+/// Record an attempt whose Creator produced NO patch, so the evidence lists every
+/// attempt the Governor counted.
+///
+/// [VANTA-WHY] v1-m3.2 CodeRabbit round 2 — a Creator call that exhausts its
+/// parse retries `continue`s to the next round BEFORE `open_fixed_round_record`
+/// runs (that call is what guards `previous_patch_text`), so the attempt owned no
+/// record at all: a K=4 run whose Creator never answered stored `"attempts": []`
+/// while `run.summary` said `attempts_run=4`, and the attempt's feedback and
+/// `creator_prompt_hash` were lost from the index. This is the record it should
+/// have had — the same keys as an observed attempt, with `patch` null because
+/// nothing was produced (a placeholder text here would be read as a candidate
+/// nobody made) and `unchanged` false. It deliberately does NOT advance
+/// `previous_patch_text`: the next attempt must still be compared against the
+/// last patch anyone OBSERVED, and this attempt observed nothing.
+fn record_unpatched_round(
+    records: &mut Vec<serde_json::Value>,
+    attempt_index: u32,
+    feedback: Option<String>,
+    creator_prompt_hash: Option<String>,
+) {
+    records.push(serde_json::json!({
+        "attempt": attempt_index + 1,
+        "applied": false,
+        "passed": false,
+        "patch": null,
+        "tests": Vec::<String>::new(),
+        "feedback": feedback,
+        "creator_prompt_hash": creator_prompt_hash,
+        "unchanged": false,
+    }));
 }
 
 fn read_json_value_from_debug(path: &Path) -> Option<serde_json::Value> {

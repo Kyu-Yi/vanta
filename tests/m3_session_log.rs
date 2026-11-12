@@ -6058,6 +6058,43 @@ fn a_creator_that_never_produces_a_patch_spends_every_attempt_and_fabricates_no_
             .collect::<Vec<_>>()
     );
 
+    // Finding #2 (CodeRabbit round 2) — an attempt whose Creator exhausted its
+    // parse retries is SPENT (the Governor counts it) and `run.summary` reports
+    // it, so the evidence must list it too. A patchless attempt used to `continue`
+    // before `open_fixed_round_record`, leaving `"attempts": []` for a run whose
+    // Creator never answered.
+    let evidence_path = workspace
+        .path()
+        .join("vanta_sessions")
+        .join(format!("{}_evidence.json", records[0].session_id.as_str()));
+    let evidence = read_json(&evidence_path);
+    let attempts = evidence["attempts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("evidence.attempts must be an array; got {evidence}"));
+    assert_eq!(
+        attempts.len(),
+        4,
+        "every spent attempt must own a record, even one whose Creator produced nothing; \
+         got {attempts:?}"
+    );
+    assert!(
+        attempts.iter().all(|a| a["patch"].is_null()),
+        "no attempt produced a patch, so no record may name one; got {attempts:?}"
+    );
+    assert!(
+        attempts
+            .iter()
+            .all(|a| a["creator_prompt_hash"].as_str().is_some_and(|h| !h.is_empty())),
+        "every attempt ran a Creator, so each record must carry its prompt hash; got {attempts:?}"
+    );
+    assert!(
+        attempts[1..]
+            .iter()
+            .all(|a| a["feedback"].as_str().is_some_and(|f| !f.is_empty())),
+        "the attempts after the first were handed the recovery feedback, so each record \
+         must carry it; got {attempts:?}"
+    );
+
     // Finding #1 (CodeRabbit round 2) — the recovery feedback a spent Creator
     // attempt hands the next one must RESTATE the contract the parser requires.
     // `creator_generate_patch` deserialises a `CreatorResponse` JSON object, but

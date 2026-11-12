@@ -28104,6 +28104,30 @@ class TestManifest:
         manifest.append({"key": "k1", "session_id": "new", "oracle": {"inconclusive": False}})
         assert manifest.is_done("k1") is True
 
+    def test_a_done_infra_failure_is_re_run_only_under_rerun_infra(self, tmp_path):
+        """Item E — `--rerun-infra` re-runs a DONE `InfraFailure`, and nothing else.
+
+        [WHY] The verdict is a statement about the environment, which a re-run can
+        change; every other done row is a measurement, which a re-run would only
+        repeat. Off (the default) the flag changes nothing, so a batch on disk is
+        skipped exactly as it was before this item.
+        """
+        manifest = manifest_mod.Manifest(tmp_path)
+        manifest.append(
+            {"key": "infra", "session_id": "i", "verdict": "InfraFailure", "oracle": {}}
+        )
+        manifest.append(
+            {"key": "served", "session_id": "s", "verdict": "Rejected", "oracle": {}}
+        )
+        manifest.mark("infra", manifest_mod.DONE)
+        manifest.mark("served", manifest_mod.DONE)
+        # Off — unchanged: both are done.
+        assert manifest.is_done("infra") is True
+        assert manifest.is_done("served") is True
+        # On — only the InfraFailure row is claimable again.
+        assert manifest.is_done("infra", rerun_infra=True) is False
+        assert manifest.is_done("served", rerun_infra=True) is True
+
     def test_a_row_without_an_oracle_block_is_not_inconclusive(self, tmp_path):
         """A `failed` job and a non-run row carry no oracle; neither is inconclusive."""
         assert manifest_mod.oracle_inconclusive(None) is False
@@ -29853,6 +29877,34 @@ class TestWaveGate:
         problems = runner_mod.wave_gate_failures(rows)
         assert any("InfraFailure" in problem for problem in problems)
 
+    def test_a_superseded_infra_failure_no_longer_stops_the_wave(self):
+        """Item D/E — the gate reads the EFFECTIVE rows, so a replaced InfraFailure is gone.
+
+        [WHY] `manifest.jsonl` is append-only, so an auto-retried or `--rerun-infra`
+        re-run leaves the OLD `InfraFailure` row on disk beside the row that names
+        it in `supersedes`. If the gate counted raw rows it would stop the wave over
+        a machine fault the batch has already replaced — and worse, it would report a
+        verdict the current evidence no longer holds. The replacement row here is a
+        healthy one, so the wave must pass with BOTH rows present.
+        """
+        good = _healthy_wave()
+        # The vanta repair row of the healthy wave, replaced by a clean re-run: the
+        # OLD row is an `InfraFailure`, the NEW one is healthy and names the old
+        # session in `supersedes`. Both sit on disk, as they would after item D/E.
+        replacement = _gate_row(config="vanta", mode="repair")
+        failure = dict(
+            replacement, session_id="vanta-repair-old", verdict="InfraFailure",
+            label="infra_failure",
+        )
+        replacement = dict(
+            replacement, session_id="vanta-repair-new",
+            supersedes={"session_id": "vanta-repair-old", "key": "k"},
+        )
+        rows = [failure, replacement] + [
+            row for row in good if not (row["config"] == "vanta" and row["mode"] == "repair")
+        ]
+        assert runner_mod.wave_gate_failures(rows) == []
+
     def test_a_censored_row_stops_the_wave_and_names_the_reason(self):
         rows = _healthy_wave()
         rows[0]["verdict"] = "PatchApplicationFailed"
@@ -29990,6 +30042,89 @@ class TestWaveGate:
                     labels.add(row["label"])
             assert runner_mod.wave_gate_failures(rows) == []
         assert labels == {"needs_review_on_good", "needs_review_on_bad"}
+
+    def test_a_graded_model_output_invalid_row_does_not_stop_the_wave(self):
+        """v1-m3.2 item B: an unreadable model answer is graded, not deadly.
+
+        [WHY] An exhausted structured call that failed on the MODEL'S OWN OUTPUT
+        (a schema parse error, or an answer cut off twice) used to end the run as
+        `InfraFailure`, which the wave gate treats as a machine fault and halts on.
+        It is now a `NeedsReview` with `stop_reason=model_output_invalid` and the
+        produced/candidate tree attached, so `label_for` names the row
+        `needs_review_on_good`/`needs_review_on_bad` and §14.6's NeedsReview
+        exemption applies exactly as it does to any other refusal. As with the
+        deadline test beside this one, the gate reads the LABEL, never
+        `stop_reason` — the same row left with no patch stays `unobservable` and is
+        still gated.
+        """
+        labels = set()
+        for good in (True, False):
+            rows = _healthy_wave()
+            for row in rows:
+                if row["candidate"] and row["candidate"]["kind"] == runner_mod.DEV_FIX:
+                    row["verdict"] = "NeedsReview"
+                    row["stop_reason"] = "model_output_invalid"
+                    row["label"] = runner_mod.label_for(
+                        "NeedsReview", oracle_mod.OracleResult(apply_ok=True, patch_good=good)
+                    )
+                    labels.add(row["label"])
+            assert runner_mod.wave_gate_failures(rows) == []
+        assert labels == {"needs_review_on_good", "needs_review_on_bad"}
+
+    def test_a_model_output_invalid_row_with_no_tree_stays_ungraded_and_gated(self):
+        """The other half of item B: no tree was ever produced, so nothing to grade.
+
+        [WHY] The Attacker and the Judge run after the candidate has applied, so
+        their exhaustion always has THIS attempt's tree to attach; a Creator
+        exhaustion on the FIRST attempt has nothing applied yet and ends
+        `MaxAttemptsReached`, not this stop_reason. If a model-output row ever
+        reached the runner with no patch, it is genuinely unobservable — the
+        plumbing, not the candidate — and the wave gate must keep halting on it.
+        """
+        rows = _healthy_wave()
+        rows[0]["verdict"] = "NeedsReview"
+        rows[0]["stop_reason"] = "model_output_invalid"
+        rows[0]["label"] = "unobservable"
+        rows[0]["oracle"]["apply_ok"] = False
+        rows[0]["oracle"]["apply_detail"] = "no final.patch for verdict NeedsReview"
+        problems = runner_mod.wave_gate_failures(rows)
+        assert any(
+            "unobservable" in problem and "no final.patch" in problem for problem in problems
+        )
+
+    def test_a_creator_exhaustion_row_is_graded_unresolved_not_censored(self):
+        """v1-m3.2 item B, the Creator arm: nothing was produced, so nothing halts.
+
+        [WHY] The Creator runs BEFORE any apply, so an exhausted call produced no
+        patch — the driver spends the attempt and asks again (the Rust lint test
+        pins the loop). On the last attempt the run ends `MaxAttemptsReached`, whose
+        terminal arm attaches the run's last produced tree; with nothing ever
+        applied that is the ORIGINAL tree, so `final.patch` is an empty diff. An
+        empty body is not a refusal: `git_apply_patch(drop_test_hunks=True)`
+        short-circuits it to APPLY_APPLIED, so `apply_ok = True` and `label_for`
+        falls through to the `MaxAttemptsReached` arm — `unresolved`. The censor's
+        `unobservable` (which halts the wave, §8.2) stays for a run we could not
+        measure AT ALL; routing the Creator's exhaustion there would hide a whole
+        class of runs from the fix rate.
+        """
+        rows = _healthy_wave()
+        for row in rows:
+            if row["candidate"] and row["candidate"]["kind"] == runner_mod.DEV_FIX:
+                row["verdict"] = "MaxAttemptsReached"
+                row["label"] = runner_mod.label_for(
+                    "MaxAttemptsReached",
+                    oracle_mod.OracleResult(
+                        apply_ok=True,
+                        apply_outcome=suite_mod.APPLY_APPLIED,
+                        patch_good=False,
+                    ),
+                )
+        assert all(
+            row["label"] == "unresolved"
+            for row in rows
+            if row["candidate"] and row["candidate"]["kind"] == runner_mod.DEV_FIX
+        )
+        assert runner_mod.wave_gate_failures(rows) == []
 
     def test_a_budget_exhausted_row_with_no_tree_stays_ungraded_and_gated(self):
         """The other half of item 1: no tree was ever produced, so nothing to grade.
@@ -32809,6 +32944,228 @@ class TestRunJob:
         )
 
 
+def _scripted_outcome(tmp_path: Path, verdicts: Sequence[str]):
+    """An ``invoke_vanta`` stub that answers the given verdicts, one per call.
+
+    Each call gets its own session id, so a superseded attempt and the row that
+    replaces it are two distinct sessions — which is what the ``supersedes``
+    mechanism keys on.
+    """
+    calls = {"n": 0}
+
+    def invoke(**kwargs):
+        n = calls["n"]
+        calls["n"] += 1
+        verdict = verdicts[min(n, len(verdicts) - 1)]
+        # The real `invoke_vanta` writes the child's log at the path it was handed;
+        # stand in for that here so a test can see whether each attempt got its own.
+        log_path = kwargs.get("log_path")
+        if log_path is not None:
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(log_path).write_text(f"attempt {n}\n", encoding="utf-8")
+        return _outcome(tmp_path, session_id=f"sess-{n}", decision=verdict)
+
+    return invoke, calls
+
+
+class TestRowAutoRetry:
+    """Item D — an automatic retry for a row that ends ``InfraFailure``.
+
+    [WHY] An ``InfraFailure`` is the one verdict a re-run can change: it names the
+    environment, not the model. So the runner attempts such a row again, at most
+    ``ROW_RETRY_EXTRA`` extra times, keeps every earlier attempt on disk (named by
+    the next one's ``supersedes``, reason ``auto-retry``) and records the LAST
+    result. Every other verdict ends the loop, because re-running a *measurement*
+    would only repeat the experiment.
+    """
+
+    def _paths(self, tmp_path):
+        return runner_mod.BatchPaths.under(tmp_path)
+
+    def _run(self, tmp_path, monkeypatch, verdicts, *, rerun_infra=False,
+             run_manifest=None):
+        paths = self._paths(tmp_path)
+        manifest = run_manifest if run_manifest is not None else manifest_mod.Manifest(tmp_path)
+        job = _job(prep(root=tmp_path / "root"))
+        invoke, calls = _scripted_outcome(tmp_path, list(verdicts))
+        monkeypatch.setattr(runner_mod, "invoke_vanta", invoke)
+        monkeypatch.setattr(
+            oracle_mod, "grade",
+            lambda **kwargs: oracle_mod.OracleResult(apply_ok=True, apply_detail="applied"),
+        )
+        record = runner_mod.run_job(
+            job=job, paths=paths, manifest=manifest, vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+            rerun_infra=rerun_infra,
+        )
+        return job, manifest, record, calls
+
+    def test_an_infra_failure_is_retried_and_the_last_result_is_the_row(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        job, manifest, record, calls = self._run(
+            tmp_path, monkeypatch, ["InfraFailure", "InfraFailure", "Rejected"]
+        )
+        assert calls["n"] == 3, "two InfraFailures then a verdict is three runs"
+        assert record["verdict"] == "Rejected"
+        assert record["row_retries"] == runner_mod.ROW_RETRY_EXTRA
+        rows = manifest.records()
+        assert [row["verdict"] for row in rows] == ["InfraFailure", "InfraFailure", "Rejected"]
+        assert [
+            row.get("supersedes", {}).get("reason") for row in rows
+        ] == [None, "auto-retry", "auto-retry"]
+        assert rows[1]["supersedes"]["session_id"] == "sess-0"
+        assert rows[2]["supersedes"]["session_id"] == "sess-1"
+        assert manifest.state()[job.key] == manifest_mod.DONE
+        # One line per retry, and no more: a retry is cheap to print and
+        # expensive to run, so the log must name each one exactly once.
+        assert capsys.readouterr().out.count("auto-retry") == runner_mod.ROW_RETRY_EXTRA
+
+    def test_a_verdict_other_than_infra_failure_is_never_retried(self, tmp_path, monkeypatch):
+        job, manifest, record, calls = self._run(tmp_path, monkeypatch, ["Rejected"])
+        assert calls["n"] == 1
+        assert record["verdict"] == "Rejected"
+        assert "row_retries" not in record, (
+            "a row that was not retried must not carry the field — absent means zero"
+        )
+        assert len(manifest.records()) == 1
+
+    def test_a_persistent_infra_failure_stops_after_the_extra_tries(
+        self, tmp_path, monkeypatch
+    ):
+        job, manifest, record, calls = self._run(
+            tmp_path, monkeypatch, ["InfraFailure"] * 10
+        )
+        assert calls["n"] == 1 + runner_mod.ROW_RETRY_EXTRA
+        assert record["verdict"] == "InfraFailure"
+        assert record["row_retries"] == runner_mod.ROW_RETRY_EXTRA
+        assert len(manifest.records()) == 1 + runner_mod.ROW_RETRY_EXTRA
+
+    def test_each_attempt_keeps_its_own_log_and_oracle_sidecar(self, tmp_path, monkeypatch):
+        """A superseded attempt's artefacts must survive the attempt that replaced it."""
+        job, manifest, record, calls = self._run(
+            tmp_path, monkeypatch, ["InfraFailure", "Rejected"]
+        )
+        stem = runner_mod._stem(job.key)
+        assert (self._paths(tmp_path).logs / f"{stem}.log").is_file()
+        assert (self._paths(tmp_path).logs / f"{stem}.retry1.log").is_file()
+        assert (self._paths(tmp_path).oracle / f"{stem}.json").is_file()
+        assert (self._paths(tmp_path).oracle / f"{stem}.retry1.json").is_file()
+
+
+class TestRerunInfra:
+    """Item E — ``--rerun-infra`` re-runs a DONE ``InfraFailure`` and nothing else."""
+
+    def _paths(self, tmp_path):
+        return runner_mod.BatchPaths.under(tmp_path)
+
+    def _seed_done(self, tmp_path, verdict: str, session_id: str) -> manifest_mod.Manifest:
+        manifest = manifest_mod.Manifest(tmp_path)
+        job = _job(prep(root=tmp_path / "root"))
+        manifest.append({"key": job.key, "session_id": session_id, "verdict": verdict,
+                         "oracle": {"apply_ok": True}})
+        manifest.mark(job.key, manifest_mod.DONE)
+        return manifest
+
+    def test_with_the_flag_the_infra_failure_is_re_run_and_superseded(
+        self, tmp_path, monkeypatch
+    ):
+        manifest = self._seed_done(tmp_path, "InfraFailure", "old")
+        job = _job(prep(root=tmp_path / "root"))
+        invoke, calls = _scripted_outcome(tmp_path, ["Rejected"])
+        monkeypatch.setattr(runner_mod, "invoke_vanta", invoke)
+        monkeypatch.setattr(
+            oracle_mod, "grade",
+            lambda **kwargs: oracle_mod.OracleResult(apply_ok=True, apply_detail="applied"),
+        )
+        record = runner_mod.run_job(
+            job=job, paths=self._paths(tmp_path), manifest=manifest,
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20", rerun_infra=True,
+        )
+        assert calls["n"] == 1
+        assert record["verdict"] == "Rejected"
+        assert record["supersedes"] == {
+            "session_id": "old", "key": job.key, "reason": "rerun-infra",
+        }
+        # The old row stays on disk (append-only); the effective rows drop it.
+        assert [row["session_id"] for row in manifest.effective_records()] == [
+            record["session_id"]
+        ]
+
+    def test_a_rerun_does_not_reuse_the_superseded_rows_artifact_names(
+        self, tmp_path, monkeypatch
+    ):
+        """A re-run must not overwrite the evidence of the row it supersedes.
+
+        A ``--rerun-infra`` run starts its own attempt index at 0, so an index-only
+        suffix would hand it the bare name its predecessor's row still records in
+        ``run_log``/``oracle_json`` — and ``invoke_vanta`` opens the log ``"w"``.
+        The name is offset by the rows already on disk for the key instead (PR
+        review item #1), so the predecessor's bare-named log and sidecar survive
+        and the re-run lands on ``.retry1``.
+        """
+        manifest = self._seed_done(tmp_path, "InfraFailure", "old")
+        job = _job(prep(root=tmp_path / "root"))
+        paths = self._paths(tmp_path)
+        stem = runner_mod._stem(job.key)
+        # The superseded row's own artefacts: the bare names its row records.
+        paths.logs.mkdir(parents=True, exist_ok=True)
+        paths.oracle.mkdir(parents=True, exist_ok=True)
+        (paths.logs / f"{stem}.log").write_text("old run\n", encoding="utf-8")
+        (paths.oracle / f"{stem}.json").write_text('{"old": true}\n', encoding="utf-8")
+
+        invoke, calls = _scripted_outcome(tmp_path, ["Rejected"])
+        monkeypatch.setattr(runner_mod, "invoke_vanta", invoke)
+        monkeypatch.setattr(
+            oracle_mod, "grade",
+            lambda **kwargs: oracle_mod.OracleResult(apply_ok=True, apply_detail="applied"),
+        )
+        record = runner_mod.run_job(
+            job=job, paths=paths, manifest=manifest,
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20", rerun_infra=True,
+        )
+        assert calls["n"] == 1
+        assert record["verdict"] == "Rejected"
+        # The predecessor's bare-named evidence is untouched...
+        assert (paths.logs / f"{stem}.log").read_text(encoding="utf-8") == "old run\n", (
+            "the re-run overwrote the log its superseded row still records"
+        )
+        assert (
+            paths.oracle / f"{stem}.json"
+        ).read_text(encoding="utf-8") == '{"old": true}\n', (
+            "the re-run overwrote the oracle sidecar its superseded row still records"
+        )
+        # ...and the re-run wrote its own, distinct names.
+        assert (paths.logs / f"{stem}.retry1.log").is_file()
+        assert (paths.oracle / f"{stem}.retry1.json").is_file()
+
+    def test_without_the_flag_a_predecessor_is_not_named(self, tmp_path, monkeypatch):
+        """`supersedes` is a claim about a re-run, so it is written only when one happened.
+
+        `run_job` replaces the row the CALLER asked it to re-run; with the flag off
+        the caller would have skipped the key, so a `run_job` reached without it must
+        write a plain row that names no predecessor.
+        """
+        manifest = self._seed_done(tmp_path, "InfraFailure", "old")
+        job = _job(prep(root=tmp_path / "root"))
+        invoke, calls = _scripted_outcome(tmp_path, ["Rejected"])
+        monkeypatch.setattr(runner_mod, "invoke_vanta", invoke)
+        monkeypatch.setattr(
+            oracle_mod, "grade",
+            lambda **kwargs: oracle_mod.OracleResult(apply_ok=True, apply_detail="applied"),
+        )
+        record = runner_mod.run_job(
+            job=job, paths=self._paths(tmp_path), manifest=manifest,
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        # The predecessor here is neither inconclusive nor explicitly re-run, so it
+        # is left unnamed — the shape every row had before item E.
+        assert "supersedes" not in record
+
+
 class TestOracleBestAttempt:
     """M3 item H — the best attempt's grade, recorded BESIDE the last attempt's.
 
@@ -33009,7 +33366,7 @@ class TestRunBatchLoop:
 
         def stub(
             *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
-            scheduler=None,
+            scheduler=None, rerun_infra=None,
         ):
             calls.append(job)
             record = self._row(tmp_path, job)
@@ -33080,7 +33437,7 @@ class TestRunBatchLoop:
         return preps, entries, split, calls, tmp_path / "batch"
 
     def _run(self, preps, entries, split, batch_dir, *, show_hints=False, max_spend_usd=None,
-             pause_usd=None, preflight=None, max_attempts=4):
+             pause_usd=None, preflight=None, max_attempts=4, rerun_infra=False):
         return runner_mod.run_batch(
             batch_dir=batch_dir,
             batch_id="b1",
@@ -33096,6 +33453,7 @@ class TestRunBatchLoop:
             max_spend_usd=max_spend_usd,
             pause_usd=pause_usd,
             preflight=preflight,
+            rerun_infra=rerun_infra,
         )
 
     @staticmethod
@@ -33113,7 +33471,7 @@ class TestRunBatchLoop:
 
         def stub(
             *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
-            scheduler=None,
+            scheduler=None, rerun_infra=None,
         ):
             budgets.append((job.arm, max_attempts))
             record = self._row(tmp_path, job)
@@ -33156,7 +33514,7 @@ class TestRunBatchLoop:
 
         def stub(
             *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
-            scheduler=None,
+            scheduler=None, rerun_infra=None,
         ):
             calls.append(job)
             record = self._row(tmp_path, job)
@@ -33536,13 +33894,78 @@ class TestRunBatchLoop:
         assert not manifest_mod.Manifest(tmp_path / "batch-flaky").state().get(schedule[2])
 
 
+    # -- item E: --rerun-infra ---------------------------------------------
+    def _seed_done_infra(self, batch_dir, *, config="baseline"):
+        """A DONE `InfraFailure` row for bug 1's repair of ``config``, as a resume finds it."""
+        manifest = manifest_mod.Manifest(batch_dir)
+        key = manifest_mod.job_key(
+            batch_id="b1", bug="Demo/1", config=config, mode=runner_mod.REPAIR, seed=0
+        )
+        manifest.append(
+            {
+                "key": key,
+                "bug": "Demo/1",
+                "config": config,
+                "mode": runner_mod.REPAIR,
+                "seed": 0,
+                "session_id": f"Demo_1-{config}-infra",
+                "verdict": "InfraFailure",
+                "label": "infra_failure",
+                "oracle": {"apply_ok": True, "patch_good": False, "apply_detail": "", "error": ""},
+                "candidate": None,
+                "artifacts": {"final_patch": None, "session_dir": None, "oracle_json": None},
+            }
+        )
+        manifest.mark(key, manifest_mod.DONE)
+        return key
+
+    def test_rerun_infra_re_runs_a_done_infra_failure_and_the_gate_passes(
+        self, tmp_path, monkeypatch
+    ):
+        """Item E — under `--rerun-infra` the row is claimed again, and a clean re-run gates.
+
+        [WHY] The flag exists because a `done` `InfraFailure` is exactly the row a
+        plain resume skips forever: the environment failed, the cursor says done, and
+        the next run walks past it. With the flag the key is claimed, `run_job` runs
+        again, and — the re-run being clean here — the wave's rows pass the gate.
+        """
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        key = self._seed_done_infra(batch_dir)
+        code, _ = self._run(preps, entries, split, batch_dir, rerun_infra=True)
+        assert key in {job.key for job in calls}, "the InfraFailure row must be re-run"
+        assert code == 0, "a clean re-run leaves a gate-passing row"
+
+    def test_without_rerun_infra_a_done_infra_failure_is_skipped(self, tmp_path, monkeypatch):
+        """Off by default: the flag is what re-runs the row, and nothing else does."""
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        key = self._seed_done_infra(batch_dir)
+        self._run(preps, entries, split, batch_dir)
+        assert key not in {job.key for job in calls}, "without the flag it is skipped"
+
+    def test_rerun_infra_leaves_a_done_served_row_alone(self, tmp_path, monkeypatch):
+        """No other `done` row is ever re-run, flag or not — only `InfraFailure`."""
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        manifest = manifest_mod.Manifest(batch_dir)
+        key = manifest_mod.job_key(
+            batch_id="b1", bug="Demo/2", config="vanta", mode=runner_mod.REPAIR, seed=0
+        )
+        manifest.append(
+            {"key": key, "bug": "Demo/2", "config": "vanta", "mode": runner_mod.REPAIR,
+             "seed": 0, "session_id": "served", "verdict": "Rejected",
+             "label": "true_reject", "oracle": {"apply_ok": True},
+             "candidate": None, "artifacts": {"final_patch": None}}
+        )
+        manifest.mark(key, manifest_mod.DONE)
+        self._run(preps, entries, split, batch_dir, rerun_infra=True)
+        assert key not in {job.key for job in calls}, "a measured row is never re-run"
+
     # -- M3 item S6: the scheduler and the pooled phase ---------------------
     def _capturing_stub(self, tmp_path, calls, blocks):
         """A `run_job` that also records the `scheduler` block it was asked for."""
 
         def stub(
             *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
-            scheduler=None,
+            scheduler=None, rerun_infra=None,
         ):
             calls.append(job)
             blocks.append(scheduler)
@@ -33759,7 +34182,7 @@ class TestRunBatchLoop:
 
         def stub(
             *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
-            scheduler=None,
+            scheduler=None, rerun_infra=None,
         ):
             # Row 1: only once row 0 is committed to the wait, raise.
             assert in_the_slot_for_row_zero.wait(timeout=10)
@@ -33909,7 +34332,7 @@ class TestQueue:
 
         def stub(
             *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
-            scheduler=None,
+            scheduler=None, rerun_infra=None,
         ):
             calls.append(job)
             if on_call is not None:
@@ -41947,7 +42370,7 @@ class TestFrozenConfig:
 
     def test_the_committed_config_loads_and_validates(self):
         config = frozen_mod.load()
-        assert config.name == "v1-m3.1"
+        assert config.name == "v1-m3.2"
         assert len(config.sha256) == 64
         assert config.sha256 == config.sha256.lower()
         # The two kinds of `[env]` statement: a literal the harness applies, and
@@ -42243,7 +42666,7 @@ class TestFrozenConfigResolution:
         config = self._config()
         block, _ = frozen_mod.resolve(config, environ={}, allow_override=False)
         assert block["config_hash"] == config.sha256
-        assert block["config_path"] == "configs/v1-m3.1.toml"
+        assert block["config_path"] == "configs/v1-m3.2.toml"
 
 
 class TestFrozenConfigWiring:
@@ -42441,7 +42864,7 @@ class TestPrepareFrozenConfig:
         assert payload["n_ctx"] == 262144
         assert payload["n_ctx_source"] == "VANTA_LLM_CONTEXT_TOKENS"
         # Q3 — the configuration block is recorded, the same four keys as a row.
-        assert payload["config_path"] == "configs/v1-m3.1.toml"
+        assert payload["config_path"] == "configs/v1-m3.2.toml"
         assert payload["config_hash"] == frozen_mod.load().sha256
         assert payload["config_override"] is False
         assert payload["config_overrides"] == []

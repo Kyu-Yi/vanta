@@ -7,9 +7,11 @@
 // and answers a single question: does this candidate resolve the issue? It is
 // the study's "LLM-as-judge" comparison against the test-driven arms, so it is
 // deliberately NOT a pass/fail test run — no tool use, no execution — and its
-// verdict is recorded under its own tokens (`JudgeApproved`/`JudgeRejected`/
-// `JudgeFailed`) rather than borrowed from the test-driven ones, so the log
-// always says which mechanism reached the answer.
+// verdict is recorded under its own tokens (`JudgeApproved`/`JudgeRejected`)
+// rather than borrowed from the test-driven ones, so the log always says which
+// mechanism reached the answer. An answer that cannot be read is its own
+// recorded outcome as well (`NeedsReview` with `stop_reason=model_output_invalid`,
+// v1-m3.2 item B), never a verdict the model did not give.
 //
 // [VANTA-WHY] The judge is shown the SAME context selection and budget the
 // `vanta` review arm is (plans/M3-plan.md item 7's fairness rule): the driver
@@ -190,8 +192,9 @@ pub fn judge_prompt_hash() -> String {
 // [VANTA-WHY] An enum rather than a free string, so an unknown `verdict` value
 // is a PARSE error and takes the retry path: "the model said something we cannot
 // read as a verdict" is a different fact from "the model approved", and folding
-// the first into either verdict would record a decision nobody made. Two failed
-// attempts end the run as `JudgeFailed`.
+// the first into either verdict would record a decision nobody made. Attempts
+// that still cannot be read end the run `NeedsReview` with
+// `stop_reason=model_output_invalid` (v1-m3.2 item B), never as a verdict.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum JudgeVerdict {
@@ -233,17 +236,22 @@ pub struct JudgeResponse {
 //
 // [VANTA-WHY] M3 item 7 — the two failures need opposite handling, so they are
 // two types rather than one string. "The judge answered and its answer cannot be
-// read as a verdict" is the judge arm's own outcome (`JudgeFailed`, its own exit
-// code and its own bucket, counted and never retried as infrastructure). "The
-// call never produced an answer at all" is every other call site's failure and
-// ends the run as `InfraFailure`. Folding them together was the alternative: it
-// would either hide a genuinely broken candidate behind `infra_failure`, or
-// report a dead server as a verdict about the patch.
+// read as a verdict" is the MODEL's failure, not the machine's: v1-m3.2 item B
+// ends the run `NeedsReview` with `stop_reason=model_output_invalid` and the
+// candidate attached, so the row is graded instead of censored to `unobservable`,
+// and it is never retried or counted as infrastructure. ("The call never produced
+// an answer at all" is every other call site's failure and ends the run as
+// `InfraFailure`.) Folding them together was the alternative: it would either
+// hide a genuinely broken candidate behind `infra_failure`, or report a dead
+// server as a verdict about the patch. The `JudgeFailed` token (its own exit code
+// 4, its own `judge_failed` bucket) still names the pre-item-B outcome for the
+// rows already on disk and for the harness's mapping; no path mints it now.
 #[derive(Debug)]
 pub enum JudgeError {
     /// The judge did not answer with a readable verdict — malformed JSON after
-    /// the one retry, or an answer the server cut off at the cap so it was never
-    /// handed to the parser. This is item 7's `JudgeFailed`.
+    /// its retries, or an answer the server cut off at the cap so it was never
+    /// handed to the parser. The model DID answer: v1-m3.2 item B grades this as
+    /// a model-output failure (`NeedsReview`, `stop_reason=model_output_invalid`).
     Malformed(String),
     /// The call itself failed — an HTTP error, the run's deadline, a prompt that
     /// cannot fit the window. No verdict was ever attempted.
@@ -282,6 +290,15 @@ fn is_unreadable_answer(message: &str) -> bool {
 // third attempt would make the judge arm's call count depend on the invocation
 // rather than on the arm, which is exactly what the arm registry exists to
 // prevent.
+//
+// [VANTA-WHY] v1-m3.2 item C — the ONE exception is the failure a retry is FOR.
+// An answer the parser could not read raises this call's limit to
+// `max_attempts + PARSE_FAILURE_EXTRA_ATTEMPTS`, so a judge that cannot be read
+// sends FOUR requests, not two, the last two carrying the parser's own complaint
+// (`append_parse_correction`). Every other failure — a transport error, the
+// deadline, a prompt over the window, an answer cut off at the cap — keeps the
+// two, so "one call plus one retry" is still what this arm costs unless the
+// model answered with something unreadable.
 pub async fn judge_candidate(
     cfg: &LlmConfig,
     request: &JudgeRequest,

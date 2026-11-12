@@ -58,7 +58,9 @@ use crate::pipeline::patch::{
 };
 use crate::pipeline::safe_path::{confined_join, unsafe_relative_path_reason};
 use crate::pipeline::summary_escape::{encode_summary_path_list, encode_summary_value};
-use crate::pipeline::{BUDGET_EXHAUSTED, REVISE_BUDGET_PER_ATTEMPT, ReviseBudget};
+use crate::pipeline::{
+    BUDGET_EXHAUSTED, MODEL_OUTPUT_INVALID, REVISE_BUDGET_PER_ATTEMPT, ReviseBudget,
+};
 use crate::repo::Repo;
 use crate::session::{
     PatchAttemptId, SCHEMA_VERSION, SessionId, SessionLog, SessionRecord, TransitionRow,
@@ -2112,6 +2114,23 @@ pub async fn run(
     // must carry `apply_failed` for ITS OWN attempt — and the same list's length
     // is the run-level `apply_failed_attempts` counter.
     let mut apply_failed_attempt_indices: Vec<u32> = Vec::new();
+    // [VANTA-WHY] v1-m3.2 item #5 — the patch id of every attempt, IN THE
+    // GOVERNOR'S OWN ATTEMPT SPACE (index == attempt number), `None` for an
+    // attempt that produced no patch at all (its Creator answered with output the
+    // call could not read, or its patch never applied). A transition row names
+    // BOTH of its ends by attempt number, so resolving `from_attempt` /
+    // `to_attempt` needs an attempt-indexed map: `attempt_patch_ids` (above)
+    // holds only the REAL patches, in order, so an attempt that produced nothing
+    // shifts every later index and a row would name another attempt's patch — or
+    // read the wrong end as "no patch".
+    //
+    // [VANTA-WHY] Two lists rather than one because they answer two different
+    // questions and neither can be derived from the other without lying.
+    // `attempt_patch_ids` exists so `.last()` is the run's LAST PRODUCED patch —
+    // what `run.summary` and every terminal row carry as `patch_attempt_id` — and
+    // that value must be a real patch id: padding the list with a placeholder to
+    // keep indices aligned would report the placeholder as a real patch.
+    let mut attempt_patch_records: Vec<Option<PatchAttemptId>> = Vec::new();
     // [VANTA-WHY] Rows are flushed to vanta_sessions/{id}_transitions.jsonl as
     // each transition is computed, so a run that aborts mid-way (HarnessFailure
     // is terminal by design) still leaves every row it produced on disk. The
@@ -2306,13 +2325,13 @@ pub async fn run(
     // this, a dead LLM call propagated with `?` and the process exited with a
     // stack-style error and NO final decision on disk — the run was unreadable.
     let mut infra_failure_error: Option<String> = None;
-    // [VANTA-WHY] M3 item 7 — the judge's own failure text, carried out of the
-    // loop so a `JudgeFailed` run writes it to the session log. Deliberately NOT
-    // `infra_failure_error`: the machine was fine and the call was made — what
-    // came back could not be read as a verdict after the one retry — so this must
-    // not be reported, retried or counted as infrastructure. The raw answer
-    // itself is already on disk in the forensics file.
-    let mut judge_failed_error: Option<String> = None;
+    // [VANTA-WHY] v1-m3.2 item B — the failed model call's own text, carried out
+    // of the loop so a run ended by an unreadable answer (`stop_reason =
+    // model_output_invalid`) records WHY on its own phase row. Deliberately NOT
+    // `infra_failure_error`: the machine was fine and the call was made, and a
+    // reader retries an infrastructure fault but not a model that cannot answer
+    // this schema. `None` on every run that reached a verdict about the candidate.
+    let mut model_output_error: Option<String> = None;
     // [VANTA-WHY] M3 item 7 — the judge's verdict and reasoning, carried out of
     // the loop for the `run.judge` provenance row. `None` on every non-judge arm,
     // so that row exists only where a judge actually ran.
@@ -2358,6 +2377,20 @@ pub async fn run(
     // row. `None` means the guard has not run yet (and, for a plain judge arm,
     // never will). It runs ONCE, before the run's first sandbox.
     let mut import_guard_line: Option<String> = None;
+    // [VANTA-WHY] v1-m3.2 item #5 — how many attempts the Governor has spent when
+    // the loop ends. This is deliberately NOT `attempt_patch_ids.len()`: that list
+    // holds only the attempts that PRODUCED a patch, so a failed Creator (item B)
+    // or a failed apply shortens it by one while the Governor's budget still spent
+    // the attempt. `attempts_run` travels to the runner, which reads attempt
+    // `attempts_run` as the one the primary grading already describes (and skips
+    // it); under-counting it there re-grades an older attempt as if it were the
+    // last and drops the newest produced patch, and it mislabels the final graded
+    // attempt for a dataset row. `attempt` is read from the Governor at the top of
+    // each round, so `attempt + 1` is exactly the number of attempts started —
+    // which also stays right when the loop exits through a path that never calls
+    // `decide` (`AllTestsPassed` in repair mode) or through the deadline check
+    // above the read.
+    let mut attempts_spent: u32 = 0;
     let decision = 'attempts: loop {
         // [VANTA-WHY] §14.15 — the deadline is checked here as well as in the LLM
         // layer, and this is the check that turns "the calls stopped" into "the
@@ -2387,6 +2420,12 @@ pub async fn run(
             break 'attempts GovernorDecision::NeedsReview;
         }
         let attempt = governor.current_attempt();
+        // [VANTA-WHY] v1-m3.2 item #5 — this round is now STARTED, so the count of
+        // spent attempts is this attempt's number plus one, whatever the round goes
+        // on to do. Written here (not after `decide`) so every exit — the item-B
+        // failed Creator, the failed apply, a judge error, `MaxAttemptsReached` —
+        // reports the attempts the Governor really spent.
+        attempts_spent = attempt + 1;
 
         // [VANTA-WHY] §14.14 — this ATTEMPT's shared revise+simplify budget. Fresh
         // per attempt (a new round may revise again), shared by every test in it
@@ -2544,6 +2583,86 @@ pub async fn run(
                 }
                 Err(error) => {
                     let message = error.to_string();
+                    // [VANTA-WHY] v1-m3.2 item B — an exhausted Creator call that
+                    // failed on the MODEL'S OWN OUTPUT (a schema parse error, or an
+                    // answer cut off twice) is a FAILED ATTEMPT, never an
+                    // infrastructure failure: the machine was fine and the call was
+                    // made, so this attempt simply produced no patch. The loop spends
+                    // the attempt (the Governor advances the budget) and asks again
+                    // with the next round's seed; if it was the LAST attempt the run
+                    // ends `MaxAttemptsReached`, whose terminal arm attaches the run's
+                    // last PRODUCED tree, so the row is graded (`unresolved`) rather
+                    // than censored to `unobservable`. A transport error or a
+                    // `prompt_over_budget` refusal is a different claim about the run
+                    // and keeps `InfraFailure` below.
+                    if is_model_output_failure(&message) {
+                        println!(
+                            "  ↻ Creator produced no patch (the model's own output could not be \
+                             read) — spending this attempt and asking again"
+                        );
+                        // The attempt produced no patch, so it is a recorded hole in
+                        // the dataset exactly as a failed apply is. `previous_shared`
+                        // is deliberately untouched (the next attempt is still compared
+                        // against the last candidate anyone OBSERVED), and the rows are
+                        // persisted BEFORE the loop moves on so a budget that ends here
+                        // cannot lose them.
+                        governor.record_unobserved_attempt();
+                        persisted_transitions = flush_transition_rows(
+                            &governor,
+                            &mut transition_writer,
+                            persisted_transitions,
+                            &session_id,
+                            &attempt_patch_records,
+                            &apply_failed_attempt_indices,
+                            &mut metric_rows,
+                        )?;
+                        // [VANTA-WHY] v1-m3.2 CodeRabbit round 2 — the attempt is
+                        // SPENT (the Governor advanced on it) and `run.summary`
+                        // counts it, so the evidence must list it too; without this
+                        // the index read `"attempts": []` for a run whose Creator
+                        // never answered. The record carries this attempt's received
+                        // feedback and its Creator prompt hash, exactly as an
+                        // observed attempt's does, but names NO patch: none was
+                        // produced, and nothing here touches the attempt-to-patch
+                        // mapping or the comparison basis.
+                        record_unpatched_round(
+                            &mut fixed_round_records,
+                            attempt,
+                            prior_feedback.clone(),
+                            creator_prompt_hash.clone(),
+                        );
+                        // [VANTA-WHY] v1-m3.2 CodeRabbit round 2 — the re-ask must
+                        // state the shape the PARSER requires, not a different one:
+                        // the old "return ONLY the corrected unified diff" asked for
+                        // exactly the format `creator_generate_patch` rejects, so a
+                        // Creator that obeyed it was refused again and the recovery
+                        // round was spent for nothing. The contract is quoted from the
+                        // same text the system prompt ends with, so the two cannot
+                        // drift apart.
+                        prior_feedback = Some(format!(
+                            "The previous attempt produced no usable patch — the answer could \
+                             not be read as the CreatorResponse JSON object the parser \
+                             requires:\n{message}\nReturn ONLY a corrected JSON object. Its \
+                             required shape is:\n{contract}",
+                            contract = crate::agents::creator::CREATOR_OUTPUT_CONTRACT
+                        ));
+                        let decision =
+                            governor.decide(governor_mode, AttemptVerdict::Inconclusive, false);
+                        if decision == GovernorDecision::Continue {
+                            continue 'attempts;
+                        }
+                        // [VANTA-WHY] The LAST attempt's Creator produced nothing, so
+                        // the run ends `MaxAttemptsReached`. It is terminal, so it must
+                        // still leave a `final.patch`: the run's last PRODUCED tree, or
+                        // the original tree when nothing ever applied — the same rule
+                        // the failed-apply exit takes, which is what makes this row
+                        // `unresolved` rather than `unobservable`.
+                        final_patched_files = Some(final_patch_tree(
+                            last_applied_patched_files.as_ref(),
+                            &original_files,
+                        ));
+                        break 'attempts decision;
+                    }
                     // [VANTA-WHY] M3 item F5 — the pre-call check is a lower bound
                     // (it prices the two prompt strings; the guard also prices its
                     // own role wrappers), so the guard can still be the one that
@@ -2597,7 +2716,13 @@ pub async fn run(
         );
         println!("  Patch spans {} file(s)", patch_files.len());
         let patch_attempt_id = patch_attempt_id_for_patch(&patch_text);
+        // [VANTA-WHY] v1-m3.2 item #5 — `attempt_patch_ids` stays the run's list of
+        // REAL patches (`.last()` is `patch_attempt_id` on every terminal row and in
+        // `run.summary`, so a placeholder here would be reported as a patch that
+        // never existed); `attempt_patch_records` is the same id filed under this
+        // attempt's own number, which is what a transition row is stamped from.
         attempt_patch_ids.push(patch_attempt_id.clone());
+        record_attempt_patch(&mut attempt_patch_records, attempt, patch_attempt_id.clone());
         let testing_iteration_id = fresh_testing_iteration_id();
 
         // [VANTA-WHY] M3 item 9 — store the patch THIS attempt produced, so
@@ -2851,7 +2976,7 @@ pub async fn run(
                     &mut transition_writer,
                     persisted_transitions,
                     &session_id,
-                    &attempt_patch_ids,
+                    &attempt_patch_records,
                     &apply_failed_attempt_indices,
                     &mut metric_rows,
                 )?;
@@ -3069,19 +3194,29 @@ pub async fn run(
                     }
                 }
                 Err(JudgeError::Malformed(message)) => {
-                    // [VANTA-WHY] The machine was fine and the call was made; what
-                    // came back could not be read as a verdict after the one retry.
-                    // That is this arm's own outcome — its own exit code (4) and its
-                    // own bucket — and deliberately NOT `InfraFailure`, which would
-                    // report a broken candidate as a broken server (and be retried
-                    // as one). The raw answer is in the forensics file.
+                    // [VANTA-WHY] v1-m3.2 item B (PR #4 review) — an answer the
+                    // judge DID give and the parser could not read after its
+                    // retries is the MODEL's failure, not the machine's, so it takes
+                    // the model-output-invalid rule the Creator and Attacker arms
+                    // take: the candidate is attached exactly as the deadline exit
+                    // above attaches it (`final_patched_files = Some(patched_files)`)
+                    // and the run ends `NeedsReview` with
+                    // `stop_reason=model_output_invalid`, so the row is GRADED and
+                    // the wave gate passes it (§8.2). Before this, `Malformed` — the
+                    // only error an unreadable judge answer ever produces — ended as
+                    // `JudgeFailed` (exit 4) with NOTHING attached, which censored
+                    // the row to `unobservable` and halted the wave; the check in the
+                    // `Call` arm below could not help, because a parse failure never
+                    // reaches it. Every OTHER judge call error stays `InfraFailure`.
+                    stop_reason = Some(MODEL_OUTPUT_INVALID);
+                    model_output_error = Some(message);
                     println!(
-                        "  ✖ JUDGE FAILED — the judge did not return a readable verdict after \
-                         the one retry (the raw answer is in the forensics file); this is a \
-                         recorded judge failure, not an infrastructure fault"
+                        "\n  ⚠ The Judge did not return a readable verdict after its retries \
+                         — ending the run as NeedsReview ({MODEL_OUTPUT_INVALID}), not as an \
+                         infrastructure failure."
                     );
-                    judge_failed_error = Some(message);
-                    GovernorDecision::JudgeFailed
+                    final_patched_files = Some(patched_files);
+                    break 'attempts GovernorDecision::NeedsReview;
                 }
                 Err(JudgeError::Call(message)) => {
                     // [VANTA-WHY] §14.15 / Finding B (PR #4 review) — a call the
@@ -3106,6 +3241,26 @@ pub async fn run(
                         // uses (`final_patched_files = Some(patched_files)`), so the
                         // row is graded instead of censored to `unobservable` (which
                         // would halt the wave).
+                        final_patched_files = Some(patched_files);
+                        break 'attempts GovernorDecision::NeedsReview;
+                    }
+                    // [VANTA-WHY] v1-m3.2 item B — an exhausted Judge call that
+                    // failed on the MODEL'S OWN OUTPUT is not an infrastructure
+                    // failure: the machine was fine and the call was made, what came
+                    // back could not be read. The candidate is attached exactly as the
+                    // deadline exit above attaches it (`Some(patched_files)`) and the
+                    // run ends `NeedsReview` with `stop_reason=model_output_invalid`,
+                    // so the row is GRADED and the wave gate passes it — before this,
+                    // one unreadable judge answer was an `InfraFailure` that halted the
+                    // wave (§8.2). Every OTHER judge call error stays `InfraFailure`.
+                    if is_model_output_failure(&message) {
+                        stop_reason = Some(MODEL_OUTPUT_INVALID);
+                        model_output_error = Some(message.clone());
+                        println!(
+                            "\n  ⚠ The Judge did not return a readable verdict after its retries \
+                             — ending the run as NeedsReview ({MODEL_OUTPUT_INVALID}), not as an \
+                             infrastructure failure."
+                        );
                         final_patched_files = Some(patched_files);
                         break 'attempts GovernorDecision::NeedsReview;
                     }
@@ -3247,6 +3402,28 @@ pub async fn run(
                     // already applied (the Attacker runs after it), so this IS the
                     // run's most recent produced tree, and the row is graded rather
                     // than censored.
+                    final_patched_files = Some(patched_files);
+                    break 'attempts GovernorDecision::NeedsReview;
+                }
+                // [VANTA-WHY] v1-m3.2 item B — an exhausted Attacker call that
+                // failed on the MODEL'S OWN OUTPUT (a schema parse error, or an
+                // answer cut off twice) is not an infrastructure failure: the machine
+                // was fine and the call was made, what came back could not be read.
+                // The candidate patch has already applied (the Attacker runs after
+                // it), so `patched_files` IS this run's produced tree; attaching it
+                // and ending `NeedsReview` with `stop_reason=model_output_invalid`
+                // grades the row, where `InfraFailure` censored it to
+                // `unobservable` and halted the wave (§8.2). Placed AFTER the
+                // cut-off arm above, so a plain truncation still contributes no test.
+                // A transport error stays `InfraFailure` below.
+                Err(error) if is_model_output_failure(&error.to_string()) => {
+                    stop_reason = Some(MODEL_OUTPUT_INVALID);
+                    model_output_error = Some(error.to_string());
+                    println!(
+                        "\n  ⚠ The Attacker's answer could not be read after its retries — ending \
+                         the run as NeedsReview ({MODEL_OUTPUT_INVALID}); this round contributes \
+                         no test."
+                    );
                     final_patched_files = Some(patched_files);
                     break 'attempts GovernorDecision::NeedsReview;
                 }
@@ -4486,7 +4663,7 @@ pub async fn run(
             &mut transition_writer,
             persisted_transitions,
             &session_id,
-            &attempt_patch_ids,
+            &attempt_patch_records,
             &apply_failed_attempt_indices,
             &mut metric_rows,
         )?;
@@ -4938,12 +5115,17 @@ pub async fn run(
                 break decision;
             }
             GovernorDecision::JudgeFailed => {
-                // [VANTA-WHY] M3 item 7. The judge answered and its answer could
-                // not be read as a verdict after the one retry: this arm's own
-                // outcome (exit code 4, its own `judge_failed` bucket), never
-                // folded into `NeedsReview`, `Rejected` or `InfraFailure`. No
-                // verdict was reached, so nothing is attached; the raw answer is in
-                // the forensics file.
+                // [VANTA-WHY] M3 item 7, narrowed by v1-m3.2 item B. The token
+                // means "the judge answered and its answer could not be read as a
+                // verdict" — its own exit code (4) and its own `judge_failed`
+                // bucket, never folded into `NeedsReview`, `Rejected` or
+                // `InfraFailure`. No path in this loop returns it any more: an
+                // unreadable judge answer ends `NeedsReview` with
+                // `stop_reason=model_output_invalid` and the candidate attached (the
+                // `Malformed` arm), so this arm is the record of what the token
+                // MEANS for the rows already on disk and for the harness's mapping.
+                // Nothing is attached, because a `JudgeFailed` row carries no
+                // verdict about the candidate.
                 break decision;
             }
             GovernorDecision::PatchApplicationFailed => {
@@ -5140,6 +5322,40 @@ pub async fn run(
         })?;
     }
 
+    // [VANTA-WHY] v1-m3.2 item B — an unreadable model answer gets the same
+    // treatment as the deadline: its own phase row, so `stop_reason =
+    // model_output_invalid` comes with the text that earned it and is a fact in
+    // the log rather than something inferred from `final_decision=NeedsReview`
+    // plus an empty `needs_review_weak`. It is deliberately its OWN phase, not
+    // `run.infra_failure`: the machine was fine and the call was made — a reader
+    // retries an infrastructure fault, and this one is the model's answer, so
+    // reporting it as infrastructure is what turned one unreadable answer into a
+    // halted wave (§8.2). The raw answer itself is in the forensics file.
+    if let Some(error) = &model_output_error {
+        println!("  ✖ MODEL OUTPUT INVALID: {error}");
+        let one_line = error
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        session_log.append(SessionRecord {
+            session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
+            patch_attempt_id: attempt_patch_ids.last().cloned(),
+            testing_iteration_id: None,
+            test_id: None,
+            phase: "run.model_output_invalid".to_string(),
+            summary: format!(
+                "final_decision=NeedsReview stop_reason={MODEL_OUTPUT_INVALID} error={}",
+                one_line.chars().take(1000).collect::<String>()
+            ),
+            timestamp: now_iso(),
+            benchmark_instance: None,
+            benchmark_label: None,
+        })?;
+    }
+
     // [VANTA-WHY] M3 item 7 — the judge arm's verdict on its own phase row. The
     // verdict and its reasoning are the ONLY things a judge run concludes, and the
     // `JudgeApproved`/`JudgeRejected` decision token says which mechanism reached
@@ -5176,38 +5392,14 @@ pub async fn run(
         })?;
     }
 
-    // [VANTA-WHY] M3 item 7 — a `JudgeFailed` run records WHY the judge's answer
-    // could not be read after the one retry, exactly as `run.infra_failure` does
-    // for a dead call: the reason is a fact in the log rather than something a
-    // reader infers from `final_decision=JudgeFailed` alone. It is deliberately
-    // its OWN phase, not `run.infra_failure`: the machine was fine and the call
-    // was made, so this must not be read, retried or counted as infrastructure,
-    // and its exit code (4) is the arm's own. The raw answer is in the forensics
-    // file; this carries the parse/truncation diagnosis.
-    if let Some(error) = &judge_failed_error {
-        println!("  ✖ JUDGE FAILED: {error}");
-        let one_line = error
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        session_log.append(SessionRecord {
-            session_id: session_id.clone(),
-            schema_version: Some(SCHEMA_VERSION),
-            patch_attempt_id: attempt_patch_ids.last().cloned(),
-            testing_iteration_id: None,
-            test_id: None,
-            phase: "run.judge_failed".to_string(),
-            summary: format!(
-                "final_decision=JudgeFailed error={}",
-                one_line.chars().take(1000).collect::<String>()
-            ),
-            timestamp: now_iso(),
-            benchmark_instance: None,
-            benchmark_label: None,
-        })?;
-    }
+    // [VANTA-WHY] v1-m3.2 item B (PR #4 review) — there is no `run.judge_failed`
+    // row any more. The one failure that ever wrote it (an unreadable judge
+    // answer, `JudgeError::Malformed`) is now the model-output rule above, so it
+    // is recorded once, on `run.model_output_invalid`, with the parse/truncation
+    // diagnosis in the same `error=` field; a second row would restate that under
+    // a decision the run no longer reaches. The `JudgeFailed` token itself is
+    // unchanged (exit 4, its own `judge_failed` bucket) and still describes every
+    // row written before this.
 
     // [VANTA-WHY] "Fixed at attempt 1" is its own number, not a rate. A repair
     // that passes on the first candidate has no N→N+1 transition, so ECR/EIR
@@ -5224,7 +5416,14 @@ pub async fn run(
     // AttackerGenerated rows and the line still claimed there was no transition,
     // which is false about the file on disk. When rows exist, print the metric
     // they carry instead.
-    let attempts_run = attempt_patch_ids.len();
+    // [VANTA-WHY] v1-m3.2 item #5 — the attempt count is the Governor's spent
+    // attempts, not the number of patches produced: a run whose Creator failed on
+    // one attempt of four spent four, and its LAST produced patch is the one the
+    // primary grading describes. Reporting the patch count here made the runner
+    // treat an earlier attempt as the primary (and skip it) while grading the last
+    // produced tree separately, so the row's `attempts_run`, its per-attempt
+    // grading and its label disagreed about which attempt the verdict was about.
+    let attempts_run = attempts_spent as usize;
     let fixed_at_attempt_1 = decision == GovernorDecision::AllTestsPassed && attempts_run == 1;
 
     // ---- Per-call token accounting (plans/bugsinpy.md §4.3) ----
@@ -6845,6 +7044,22 @@ fn build_creator_feedback(
     fb
 }
 
+/// [VANTA-WHY] v1-m3.2 item B — whether a failed structured model call failed on
+/// the MODEL'S OWN OUTPUT rather than on the machine.
+///
+/// A schema parse error (`llm::PARSE_FAILURE_PREFIX`) or an answer the server cut
+/// off twice (`llm::TRUNCATED_TWICE_MARKER`) is a fact about what the model
+/// returned: the call was made, the server answered, and the answer could not be
+/// read. Every OTHER reason a structured call fails — an unreachable server, a
+/// refused connection, a 5xx after the client's own retries, a `prompt_over_budget`
+/// refusal — is a fact about the machine or the run's configuration, and stays
+/// `InfraFailure`. This is the ONE predicate the three arms (Creator, Attacker,
+/// Judge) share, so the class cannot drift between them.
+fn is_model_output_failure(message: &str) -> bool {
+    message.contains(crate::llm::PARSE_FAILURE_PREFIX)
+        || message.contains(crate::llm::TRUNCATED_TWICE_MARKER)
+}
+
 /// [VANTA-WHY] M3 item F5 — whether a Creator prompt can fit the run's context
 /// window, priced exactly as the run-time guard prices it
 /// (`llm::context_budget_exceeded`: prompt + completion + chat overhead > window).
@@ -6975,6 +7190,38 @@ fn open_fixed_round_record(
         "unchanged": unchanged,
     }));
     records.len() - 1
+}
+
+/// Record an attempt whose Creator produced NO patch, so the evidence lists every
+/// attempt the Governor counted.
+///
+/// [VANTA-WHY] v1-m3.2 CodeRabbit round 2 — a Creator call that exhausts its
+/// parse retries `continue`s to the next round BEFORE `open_fixed_round_record`
+/// runs (that call is what guards `previous_patch_text`), so the attempt owned no
+/// record at all: a K=4 run whose Creator never answered stored `"attempts": []`
+/// while `run.summary` said `attempts_run=4`, and the attempt's feedback and
+/// `creator_prompt_hash` were lost from the index. This is the record it should
+/// have had — the same keys as an observed attempt, with `patch` null because
+/// nothing was produced (a placeholder text here would be read as a candidate
+/// nobody made) and `unchanged` false. It deliberately does NOT advance
+/// `previous_patch_text`: the next attempt must still be compared against the
+/// last patch anyone OBSERVED, and this attempt observed nothing.
+fn record_unpatched_round(
+    records: &mut Vec<serde_json::Value>,
+    attempt_index: u32,
+    feedback: Option<String>,
+    creator_prompt_hash: Option<String>,
+) {
+    records.push(serde_json::json!({
+        "attempt": attempt_index + 1,
+        "applied": false,
+        "passed": false,
+        "patch": null,
+        "tests": Vec::<String>::new(),
+        "feedback": feedback,
+        "creator_prompt_hash": creator_prompt_hash,
+        "unchanged": false,
+    }));
 }
 
 fn read_json_value_from_debug(path: &Path) -> Option<serde_json::Value> {
@@ -7237,18 +7484,20 @@ fn append_derived_rows(
 
 /// Append every transition not yet persisted and return the new cursor.
 ///
-/// [VANTA-WHY] One definition, called from two places: the ordinary post-attempt
-/// flush, and the repair-mode failed-apply path (which must persist its censored
-/// rows BEFORE the loop continues, because if the budget is then exhausted the
-/// ordinary flush never runs again and the hole would be lost). The rows are
-/// also kept in memory so the live EIR/ECR print derives from the same rows with
-/// the one shared function rather than a second rule.
+/// [VANTA-WHY] One definition, called from THREE places: the ordinary
+/// post-attempt flush, the repair-mode failed-apply path (which must persist its
+/// censored rows BEFORE the loop continues, because if the budget is then
+/// exhausted the ordinary flush never runs again and the hole would be lost),
+/// and item B's failed-Creator path (which spends the attempt with no patch and
+/// must persist its censored rows for the same reason). The rows are also kept
+/// in memory so the live EIR/ECR print derives from the same rows with the one
+/// shared function rather than a second rule.
 fn flush_transition_rows(
     governor: &Governor,
     writer: &mut TransitionWriter,
     persisted: usize,
     session_id: &SessionId,
-    attempt_patch_ids: &[PatchAttemptId],
+    attempt_patch_records: &[Option<PatchAttemptId>],
     apply_failed_attempts: &[u32],
     metric_rows: &mut Vec<TransitionRow>,
 ) -> Result<usize, io::Error> {
@@ -7259,7 +7508,7 @@ fn flush_transition_rows(
     let rows: Vec<TransitionRow> = transitions[persisted..]
         .iter()
         .map(|t| {
-            stamp_transition_row(t, session_id, attempt_patch_ids, apply_failed_attempts)
+            stamp_transition_row(t, session_id, attempt_patch_records, apply_failed_attempts)
         })
         .collect();
     writer.append(&rows)?;
@@ -7267,18 +7516,55 @@ fn flush_transition_rows(
     Ok(transitions.len())
 }
 
+/// File `attempt`'s patch id under the attempt's OWN number.
+///
+/// [VANTA-WHY] v1-m3.2 item #5 — a transition row names both of its ends by
+/// Governor attempt NUMBER (`from_attempt`/`to_attempt`), so resolving them needs
+/// a map keyed that way. `attempt_patch_ids` is a list of the patches the run
+/// PRODUCED, which is index-aligned with the attempt numbers only while every
+/// attempt produces one: after an attempt with no patch (its Creator's answer
+/// could not be read) the list is one shorter than the attempt space, and a row
+/// asking for attempt N would be handed attempt N+1's patch — or, at the end,
+/// nothing, which reads as "that patch never existed" for an attempt that did
+/// produce one.
+///
+/// [VANTA-WHY] Growth, not a placeholder: indices below `attempt` that were never
+/// recorded are filled with `None`, which is the honest value for "this attempt
+/// produced no patch". Nothing is ever written into `attempt_patch_ids` for such
+/// an attempt, because every terminal row and `run.summary` carries
+/// `attempt_patch_ids.last()` as the run's `patch_attempt_id`.
+fn record_attempt_patch(
+    records: &mut Vec<Option<PatchAttemptId>>,
+    attempt: u32,
+    patch_attempt_id: PatchAttemptId,
+) {
+    let index = attempt as usize;
+    if records.len() <= index {
+        records.resize(index + 1, None);
+    }
+    records[index] = Some(patch_attempt_id);
+}
+
 fn stamp_transition_row(
     transition: &AttemptTransition,
     session_id: &SessionId,
-    attempt_patch_ids: &[PatchAttemptId],
+    attempt_patch_records: &[Option<PatchAttemptId>],
     apply_failed_attempts: &[u32],
 ) -> TransitionRow {
-    let from_id = attempt_patch_ids
+    // [VANTA-WHY] v1-m3.2 item #5 — look the id up in the GOVERNOR'S attempt
+    // space, and keep `None` when the attempt at that number produced no patch.
+    // `record_attempt_patch` pads every gap with `None`, so the map never hands a
+    // row the id of a different attempt. A number past the end of the map is an
+    // attempt that has not run (or a trailing patchless attempt, which pads
+    // nothing) and is `None` for the same reason.
+    let from_id = attempt_patch_records
         .get(transition.from_attempt as usize)
-        .cloned();
-    let to_id = attempt_patch_ids
+        .cloned()
+        .flatten();
+    let to_id = attempt_patch_records
         .get(transition.to_attempt as usize)
-        .cloned();
+        .cloned()
+        .flatten();
     // [VANTA-WHY] The flag belongs to the NEWER side: the row exists because that
     // attempt's patch never reached the tree. Taken from the attempt index rather
     // than a run-level bool so a later successful attempt's rows are not tainted
@@ -7943,6 +8229,7 @@ mod tests {
         harness_error_log_line,
         harness_infrastructure_collapse,
         is_judge_site,
+        is_model_output_failure,
         ledger_text,
         modified_test_config_records, native_gate_cap, NativeGateFacts, native_setup_failure,
         native_vacuous_exit,
@@ -7950,6 +8237,7 @@ mod tests {
         open_fixed_round_record,
         patch_attempt_id_for_patch,
         prompt_over_budget_reason,
+        record_attempt_patch,
         record_new_static_findings,
         refuse_reasoning_budget_on_judge_arm,
         rejection_signal_message, render_committed_test_file, require_clean_target_repo_for_open_pr,
@@ -9183,7 +9471,10 @@ mod tests {
             test_intent: TestIntent::BehaviorPreservation,
         };
         let session_id = SessionId::new("apply-failed-test");
-        let attempt_ids = vec![PatchAttemptId::new("p0"), PatchAttemptId::new("p1")];
+        let attempt_ids = vec![
+            Some(PatchAttemptId::new("p0")),
+            Some(PatchAttemptId::new("p1")),
+        ];
 
         let row = stamp_transition_row(&transition, &session_id, &attempt_ids, &[1]);
         assert!(row.apply_failed, "the failed-apply attempt must be marked");
@@ -10056,6 +10347,13 @@ mod tests {
     // all eight: each must assign `final_patched_files` between its
     // `stop_reason = Some(BUDGET_EXHAUSTED)` and its break, so a graded deadline row
     // can never regress to an ungraded one.
+    //
+    // [VANTA-WHY] v1-m3.2 item B — the Attacker's and the Judge's exhausted
+    // model-output arms take the SAME `NeedsReview` shape on the SAME rule
+    // (attach the produced tree, or the row is censored and the wave halts), so
+    // they are pinned here too. They are counted separately from the eight: the
+    // `budget_exhausted` count must stay eight, exactly the deadline exits, or a
+    // model-output exit could be mistaken for "the run ran out of clock".
     #[test]
     fn every_deadline_exit_attaches_the_last_produced_tree() {
         let source = include_str!("driver.rs");
@@ -10063,25 +10361,35 @@ mod tests {
         // literal it counts (`include_str!` reads the whole file, tests included).
         let brk = concat!("break 'attempts GovernorDecision::NeedsReview", ";");
         let budget = concat!("stop_reason = Some(BUDGET_EXHAUSTED)", ";");
+        let model_output = concat!("stop_reason = Some(MODEL_OUTPUT_INVALID)", ";");
         let attach = concat!("final_patched_files = ", "");
         let breaks: Vec<usize> = source.match_indices(brk).map(|(i, _)| i).collect();
         assert_eq!(
             breaks.len(),
-            8,
+            11,
             "this file must carry exactly the eight deadline `NeedsReview` breaks \
              (attempt top, Creator refusal, Attacker refusal, two clamp skips, \
-             clamp-cut original, judge-suite deadline, judge-call refusal)"
+             clamp-cut original, judge-suite deadline, judge-call refusal) plus the \
+             three v1-m3.2 model-output breaks (judge Malformed, judge Call, \
+             Attacker)"
+        );
+        assert_eq!(
+            source.match_indices(budget).count(),
+            8,
+            "the `budget_exhausted` exits are the eight deadline ones; an item-B \
+             model-output exit must not be counted as a deadline exit"
         );
         let mut prev = 0usize;
         for (n, &b) in breaks.iter().enumerate() {
             let segment = &source[prev..b];
             assert!(
-                segment.contains(budget),
-                "deadline break #{n} does not follow a budget_exhausted stop_reason"
+                segment.contains(budget) || segment.contains(model_output),
+                "break #{n} does not follow a `budget_exhausted` or a \
+                 `model_output_invalid` stop_reason"
             );
             assert!(
                 segment.contains(attach),
-                "deadline break #{n} skips the terminal patch attach, so the runner \
+                "break #{n} skips the terminal patch attach, so the runner \
                  would censor the oracle and the wave gate would halt on this row"
             );
             prev = b + brk.len();
@@ -10131,6 +10439,124 @@ mod tests {
             source.matches(pre_apply).count(),
             2,
             "exactly the two pre-apply deadline exits read `last_applied_patched_files`"
+        );
+    }
+
+    // [VANTA-WHY] v1-m3.2 item B — the ONE predicate that decides whether an
+    // exhausted structured call is the MODEL's mistake (`NeedsReview`, graded) or
+    // the MACHINE's (`InfraFailure`, gated). Only the two markers the retry loop
+    // puts on a reply it READ and could not use count. Everything else — an
+    // unreachable server, a 5xx after the client's own retries, a prompt the
+    // pre-flight guard refused — stays infrastructure, because ending those
+    // `NeedsReview` would grade a run in which the call never happened.
+    #[test]
+    fn only_the_model_output_markers_classify_as_a_model_output_failure() {
+        use crate::llm::{PARSE_FAILURE_PREFIX, TRUNCATED_TWICE_MARKER};
+
+        // The schema-parse arm: the server answered, the answer did not satisfy
+        // the type. This is the arm the wave-1 rows died on.
+        assert!(is_model_output_failure(&format!(
+            "structured_call_with_retry 5/5 attempts FAILED. Last:\nattempt 5 \
+             {PARSE_FAILURE_PREFIX}: unknown variant `not_a_label`, expected one of \
+             `Reproduction`, `EdgeCase`"
+        )));
+        // The cut-off-twice arm: two answers the server stopped at `max_tokens`.
+        assert!(is_model_output_failure(&format!(
+            "structured_call_with_retry 3/3 attempts FAILED. Last:\nattempt 3 TRUNCATED: … \
+             ({TRUNCATED_TWICE_MARKER})"
+        )));
+
+        // The machine. A transport failure is NOT the model's output, even though
+        // it exhausts the same budget and reaches the same error string.
+        assert!(
+            !is_model_output_failure(
+                "Creator LLM call failed: attempt 3 HTTP err: HTTP ERROR 503 from \
+                 http://127.0.0.1:8080/v1/chat/completions. Body snippet: overloaded"
+            ),
+            "an unreachable or 5xx server is the machine, not the model, and must stay \
+             InfraFailure"
+        );
+        assert!(
+            !is_model_output_failure(
+                "prompt_over_budget: the Creator prompt does not fit — a prompt that cannot \
+                 fit is arithmetic decided before the call, not the model's answer"
+            ),
+            "a `prompt_over_budget` refusal never reached the model, so it must stay \
+             InfraFailure"
+        );
+        // The deadline refusal is neither: it is the run's own clock.
+        assert!(
+            !is_model_output_failure(&format!(
+                "the run's wall-clock deadline passed before this `attacker_generate` call \
+                 could start ({})",
+                crate::llm::DEADLINE_EXCEEDED_MARKER
+            )),
+            "a deadline refusal is `budget_exhausted`, which is its own exit and keeps its \
+             own stop_reason"
+        );
+    }
+
+    // [VANTA-WHY] v1-m3.2 item B — the Creator is the ONE model-output arm that
+    // must NOT take the `NeedsReview` exit the other two take. The Attacker and the
+    // Judge both run AFTER the candidate applied, so `patched_files` is a tree they
+    // can attach and `NeedsReview` grades the row. The Creator runs FIRST, so an
+    // exhausted call produced no patch at all — this attempt decided nothing, and
+    // the only honest reading is a FAILED ATTEMPT: record the hole, ask again with
+    // the next round's seed, and let the Governor advance the budget. On the LAST
+    // attempt that verdict is `MaxAttemptsReached`, whose terminal arm attaches the
+    // run's last PRODUCED tree — the original tree when nothing ever applied — so
+    // `final.patch` is written and the row is graded (`unresolved`) rather than
+    // censored to `unobservable` (which would halt the wave, §8.2). A transport
+    // error or a `prompt_over_budget` refusal is a different claim about the run and
+    // keeps `InfraFailure` in the fallback BELOW this arm.
+    #[test]
+    fn the_creators_exhausted_model_output_is_a_failed_attempt_not_an_infrastructure_failure() {
+        let source = include_str!("driver.rs");
+        // The Creator's arm is the FIRST `is_model_output_failure(&message)` in the
+        // file (the Judge's is the second). Bound it by the transport / over-budget
+        // fallback that must stay AFTER it — a machine fault never reaches this arm.
+        let marker = source
+            .find("if is_model_output_failure(&message) {")
+            .expect("the Creator call arm must classify an exhausted model-output error");
+        let transport = source
+            .find("infra_failure_error = Some(if message")
+            .expect("the Creator's transport / prompt-over-budget fallback must still exist");
+        assert!(
+            marker < transport,
+            "the model-output arm must be matched BEFORE the transport fallback, or an \
+             unreachable server would be read as the model's own bad answer"
+        );
+        let branch = &source[marker..transport];
+        assert!(
+            branch.contains("governor.record_unobserved_attempt();"),
+            "an exhausted Creator produced no patch, so the attempt must be recorded as a \
+             hole in the dataset exactly as a failed apply is"
+        );
+        assert!(
+            branch.contains("AttemptVerdict::Inconclusive"),
+            "this attempt produced nothing to observe, so it is `Inconclusive` to the Governor"
+        );
+        assert!(
+            branch.contains("continue 'attempts;"),
+            "a non-last attempt must go round again, with the seed advanced"
+        );
+        assert!(
+            branch.contains("final_patch_tree("),
+            "the LAST attempt must attach the run's last produced tree (the original tree \
+             when nothing ever applied), so the `MaxAttemptsReached` row is graded, not censored"
+        );
+        assert!(
+            branch.contains("break 'attempts decision;"),
+            "the last attempt must break with the Governor's OWN decision \
+             (`MaxAttemptsReached`), not a hard-coded verdict"
+        );
+        assert!(
+            !branch.contains("infra_failure_error"),
+            "the model-output arm must never set an infrastructure failure"
+        );
+        assert!(
+            !branch.contains("GovernorDecision::InfraFailure"),
+            "the model-output arm must never end the run `InfraFailure`"
         );
     }
 

@@ -55,17 +55,20 @@ pub const CREATOR_PROMPT_VERSION: &str = "3";
 // only reachable copy was outside the function, so a hash — or a test — could
 // have been computed over text the model never saw. This is the same move the
 // A10 follow-up made for the Attacker's simplify prompt.
-pub const CREATOR_SYSTEM_PROMPT: &str = r#"You are Vanta Creator. Before writing any patch, THINK BRIEFLY (under 200 words) about how the change will be verified: what tests would pass/fail, what properties must hold. Then output the fix.
-
-IMPORTANT: Keep your reasoning SHORT. The bulk of your output budget must go to the JSON answer in content.
-
-YOU MUST output valid JSON. NO EXCEPTIONS.
-  1. First character of content MUST be '{'
-  2. Last character MUST be the matching '}'
-  3. No prose, no markdown fences
-  4. Do not stop until the full '}' is written
-
-How to provide the fix in patch_text — CHOOSE ONE:
+/// The Creator's output contract — the `patch_text` formats (Option A full
+/// source / Option B SEARCH-REPLACE blocks) and the required JSON schema — as a
+/// macro, so the system prompt below and the driver's recovery feedback read one
+/// text.
+///
+/// [VANTA-WHY] v1-m3.2 CodeRabbit round 2 — the driver's recovery feedback after
+/// a Creator call that exhausted its parse retries used to ask for "ONLY the
+/// corrected unified diff". That contradicts the parser: `creator_generate_patch`
+/// deserialises a `CreatorResponse` JSON object, so a bare diff is rejected
+/// again and the recovery round is spent for nothing. The two texts must
+/// therefore be ONE, so they cannot drift apart again.
+macro_rules! creator_output_contract {
+    () => {
+        r#"How to provide the fix in patch_text — CHOOSE ONE:
 
 OPTION A (preferred for files under ~200 lines): Output the COMPLETE patched file content.
   Write the entire file as it should look after the fix, from the first line to the last.
@@ -97,7 +100,29 @@ Required JSON schema:
   "explanation":   string — 1 sentence,
   "files_touched": array of strings,
   "confidence":    number 0.0 to 1.0
-}"#;
+}"#
+    };
+}
+
+/// The text [`CREATOR_SYSTEM_PROMPT`] ends with, published so a recovery
+/// instruction can restate the exact contract the parser requires rather than a
+/// paraphrase that might contradict it (see `creator_output_contract!`).
+pub const CREATOR_OUTPUT_CONTRACT: &str = creator_output_contract!();
+
+pub const CREATOR_SYSTEM_PROMPT: &str = concat!(
+    r#"You are Vanta Creator. Before writing any patch, THINK BRIEFLY (under 200 words) about how the change will be verified: what tests would pass/fail, what properties must hold. Then output the fix.
+
+IMPORTANT: Keep your reasoning SHORT. The bulk of your output budget must go to the JSON answer in content.
+
+YOU MUST output valid JSON. NO EXCEPTIONS.
+  1. First character of content MUST be '{'
+  2. Last character MUST be the matching '}'
+  3. No prose, no markdown fences
+  4. Do not stop until the full '}' is written
+
+"#,
+    creator_output_contract!(),
+);
 
 /// The Verify-First prompt the call site sends.
 ///

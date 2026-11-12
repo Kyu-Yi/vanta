@@ -215,11 +215,25 @@ class RunnerError(RuntimeError):
 # the session outcome and the failure record must not be able to disagree about the
 # spelling of the same condition.
 REPORT_UNREADABLE = "report_unreadable"
-INFRA_VERDICT = "InfraFailure"
+INFRA_VERDICT = manifest_mod.INFRA_VERDICT
 INFRA_LABEL = "infra_failure"
 """``label_for(INFRA_VERDICT, …)`` — pinned by a test so the failure record and the
 manifest's label table cannot drift apart about what an infrastructure failure is
 called."""
+
+ROW_RETRY_EXTRA = 2
+"""Item D — how many EXTRA attempts a row that ends ``InfraFailure`` is given.
+
+[VANTA-WHY] An ``InfraFailure`` is a statement about the environment, not the
+model, and the environment is exactly the thing a retry can change: a dropped
+connection, a 5xx after the call's own retries, a sandbox that failed to spawn.
+So a row that ends ``InfraFailure`` is re-run up to this many extra times (at most
+``1 + ROW_RETRY_EXTRA`` = 3 runs) before its last result is recorded. After item B
+an exhausted model-output call is never ``InfraFailure``, so it is never
+auto-retried here — and no row that ended with any OTHER verdict is retried at all.
+Each attempt is its own manifest row (so it counts toward the spend cap) and every
+earlier one is superseded with reason ``auto-retry``.
+"""
 
 
 class ReportUnreadable(RunnerError):
@@ -3287,6 +3301,7 @@ def run_job(
     disk_mb: int,
     python_version: str,
     scheduler: Optional[dict[str, Any]] = None,
+    rerun_infra: bool = False,
 ) -> Optional[dict[str, Any]]:
     """Execute one job end to end, or return ``None`` if it left no evidence.
 
@@ -3300,8 +3315,131 @@ def run_job(
     ``None`` for a caller that had no budget. It is passed straight through to
     :func:`build_record`, which is the only place with the run's summary in hand;
     ``None`` leaves the row exactly as it was before this item.
+
+    ``rerun_infra`` is item E's ``--rerun-infra``: the caller reached this key
+    despite a ``done`` row because that row's verdict is ``InfraFailure``, so the
+    row this run writes names it in ``supersedes`` with reason ``rerun-infra``.
+
+    [VANTA-WHY] Item D — a verdict of ``InfraFailure`` is a statement about the
+    ENVIRONMENT, not the model, and the environment is the one thing a retry can
+    change: a dropped connection, a 5xx after the call's own retries, a sandbox
+    that failed to spawn. So this is a loop: while the row about to be written
+    ends ``InfraFailure`` and it has retries left, the job is attempted again —
+    up to ``ROW_RETRY_EXTRA`` extra times — and the LAST attempt's row is the
+    job's. Each attempt appends its own row, so each counts toward the spend cap,
+    and every earlier one is named by the next attempt's ``supersedes`` with
+    reason ``auto-retry``; the final row carries ``row_retries=N``. Only
+    ``InfraFailure`` is retried here: every other verdict — including item B's
+    ``NeedsReview`` for an exhausted model-output call — ends the loop.
     """
     manifest.mark(job.key, RUNNING)
+    # The row this run replaces, if any, and why. An INCONCLUSIVE predecessor is
+    # item E6's re-run and keeps the shape that predates this item (no reason).
+    # Under `--rerun-infra` the predecessor is the DONE `InfraFailure` the caller
+    # asked to re-run, and the new row names it with reason `rerun-infra`. An
+    # in-run auto-retry (item D) replaces the attempt it just wrote, with reason
+    # `auto-retry`, inside the loop below.
+    supersede = manifest.find(job.key)
+    reason: Optional[str] = (
+        "rerun-infra"
+        if (
+            rerun_infra
+            and isinstance(supersede, dict)
+            and supersede.get("verdict") == INFRA_VERDICT
+        )
+        else None
+    )
+    row_retries = 0
+    # [VANTA-WHY] PR review item #1 — the artifact suffix is derived from how many
+    # rows are ALREADY on disk for this key, not from the in-run attempt index
+    # alone. A `--rerun-infra` run starts its own attempt index at 0, so an index-
+    # only suffix would hand the re-run the bare name the superseded row still
+    # records in `run_log`/`oracle_json` — `invoke_vanta` opens the log ``"w"``, so
+    # the retained row's evidence would be overwritten by its replacement. Counting
+    # the rows already recorded for the key (append-only, so this includes the row
+    # being superseded) makes every name distinct from every name already on disk,
+    # while a key's first run still counts 0 rows and keeps the bare name byte for
+    # byte. The count is taken ONCE, outside the loop: it is the same list
+    # `supersede` came from, and the in-run auto-retries added below are already
+    # offset by ``attempt``.
+    rows_recorded = sum(1 for row in manifest.records() if row.get("key") == job.key)
+    while True:
+        record = _run_job_attempt(
+            job=job,
+            paths=paths,
+            manifest=manifest,
+            vanta_bin=vanta_bin,
+            max_attempts=max_attempts,
+            disk_mb=disk_mb,
+            python_version=python_version,
+            scheduler=scheduler,
+            attempt=row_retries,
+            rows_recorded=rows_recorded,
+            supersede=supersede,
+            supersede_reason=reason,
+        )
+        if record is None:
+            return None
+        if record["verdict"] == INFRA_VERDICT and row_retries < ROW_RETRY_EXTRA:
+            manifest.append(record)
+            row_retries += 1
+            print(
+                f"  {job.label()} → InfraFailure (the environment, not the model); "
+                f"auto-retry {row_retries}/{ROW_RETRY_EXTRA}",
+                flush=True,
+            )
+            supersede = record
+            reason = "auto-retry"
+            continue
+        if row_retries:
+            record["row_retries"] = row_retries
+        manifest.append(record)
+        manifest.mark(job.key, DONE)
+        print(
+            f"  {job.label()} → {record['verdict']} "
+            f"patch_good={record['oracle']['patch_good']} label={record['label']} "
+            f"({record['timings']['total_s']:.0f}s)",
+            flush=True,
+        )
+        return record
+
+
+def _run_job_attempt(
+    *,
+    job: Job,
+    paths: BatchPaths,
+    manifest: Manifest,
+    vanta_bin: Path,
+    max_attempts: int,
+    disk_mb: int,
+    python_version: str,
+    scheduler: Optional[dict[str, Any]],
+    attempt: int,
+    rows_recorded: int,
+    supersede: Optional[dict[str, Any]],
+    supersede_reason: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """One attempt at a job: invoke, grade, compact, and build the row (item D).
+
+    [VANTA-WHY] This is the body :func:`run_job` repeats. It does NOT append its
+    row and does NOT mark the key ``done`` — ``run_job`` owns both, so an attempt
+    that ends ``InfraFailure`` can be followed by another and only the LAST row is
+    the job's. A job that left no usable session (``outcome.usable`` false) still
+    writes ``failures.jsonl`` and marks itself ``failed`` here: it has no row to
+    hand back, so there is nothing for the loop to retry.
+
+    ``attempt`` is the 0-based index of this attempt within this invocation, and
+    ``rows_recorded`` is how many rows this key already had on disk when the
+    invocation began (0 for a key's first run). Together they name this attempt's
+    log and oracle sidecar: ``.retryN`` where ``N`` is their sum, and the bare name
+    only when that sum is 0 (PR review item #1). An index-only suffix would give a
+    ``--rerun-infra`` re-run — whose index also starts at 0 — the bare name the
+    superseded row still records, so the re-run would overwrite its own
+    predecessor's evidence. ``supersede`` is the row this attempt replaces (named
+    in the record's ``supersedes`` block) and ``supersede_reason`` is ``None`` for
+    item E6's inconclusive re-run — the shape that predates this item — and
+    ``auto-retry`` / ``rerun-infra`` for the two this item adds.
+    """
     prep = job.prep
     # [VANTA-WHY] M3 item V1 — the issue file is keyed by the JOB, not the bug.
     # `prep.slug` is the bug, and once rows run concurrently (S6) two rows of one
@@ -3319,7 +3457,16 @@ def run_job(
     )
     issue_sha256 = sha256_text(issue_path.read_text(encoding="utf-8"))
 
-    log_path = paths.logs / f"{_stem(job.key)}.log"
+    # Item D — each attempt of one job gets its own log and oracle sidecar, so a
+    # superseded attempt's artefacts are not overwritten by the attempt that
+    # replaced it. The name is offset by the rows already on disk for this key (PR
+    # review item #1), so a `--rerun-infra` re-run — whose own attempt index also
+    # starts at 0 — lands on `.retryN` rather than back on the bare name its
+    # superseded predecessor's row still records; a key's first run counts 0 rows
+    # and keeps the bare name every row on disk already has.
+    attempt_number = rows_recorded + attempt
+    suffix = "" if attempt_number == 0 else f".retry{attempt_number}"
+    log_path = paths.logs / f"{_stem(job.key)}{suffix}.log"
     env = vanta_env(
         arm=job.arm,
         seed=job.seed,
@@ -3365,7 +3512,7 @@ def run_job(
         else:
             oracle = job.candidate.oracle  # type: ignore[assignment]
     else:
-        oracle_json = paths.oracle / f"{_stem(job.key)}.json"
+        oracle_json = paths.oracle / f"{_stem(job.key)}{suffix}.json"
         patch_path = outcome.final_patch
         if patch_path is None:
             # A repair run that reaches PatchApplicationFailed / HarnessFailure
@@ -3449,27 +3596,25 @@ def run_job(
         # with one attempt), which likewise leaves that row's shape untouched.
         oracle_best=oracle_best,
     )
-    # [VANTA-WHY] Item E6 + Q3 — the only reason `is_done` let this key through is
-    # that its previous row's oracle was INCONCLUSIVE. Rows stay append-only, so the
-    # old row is kept; this one names the session it supersedes, and every reader —
-    # `analyse.load_manifest`, `metrics.oracle_by_session`, the batch digest,
-    # `write_labels`, the pool harvest and the replay selector — drops that session
-    # through the one shared rule, `manifest.effective_records` (F3). With no
-    # superseded session (the old row carried none), there is nothing to name.
-    previous = manifest.find(job.key)
-    if manifest_mod.oracle_inconclusive(previous) and previous.get("session_id"):
-        record["supersedes"] = {
-            "session_id": previous["session_id"],
-            "key": job.key,
-        }
-    manifest.append(record)
-    manifest.mark(job.key, DONE)
-    print(
-        f"  {job.label()} → {record['verdict']} "
-        f"patch_good={record['oracle']['patch_good']} label={record['label']} "
-        f"({record['timings']['total_s']:.0f}s)",
-        flush=True,
-    )
+    # [VANTA-WHY] Item E6 + Q3 — a re-run of an INCONCLUSIVE row names the session
+    # it replaces. Rows stay append-only, so the old row is kept; this one names the
+    # session it supersedes, and every reader — `analyse.load_manifest`,
+    # `metrics.oracle_by_session`, the batch digest, `write_labels`, the pool harvest
+    # and the replay selector — drops that session through the one shared rule,
+    # `manifest.effective_records` (F3). Item D adds the same mechanism for an
+    # auto-retried `InfraFailure` (reason `auto-retry`) and item E for a
+    # `--rerun-infra` re-run (reason `rerun-infra`): the reason is recorded so a
+    # reader can tell the three apart, while a predecessor that is neither
+    # inconclusive nor explicitly superseded is left unnamed, exactly as before.
+    if (
+        isinstance(supersede, dict)
+        and supersede.get("session_id")
+        and (supersede_reason is not None or manifest_mod.oracle_inconclusive(supersede))
+    ):
+        block: dict[str, Any] = {"session_id": supersede["session_id"], "key": job.key}
+        if supersede_reason is not None:
+            block["reason"] = supersede_reason
+        record["supersedes"] = block
     return record
 
 
@@ -4093,6 +4238,7 @@ def run_batch(
     arm_spellings: Optional[Sequence[str]] = None,
     budget: Optional[budget_mod.Budget] = None,
     issues_dir: Optional[Path] = None,
+    rerun_infra: bool = False,
 ) -> tuple[int, list[WaveResult]]:
     """The whole batch: per wave, D13's four phases, then the wave-1 gate.
 
@@ -4332,6 +4478,9 @@ def run_batch(
                     stop_file=stop_file,
                     pause_usd=pause_usd,
                     preflight=preflight,
+                    # Item E — the pooled path claims a key the same way the
+                    # sequential one does, so `--rerun-infra` has to reach it too.
+                    rerun_infra=rerun_infra,
                 )
                 result.records.extend(phase_records)
                 result.failed += phase_failed
@@ -4346,7 +4495,7 @@ def run_batch(
                     return 1, results
                 continue
             for job in jobs:
-                if manifest.is_done(job.key):
+                if manifest.is_done(job.key, rerun_infra=rerun_infra):
                     print(f"  {job.label()} done — skipping (resume)", flush=True)
                     found = manifest.find(job.key)
                     if found:
@@ -4460,6 +4609,11 @@ def run_batch(
                             if budget is not None and budget.concurrent
                             else None
                         ),
+                        # Item E — `--rerun-infra`: this key was claimed despite a
+                        # `done` row because `is_done` said so (the row's verdict
+                        # is `InfraFailure`), so the row this run writes names the
+                        # old one in `supersedes` with reason `rerun-infra`.
+                        rerun_infra=rerun_infra,
                     )
                 finally:
                     # Reconcile against the job's recorded cost by releasing:
@@ -4663,6 +4817,7 @@ def _run_jobs_concurrently(
     stop_file: Optional[Path],
     pause_usd: Optional[float],
     preflight: Optional[Callable[[], Optional[str]]],
+    rerun_infra: bool = False,
 ) -> tuple[str, list[dict[str, Any]], int]:
     """Run one phase's jobs on a pool, and report how the phase ended.
 
@@ -4677,7 +4832,9 @@ def _run_jobs_concurrently(
 
     Everything the serial path guarantees per row is kept per row here:
 
-    * the resume skip, which reads the row's key from the cursor before claiming;
+    * the resume skip, which reads the row's key from the cursor before claiming,
+      honouring item E's ``rerun_infra`` exactly as the sequential path does (an
+      ``InfraFailure`` row is re-run rather than skipped under ``--rerun-infra``);
     * item 13's stop file, checked before the claim and — H3 — again after the
       spend gate's ``acquire`` returns, because the file can appear while a worker
       sleeps;
@@ -4717,7 +4874,7 @@ def _run_jobs_concurrently(
     # row that does run then gets a `Manifest` of its own below.
     pending: list[tuple[int, "Job"]] = []
     for index, job in enumerate(jobs):
-        if manifest.is_done(job.key):
+        if manifest.is_done(job.key, rerun_infra=rerun_infra):
             print(f"  {job.label()} done — skipping (resume)", flush=True)
             slots[index] = ("skip", manifest.find(job.key))
             continue
@@ -4819,6 +4976,9 @@ def _run_jobs_concurrently(
                     scheduler=_scheduler_row_block(
                         budget, charge_mb=charge_mb, slot_wait_s=slot_wait_s
                     ),
+                    # Item E — the same `--rerun-infra` the serial path passes, so
+                    # a pooled phase re-runs an `InfraFailure` key the same way.
+                    rerun_infra=rerun_infra,
                 )
             slots[index] = ("failed" if record is None else "record", record)
         except BaseException as exc:  # noqa: BLE001 — stored and re-raised in order
@@ -5119,6 +5279,16 @@ def wave_gate_failures(records: Sequence[dict[str, Any]]) -> list[str]:
     its counts belong to `metrics.py`, which scores it as its own outcome.
     """
     problems: list[str] = []
+    # [VANTA-WHY] Item D/E — the gate reads the EFFECTIVE rows, not the raw list.
+    # `manifest.jsonl` is append-only, so an auto-retried `InfraFailure` (D) and a
+    # `--rerun-infra` re-run (E) both leave the OLD row on disk with the new one
+    # naming it in `supersedes`. Counting the old row would fail the gate on an
+    # `InfraFailure` the batch has already replaced — the gate would stop a wave
+    # over evidence that is no longer current. So the one shared filter
+    # (`manifest.effective_records`, F3) is applied here exactly as every report
+    # reader applies it. It is idempotent, and for rows with no `key` it is a
+    # no-op, so a wave written before this item gates exactly as it did.
+    records = manifest_mod.effective_records(records)
     if not records:
         return ["the wave produced no records at all"]
     for record in records:
@@ -5936,6 +6106,7 @@ def run_queue(
     arm_spellings: Optional[Sequence[str]] = None,
     budget: Optional[budget_mod.Budget] = None,
     issues_dir: Optional[Path] = None,
+    rerun_infra: bool = False,
 ) -> tuple[int, list[QueueOutcome]]:
     """Item 13 — run a prepared batch's bugs up to ``jobs`` at a time.
 
@@ -6004,6 +6175,9 @@ def run_queue(
             arm_spellings=arm_spellings,
             budget=budget,
             issues_dir=issues_dir,
+            # Item E — the queue is a resume of the same rows, so `--rerun-infra`
+            # has to reach every per-bug `run_batch` here.
+            rerun_infra=rerun_infra,
         )
     finally:
         owner.release()
@@ -6244,6 +6418,10 @@ def _run_task(
             # a caller that drives `_run_queue` with its own kwargs (a test) need not
             # name it; absent means the committed default, exactly as before.
             issues_dir=kwargs.get("issues_dir"),
+            # Item E — `--rerun-infra`, carried from the invocation. `.get` for the
+            # same reason as `pause_usd` and `issues_dir`: a test may drive
+            # `_run_queue` with its own kwargs, and absent means the flag is off.
+            rerun_infra=kwargs.get("rerun_infra"),
         )
     except Exception as exc:  # one bug must not take the queue down
         print(f"  [{prep.key}] FAILED — {type(exc).__name__}: {exc}", flush=True)

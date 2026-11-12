@@ -122,6 +122,17 @@ struct StubLlmServer {
     /// hosted API uses when a `flex` tier has no capacity, so the run records the
     /// refusal under `resource_unavailable` rather than the generic rate limit.
     busy_next: Arc<Mutex<Vec<String>>>,
+    /// Exact reply texts served one per CHAT request, in order, the last
+    /// repeating. Installed after `start*` with `script_raw_replies`.
+    ///
+    /// [VANTA-WHY] v1-m3.2 item C — the kind-based scripts above cannot express
+    /// every malformed reply the parser tests need. A duplicate JSON key is
+    /// COLLAPSED by `serde_json::Value` (last one wins), so
+    /// `{"test_name":"a","test_name":"b"}` cannot survive the round trip through
+    /// the stub's own `Value` — and "the parser saw a duplicate field" is exactly
+    /// the fixture item C's corrective-reprompt test needs. Serving the text
+    /// verbatim is the only way to hand the client the bytes the test wrote.
+    scripted_raw: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
 }
@@ -290,7 +301,7 @@ impl StubLlmServer {
     /// As `start`, but a judge call is answered with a scripted verdict body
     /// instead of the default approval (M3 item 7). The answer is served
     /// VERBATIM, so a test can script prose the judge parser cannot read — the
-    /// retry-then-`JudgeFailed` path — as well as a real verdict object.
+    /// retry-then-model-output-invalid path — as well as a real verdict object.
     fn start_with_judge(judge_response_json: &str) -> Self {
         Self::start_scripted_impl(
             None,
@@ -327,6 +338,7 @@ impl StubLlmServer {
         let truncate_batch_audit = Arc::new(AtomicBool::new(false));
         let truncate_next = Arc::new(Mutex::new(Vec::new()));
         let busy_next = Arc::new(Mutex::new(Vec::new()));
+        let scripted_raw = Arc::new(Mutex::new(Vec::<String>::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
         let request_count_clone = Arc::clone(&request_count);
@@ -336,6 +348,7 @@ impl StubLlmServer {
         let truncate_batch_audit_clone = Arc::clone(&truncate_batch_audit);
         let truncate_next_clone = Arc::clone(&truncate_next);
         let busy_next_clone = Arc::clone(&busy_next);
+        let scripted_raw_clone = Arc::clone(&scripted_raw);
         let stop_clone = Arc::clone(&stop);
         // The Attacker has two call sites with different response shapes: a
         // generation call expects `{"tests":[...]}` (AttackerResponse), while a
@@ -357,14 +370,17 @@ impl StubLlmServer {
             intent_audit_response_json.map(|json| serde_json::from_str(json).unwrap());
         // [VANTA-WHY] M3 item 7 — a STRING, not a parsed `Value`: a judge answer is
         // served verbatim so a test can script prose the judge parser cannot read
-        // (the retry-then-`JudgeFailed` path), which is not valid JSON at all and so
-        // could not round-trip through `serde_json::Value`.
+        // (the retry-then-model-output-invalid path), which is not valid JSON at all
+        // and so could not round-trip through `serde_json::Value`.
         let judge_answer: Option<String> = judge_response_json.map(|json| json.to_string());
 
         let join = thread::spawn(move || {
             // How many Creator calls have been answered, so a scripted array of
             // answers can be served in order.
             let mut creator_calls = 0_usize;
+            // How many chat requests have consumed a `scripted_raw` reply, so the
+            // verbatim script is likewise served in order (item C).
+            let mut scripted_calls = 0_usize;
             while !stop_clone.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _addr)) => {
@@ -531,6 +547,23 @@ impl StubLlmServer {
                                 .cloned()
                                 .unwrap_or_else(|| attacker_value.clone())
                         };
+                        // [VANTA-WHY] v1-m3.2 item C — the verbatim script, consumed
+                        // one reply per chat request and repeating its last entry. Taken
+                        // BEFORE the kind-based answers because a reply the test wrote
+                        // byte for byte (a duplicate JSON key) outranks a reply
+                        // reconstructed from a `Value`.
+                        let scripted_now: Option<String> = {
+                            let queued = scripted_raw_clone
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if queued.is_empty() {
+                                None
+                            } else {
+                                let index = scripted_calls.min(queued.len() - 1);
+                                scripted_calls += 1;
+                                Some(queued[index].clone())
+                            }
+                        };
                         let content = if request_kind == "creator" {
                             // [VANTA-WHY] A creator answer may be a SCRIPT: a JSON
                             // array whose elements are served one per Creator call
@@ -623,7 +656,9 @@ impl StubLlmServer {
                         } else {
                             None
                         };
-                        let (content_text, finish_reason) = if let Some(raw) = judge_raw {
+                        let (content_text, finish_reason) = if let Some(raw) = scripted_now {
+                            (raw, None)
+                        } else if let Some(raw) = judge_raw {
                             (raw, None)
                         } else if cut_off_batch {
                             (
@@ -767,6 +802,7 @@ impl StubLlmServer {
             truncate_batch_audit,
             truncate_next,
             busy_next,
+            scripted_raw,
             stop,
             join: Some(join),
         }
@@ -802,6 +838,19 @@ impl StubLlmServer {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         queued.clear();
         queued.extend(kinds.iter().map(|kind| kind.to_string()));
+    }
+
+    /// Serve these exact reply texts, one per chat request, in order, the last
+    /// repeating — the item C fixture for replies that cannot round-trip through
+    /// `serde_json::Value` (a duplicate JSON key is collapsed by it). Called
+    /// after `start*`.
+    fn script_raw_replies(&self, replies: &[&str]) {
+        let mut queued = self
+            .scripted_raw
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queued.clear();
+        queued.extend(replies.iter().map(|reply| reply.to_string()));
     }
 
     fn request_count(&self) -> usize {
@@ -1268,9 +1317,11 @@ const JUDGE_APPROVE_ANSWER: &str =
 const JUDGE_REJECT_ANSWER: &str =
     r#"{"verdict":"reject","confidence":0.8,"reason":"the diff leaves the reported bug in place"}"#;
 
-/// Prose the judge parser cannot read as a verdict — not JSON at all, so after
-/// the one retry the run ends as `JudgeFailed`. Served RAW (unnormalised), which
-/// is why `start_with_judge` takes a string rather than a `serde_json::Value`.
+/// Prose the judge parser cannot read as a verdict — not JSON at all, so the
+/// call spends its whole parse budget (four requests: `max_attempts` two plus the
+/// two item C adds) and the run ends as `JudgeFailed`. Served RAW
+/// (unnormalised), which is why `start_with_judge` takes a string rather than a
+/// `serde_json::Value`.
 const JUDGE_UNREADABLE_ANSWER: &str = "I am sorry, I cannot decide from this diff.";
 
 
@@ -3195,9 +3246,12 @@ fn the_batched_audit_is_one_call_per_round_with_the_same_decisions() {
 
 /// [VANTA-WHY] §14.5 — an answer that does not cover the round is a parse failure
 /// of the whole response, so it is retried like any other malformed structured
-/// output; and when it finally fails, every test falls back to EXACTLY the
-/// single-call failure shape. Both halves are asserted against the flag-off run
-/// of the same fixture, whose calls fail the same way at the same place.
+/// output — and, since v1-m3.2 item C, that retry spends EACH call's raised parse
+/// budget of five (`max_attempts` three plus the two `PARSE_FAILURE_EXTRA_ATTEMPTS`),
+/// not the caller's three; and when it finally fails, every test falls back to
+/// EXACTLY the single-call failure shape. Both halves are asserted against the
+/// flag-off run of the same fixture, whose calls fail the same way at the same
+/// place.
 ///
 /// This is also the other half of the truncation test's contract: an answer that
 /// was NOT cut off keeps its retries, and the session log tells the two events
@@ -3240,7 +3294,11 @@ fn a_batch_the_auditor_cannot_answer_falls_back_to_the_single_call_failure_shape
     let (kinds_on, bodies_on, decisions_on, transports_on, output_on) =
         run(&[("VANTA_BATCH_AUDIT", "on")]);
 
-    // Off: three tests, each call retried the full budget = 1 + 3x3.
+    // Off: three tests, each call spends the FULL parse budget. v1-m3.2 item C
+    // raised that budget from the caller's three to FIVE (`max_attempts` + the two
+    // `PARSE_FAILURE_EXTRA_ATTEMPTS`), because an unreadable answer — unlike a
+    // transport failure or a cut-off one — is the one failure a corrective re-ask
+    // can fix. So this is 1 generate + 3 tests x 5 attempts.
     assert_eq!(
         kinds_off,
         vec![
@@ -3254,15 +3312,30 @@ fn a_batch_the_auditor_cannot_answer_falls_back_to_the_single_call_failure_shape
             "intent_audit",
             "intent_audit",
             "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
         ],
-        "with the flag off an unparseable audit is retried per test"
+        "with the flag off an unparseable audit is retried per test, on item C's raised parse budget"
     );
-    // On: ONE logical call, retried three times. The retries are the point: this
-    // answer was NOT cut off, so the model can answer it differently next time,
-    // and only a cut-off answer skips the budget (see the truncation test).
+    // On: ONE logical call, retried on the SAME raised budget — five attempts spent
+    // on the batch instead of five on each of three calls. The retries are the
+    // point: this answer was NOT cut off, so the model can answer it differently
+    // next time, and only a cut-off answer skips the budget (see the truncation
+    // test).
     assert_eq!(
         kinds_on,
-        vec!["generate", "intent_audit", "intent_audit", "intent_audit"],
+        vec![
+            "generate",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+        ],
         "an incomplete batch must be retried as ONE call, not split into three"
     );
     // …and the session log names the event, since the call count no longer has to
@@ -5754,6 +5827,310 @@ fn a_zero_denominator_prints_not_applicable_never_a_zero_percent() {
     );
 }
 
+/// Finding #5 — a spent attempt whose Creator produced NOTHING still spends the
+/// attempt, and both ends of every transition row name the right patch.
+///
+/// [VANTA-WHY] Two facts the old code got wrong, and the runner leans on both.
+/// The Governor counts an attempt whether or not it produced a patch — item B's
+/// failed Creator spends the budget — so `attempts_run` must be the number of
+/// attempts the Governor SPENT, not the number of patches the run produced:
+/// `grade_best_attempt` treats attempt `attempts_run` as the one the primary
+/// grading already describes (and skips it), so a short count makes it grade an
+/// older attempt as if it were the last and drops the newest produced patch.
+/// And a transition row names BOTH of its ends by attempt NUMBER, so the patch
+/// ids must be resolved in that same attempt space: the attempt that produced
+/// nothing resolves to NO patch, never to its neighbour's.
+#[test]
+fn a_creator_failure_on_one_attempt_spends_it_and_keeps_the_patch_index_aligned() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let _ = write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+
+    // THREE different wrong patches, so every produced candidate has its OWN id
+    // and a row that names the wrong neighbour is visible. All three keep the
+    // tree importable and fail the probe (`add(2, 3) == 5`), so the loop runs on.
+    let patch = |body: &str| {
+        format!(
+            "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n\
+             @@ -1,2 +1,2 @@\n def add(a, b):\n-    return a + b\n+    return {body}\n"
+        )
+    };
+    // A well-formed JSON object that is NOT a `CreatorResponse`: the Creator call
+    // cannot read it however many times it is re-asked, so attempt 2 is SPENT with
+    // no patch. Served for every retry of that attempt (the array's element per
+    // Creator call, last repeating), then repaired patches answer the attempts
+    // after it.
+    let unreadable = serde_json::json!({"note": "this answer is not a CreatorResponse"});
+    let script = serde_json::json!([
+        {
+            "patch_text": patch("a - b"),
+            "explanation": "wrong arithmetic",
+            "files_touched": ["calc.py"],
+            "confidence": 0.3
+        },
+        unreadable.clone(),
+        unreadable.clone(),
+        unreadable.clone(),
+        unreadable.clone(),
+        unreadable.clone(),
+        {
+            "patch_text": patch("a + b + 1"),
+            "explanation": "still wrong",
+            "files_touched": ["calc.py"],
+            "confidence": 0.4
+        },
+        {
+            "patch_text": patch("a * b"),
+            "explanation": "still wrong",
+            "files_touched": ["calc.py"],
+            "confidence": 0.5
+        }
+    ])
+    .to_string();
+    let server = StubLlmServer::start_with_creator_script(&script, SINGLE_BEHAVIOR_TEST);
+
+    let output = run_creator_mode_with_output(workspace.path(), &server, 4, &[]);
+    assert!(
+        !output.status.success(),
+        "no candidate ever passed the probe, so the budget must be exhausted; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let summary = run_summary(workspace.path());
+    assert_eq!(
+        summary_value(&summary.summary, "attempts_run"),
+        "4",
+        "four attempts were SPENT — the one whose Creator produced nothing counts like \
+         any other, because the Governor advanced on it; got {}",
+        summary.summary
+    );
+    assert_eq!(
+        summary_value(&summary.summary, "final_decision"),
+        "MaxAttemptsReached",
+        "the run used its whole budget; got {}",
+        summary.summary
+    );
+
+    let rows = read_transition_rows(&find_transitions(workspace.path()));
+    let row_at = |from: u32, to: u32| {
+        rows.iter()
+            .find(|r| r.from_attempt == from && r.to_attempt == to)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no transition row {from}->{to}; rows: {:?}",
+                    rows.iter()
+                        .map(|r| (
+                            r.from_attempt,
+                            r.to_attempt,
+                            r.from_patch_attempt_id.is_some(),
+                            r.to_patch_attempt_id.is_some(),
+                        ))
+                        .collect::<Vec<_>>()
+                )
+            })
+    };
+
+    // Attempt 1 (Governor attempt 0) produced a patch; attempt 2 (Governor
+    // attempt 1) produced NONE. Its side of the row must be NULL, not the patch
+    // its neighbour produced.
+    let unobserved = row_at(0, 1);
+    assert!(
+        unobserved.from_patch_attempt_id.is_some(),
+        "attempt 0 DID produce a patch, so the row's FROM side must name it"
+    );
+    assert!(
+        unobserved.to_patch_attempt_id.is_none(),
+        "attempt 1 produced no patch, so its side of the row must be null — a \
+         neighbouring attempt's id would report a candidate nobody made; got {:?}",
+        unobserved.to_patch_attempt_id
+    );
+
+    // Attempt 3 (Governor attempt 2) produced the SECOND patch. Its row compares
+    // against the last attempt anyone OBSERVED (attempt 0), and its patch id must
+    // be attempt 2's own — the same id the NEXT row names on its FROM side.
+    let observed = row_at(0, 2);
+    assert_eq!(
+        observed.from_patch_attempt_id, unobserved.from_patch_attempt_id,
+        "both rows' FROM side is attempt 0's patch"
+    );
+    assert!(
+        observed.to_patch_attempt_id.is_some(),
+        "attempt 2 produced a patch, so the row's TO side must name it"
+    );
+
+    // Attempt 4 (Governor attempt 3) produced the THIRD patch.
+    let last = row_at(2, 3);
+    assert_eq!(
+        last.from_patch_attempt_id, observed.to_patch_attempt_id,
+        "attempt 2's patch must carry the SAME id on both rows that name it"
+    );
+    assert_ne!(
+        last.from_patch_attempt_id, last.to_patch_attempt_id,
+        "the three patches are different candidates"
+    );
+
+    // The graded final attempt is the LAST attempt that produced a patch — here
+    // attempt 4 — and that is the id every terminal row carries.
+    assert_eq!(
+        summary.patch_attempt_id, last.to_patch_attempt_id,
+        "the run's last PRODUCED patch is attempt 4's, not the patchless attempt's \
+         and not a fabricated id"
+    );
+}
+
+/// Finding #5 — a Creator that NEVER returns a readable patch spends every
+/// attempt and fabricates no patch id.
+///
+/// [VANTA-WHY] The mirror of the test above, and the one that pins the
+/// "no placeholder" rule: `attempt_patch_ids.last()` is the run's
+/// `patch_attempt_id` on every terminal row and in `run.summary`. If a
+/// patchless attempt were padded with a placeholder to keep indices aligned,
+/// that placeholder would be reported as a real candidate. Here nothing is ever
+/// produced, so every one of those fields must be null — and the attempt count
+/// must still be the full budget.
+#[test]
+fn a_creator_that_never_produces_a_patch_spends_every_attempt_and_fabricates_no_patch_id() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let _ = write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+
+    // Every Creator call gets the same unreadable answer (the array's last
+    // element repeats), so every attempt is SPENT and produces nothing.
+    let unreadable = serde_json::json!({"note": "this answer is not a CreatorResponse"});
+    let script = serde_json::json!([
+        unreadable.clone(),
+        unreadable.clone(),
+        unreadable.clone(),
+        unreadable.clone(),
+        unreadable.clone()
+    ])
+    .to_string();
+    let server = StubLlmServer::start_with_creator_script(&script, SINGLE_BEHAVIOR_TEST);
+
+    let output = run_creator_mode_with_output(workspace.path(), &server, 4, &[]);
+    assert!(
+        !output.status.success(),
+        "no candidate was ever produced, so the budget must be exhausted; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let summary = run_summary(workspace.path());
+    assert_eq!(
+        summary_value(&summary.summary, "attempts_run"),
+        "4",
+        "the Governor spent four attempts even though none produced a patch; got {}",
+        summary.summary
+    );
+    assert_eq!(
+        summary_value(&summary.summary, "final_decision"),
+        "MaxAttemptsReached",
+        "the run used its whole budget; got {}",
+        summary.summary
+    );
+
+    // NO patch was ever produced, so the run's `patch_attempt_id` must be NULL —
+    // never a placeholder that a reader would take for a real candidate.
+    assert!(
+        summary.patch_attempt_id.is_none(),
+        "no attempt produced a patch, so the terminal row must carry no patch id; \
+         got {:?}",
+        summary.patch_attempt_id
+    );
+
+    let rows = read_transition_rows(&find_transitions(workspace.path()));
+    assert!(
+        rows.iter()
+            .all(|r| r.from_patch_attempt_id.is_none() && r.to_patch_attempt_id.is_none()),
+        "no attempt produced a patch, so no transition row may name one; got {:?}",
+        rows.iter()
+            .map(|r| (&r.from_patch_attempt_id, &r.to_patch_attempt_id))
+            .collect::<Vec<_>>()
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    assert!(
+        records.iter().all(|r| r.patch_attempt_id.is_none()),
+        "no patch was produced, so no session record may carry a patch id; got {:?}",
+        records
+            .iter()
+            .filter(|r| r.patch_attempt_id.is_some())
+            .map(|r| (&r.phase, &r.patch_attempt_id))
+            .collect::<Vec<_>>()
+    );
+
+    // Finding #2 (CodeRabbit round 2) — an attempt whose Creator exhausted its
+    // parse retries is SPENT (the Governor counts it) and `run.summary` reports
+    // it, so the evidence must list it too. A patchless attempt used to `continue`
+    // before `open_fixed_round_record`, leaving `"attempts": []` for a run whose
+    // Creator never answered.
+    let evidence_path = workspace
+        .path()
+        .join("vanta_sessions")
+        .join(format!("{}_evidence.json", records[0].session_id.as_str()));
+    let evidence = read_json(&evidence_path);
+    let attempts = evidence["attempts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("evidence.attempts must be an array; got {evidence}"));
+    assert_eq!(
+        attempts.len(),
+        4,
+        "every spent attempt must own a record, even one whose Creator produced nothing; \
+         got {attempts:?}"
+    );
+    assert!(
+        attempts.iter().all(|a| a["patch"].is_null()),
+        "no attempt produced a patch, so no record may name one; got {attempts:?}"
+    );
+    assert!(
+        attempts
+            .iter()
+            .all(|a| a["creator_prompt_hash"].as_str().is_some_and(|h| !h.is_empty())),
+        "every attempt ran a Creator, so each record must carry its prompt hash; got {attempts:?}"
+    );
+    assert!(
+        attempts[1..]
+            .iter()
+            .all(|a| a["feedback"].as_str().is_some_and(|f| !f.is_empty())),
+        "the attempts after the first were handed the recovery feedback, so each record \
+         must carry it; got {attempts:?}"
+    );
+
+    // Finding #1 (CodeRabbit round 2) — the recovery feedback a spent Creator
+    // attempt hands the next one must RESTATE the contract the parser requires.
+    // `creator_generate_patch` deserialises a `CreatorResponse` JSON object, but
+    // the old wording asked for "ONLY the corrected unified diff" — the one shape
+    // the parser rejects — so a Creator that obeyed it was refused again and the
+    // recovery round was spent for nothing.
+    let feedback_tails: Vec<String> = server
+        .request_bodies()
+        .into_iter()
+        .filter_map(|body| {
+            body.split("PRIOR FEEDBACK (from previous attempt, address this):")
+                .nth(1)
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        !feedback_tails.is_empty(),
+        "the attempts after the first carry the recovery feedback, so at least one Creator \
+         body must quote it; got {} request(s)",
+        server.request_count()
+    );
+    for tail in &feedback_tails {
+        for field in ["patch_text", "explanation", "files_touched", "confidence"] {
+            assert!(
+                tail.contains(field),
+                "the recovery feedback must restate the required JSON field `{field}`; got {tail}"
+            );
+        }
+        assert!(
+            !tail.to_lowercase().contains("unified diff"),
+            "the recovery feedback must NOT ask for a bare diff, which the Creator parser \
+             rejects; got {tail}"
+        );
+    }
+}
+
 // ============================================================================
 // LLM call robustness: streaming liveness, cancel, InfraFailure
 // ============================================================================
@@ -7103,17 +7480,22 @@ fn the_judge_suite_arm_shows_the_model_the_failing_tests_and_the_summary() {
     assert_eq!(summary_value(&summary.summary, "llm_calls_site_judge"), "1");
 }
 
-/// M3 item 7 — an answer the judge cannot read is retried ONCE, then ends the run
-/// as `JudgeFailed` with its own exit code 4 — never `InfraFailure`, never a
-/// rejection.
+/// M3 item 7 — an answer the judge cannot read is retried until the parse budget
+/// is spent (v1-m3.2 item C raised it to four requests), and then the run is
+/// GRADED unreadable: `NeedsReview` with `stop_reason=model_output_invalid` and
+/// the candidate attached (v1-m3.2 item B) — never `InfraFailure`, never a
+/// rejection, no longer `JudgeFailed`.
 ///
 /// [VANTA-WHY] "The machine is broken" and "the model said something we cannot
 /// read as a verdict" are opposite facts: the first is retried as infrastructure
-/// and reported as `infra_failure`, the second is this arm's own outcome and must
-/// not be. The exit code (4) is what lets the harness map it to `judge_failed`
-/// without treating it as an infra fault.
+/// and reported as `infra_failure`, the second is the model's OWN output and gets
+/// the same rule the Creator's and Attacker's unreadable answers get. The
+/// candidate is on disk either way, so the row can be labelled — ending it
+/// `JudgeFailed` with nothing attached is what censored the row to `unobservable`
+/// and halted the wave (§8.2). There was still no verdict, so there must still be
+/// no `run.judge` row claiming one.
 #[test]
-fn an_unreadable_judge_answer_is_retried_once_then_fails_with_exit_four() {
+fn an_unreadable_judge_answer_is_graded_as_model_output_invalid() {
     let _serial = serial_run();
     let workspace = TempDir::new().unwrap();
     let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
@@ -7138,34 +7520,84 @@ fn an_unreadable_judge_answer_is_retried_once_then_fails_with_exit_four() {
 
     assert_eq!(
         output.status.code(),
-        Some(4),
-        "a readable machine and an unreadable answer is `JudgeFailed` (exit 4), its \
-         own code — never `InfraFailure` (2); stdout:\n{}",
+        Some(3),
+        "a readable machine and an unreadable answer is a MODEL-OUTPUT failure, so \
+         the run ends `NeedsReview` (exit 3) — never `InfraFailure` (2, the machine \
+         broke) and no longer `JudgeFailed`'s 4; stdout:\n{}",
         String::from_utf8_lossy(&output.stdout)
     );
     assert_eq!(
         server.request_kinds(),
-        vec!["judge".to_string(), "judge".to_string()],
-        "the plan fixes the judge at one call plus ONE retry on malformed JSON, and \
-         nothing more; kinds={:?}",
+        vec![
+            "judge".to_string(),
+            "judge".to_string(),
+            "judge".to_string(),
+            "judge".to_string()
+        ],
+        "an unreadable answer is the one failure a retry can fix, so item C's \
+         extension applies: `max_attempts` two plus `PARSE_FAILURE_EXTRA_ATTEMPTS` \
+         two is four requests, and nothing more; kinds={:?}",
         server.request_kinds()
     );
 
     let records = read_session_records(&find_session_log(workspace.path()));
+    let row = records
+        .iter()
+        .find(|record| record.phase == "run.model_output_invalid")
+        .unwrap_or_else(|| {
+            panic!(
+                "the reason the answer could not be read must be on its own row, or \
+                 `NeedsReview` is indistinguishable from an ordinary uncorroborated \
+                 failure; phases: {:?}",
+                records.iter().map(|r| r.phase.as_str()).collect::<Vec<_>>()
+            )
+        });
     assert!(
-        records.iter().any(|record| record.phase == "run.judge_failed"),
-        "the reason the answer could not be read must be on its own row"
+        row.summary.contains("final_decision=NeedsReview")
+            && row.summary.contains("stop_reason=model_output_invalid"),
+        "the row must carry both the verdict and the reason; got {}",
+        row.summary
     );
     assert!(
         !records.iter().any(|record| record.phase == "run.judge"),
         "there was no verdict, so there must be no `run.judge` row claiming one"
     );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.phase == "run.judge_failed"),
+        "an unreadable answer is no longer the judge arm's own outcome, so its old \
+         row is gone: the failure is reported on `run.model_output_invalid` and \
+         nowhere else; phases: {:?}",
+        records.iter().map(|r| r.phase.as_str()).collect::<Vec<_>>()
+    );
     let summary = run_summary(workspace.path());
     assert_eq!(
         summary_value(&summary.summary, "final_decision"),
-        "JudgeFailed",
+        "NeedsReview",
         "an unreadable answer is its own outcome, never folded into a rejection; got {}",
         summary.summary
+    );
+    assert_eq!(
+        summary_value(&summary.summary, "stop_reason"),
+        "model_output_invalid",
+        "run.summary must say why the run stopped itself, not just that it did; got {}",
+        summary.summary
+    );
+
+    // The rule attaches the candidate exactly as the deadline exit does, so the
+    // patch the grader has to look at is on disk: without it the runner censors
+    // the oracle to `unobservable` and the wave gate halts on this one row (§8.2).
+    let debug_dir = workspace
+        .path()
+        .join("vanta_sessions")
+        .join(records[0].session_id.as_str())
+        .join("debug");
+    assert!(
+        debug_dir.join("final.patch").exists(),
+        "a model-output-invalid row must leave the candidate patch on disk for the \
+         grader; missing under {}",
+        debug_dir.display()
     );
 }
 
@@ -9940,5 +10372,267 @@ fn the_api_key_never_reaches_a_file_stream_or_record_when_the_provider_echoes_it
         "the echoed credential must have been replaced by the marker, proving \
          the message was built and redacted rather than never built; got {}",
         infra.summary
+    );
+}
+
+// ============================================================================
+// v1-m3.2 item C — the corrective reprompt and the parse-failure attempt budget
+// ============================================================================
+//
+// [VANTA-WHY] v1-m3.1's wave 1 lost two rows to a structured call that answered
+// three times with JSON the schema parser refused, and each retry asked the
+// IDENTICAL question — a re-draw at the same prompt, which on a pinned seed has
+// every reason to come back wrong the same way. Item C makes the retry a
+// DIFFERENT question: the next request carries the parser's own complaint and the
+// head of the reply that earned it (`llm::append_parse_correction`), and a call
+// that fails on the PARSER is allowed two attempts beyond the caller's budget.
+//
+// [VANTA-WHY] These tests drive `structured_call_with_retry` DIRECTLY rather than
+// through `vanta_m3`: what is under test is the helper's own turn-taking, and a
+// process run would only reach it through a sandbox and a real pytest — the
+// property would then be observable only where that holds. The stub is the one
+// the fixture runs use, so the bytes asserted here are the bytes every call site
+// really sends.
+//
+// [VANTA-WHY] Two of the replies are served VERBATIM through `script_raw_replies`
+// because one of them cannot survive `serde_json::Value`: `serde`'s own duplicate
+// key check is the malformed fixture the plan names, and a `Value` map keeps only
+// the last of two equal keys.
+
+/// The answer shape these tests parse. Deliberately tiny, so a reply can only be
+/// rejected for the two reasons the plan names: a duplicate field, or an intent
+/// outside the enum.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ItemCReply {
+    tests: Vec<ItemCProbe>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ItemCProbe {
+    test_name: String,
+    intent: ItemCIntent,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+enum ItemCIntent {
+    BugReproduction,
+    BehaviorPreservation,
+}
+
+/// One `structured_call_with_retry` against `server`, at the caller's ordinary
+/// budget, parsing `ItemCReply`.
+async fn itemc_structured_call(
+    server: &StubLlmServer,
+    max_attempts: u32,
+) -> Result<ItemCReply, String> {
+    let cfg = vanta::config::LlmConfig {
+        base_url: server.base_url.clone(),
+        model_id: "stub-model".to_string(),
+        ..Default::default()
+    };
+    let client = vanta::llm::build_reqwest_client(&cfg).expect("a reqwest client can be built");
+    // The call site's own turns. They are the same on every attempt — the
+    // CORRECTION is the helper's, appended after them, which is what lets this
+    // test see it as a separate turn in the recorded body.
+    let build_messages = |_attempt: u32| {
+        vec![serde_json::json!({
+            "role": "system",
+            "content": "item C fixture: answer with the tests JSON the schema asks for",
+        })]
+    };
+    // The parse closure mirrors a real call site's: the transport hands back the
+    // `===CONTENT=== … ===REASONING=== …` envelope, so the JSON is LOCATED first
+    // and the schema is applied to that. A closure that parsed the envelope
+    // directly would fail on a shape no call site ever sees.
+    let parse_into_typed = |raw: &str| -> Result<ItemCReply, String> {
+        let candidate = vanta::llm::extract_json_candidate(raw).map_err(|err| err.to_string())?;
+        serde_json::from_str::<ItemCReply>(candidate).map_err(|err| err.to_string())
+    };
+
+    vanta::llm::structured_call_with_retry(
+        &client,
+        &cfg,
+        max_attempts,
+        "itemc",
+        "itemc_fixture",
+        build_messages,
+        serde_json::Value::Null,
+        parse_into_typed,
+    )
+    .await
+    .map_err(|err| err.to_string())
+}
+
+/// Item C, half one: the retry after a parse failure is a CORRECTED question.
+///
+/// [VANTA-WHY] The assertion that matters is not "it recovered" — a re-draw
+/// recovers too, sometimes — but that the SECOND request carries the parser's
+/// complaint and the head of the reply that earned it. Without that, "the retry
+/// asks the same thing again" and "the retry corrects" are indistinguishable
+/// from the outside, and the wave-1 rows are the cost of the difference.
+#[tokio::test]
+async fn itemc_a_duplicate_field_reprompts_with_the_parser_error_and_recovers_on_try_two() {
+    let _serial = serial_run();
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    server.script_raw_replies(&[
+        // Attempt 1: `test_name` twice. `serde` refuses the duplicate, and a
+        // `serde_json::Value` cannot even REPRESENT this reply — which is why the
+        // stub serves it verbatim. The `note` is a plain marker so the test can
+        // prove the PREVIEW travelled, not merely the error.
+        r#"{"tests":[{"test_name":"itemc_dup","test_name":"itemc_dup_again","intent":"BugReproduction"}],"note":"ITEMC_MALFORMED_DUPLICATE"}"#,
+        // Attempt 2: the corrected object.
+        r#"{"tests":[{"test_name":"itemc_dup","intent":"BugReproduction"}]}"#,
+    ]);
+
+    let reply = itemc_structured_call(&server, 3)
+        .await
+        .expect("the stub's second answer is a readable object, so the call must recover");
+
+    assert_eq!(reply.tests.len(), 1);
+    assert_eq!(reply.tests[0].test_name, "itemc_dup");
+    assert_eq!(
+        server.request_count(),
+        2,
+        "a parse failure must cost exactly one extra request here: the retry is the \
+         second request, and nothing else is sent"
+    );
+
+    let bodies = server.request_bodies();
+    assert_eq!(bodies.len(), 2);
+    let retry = &bodies[1];
+    assert!(
+        retry.contains("could not be read as the required JSON"),
+        "the retry must say the previous reply was unreadable; got:\n{retry}"
+    );
+    assert!(
+        retry.contains("duplicate field"),
+        "the retry must carry the PARSER's own complaint, quoted from the failure; \
+         got:\n{retry}"
+    );
+    assert!(
+        retry.contains("ITEMC_MALFORMED_DUPLICATE"),
+        "the retry must carry the head of the reply that earned the refusal — the \
+         model cannot correct a mistake it is not shown; got:\n{retry}"
+    );
+    // The control: attempt 1 is the call site's own prompt and nothing else. A
+    // correction turn here would mean the helper corrects before anything failed,
+    // which would move the cacheable prefix of every run.
+    assert!(
+        !bodies[0].contains("could not be read as the required JSON"),
+        "attempt 1 must carry no correction; got:\n{}",
+        bodies[0]
+    );
+}
+
+/// Item C, half two: the parser's failure buys TWO extra attempts, so a call can
+/// recover as late as the fifth, and every retry is corrected.
+#[tokio::test]
+async fn itemc_a_parse_failure_gets_two_extra_attempts_and_recovers_on_the_fifth() {
+    let _serial = serial_run();
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let bad_enum = r#"{"tests":[{"test_name":"itemc_enum","intent":"NotALabel"}],"note":"ITEMC_MALFORMED_ENUM"}"#;
+    let good = r#"{"tests":[{"test_name":"itemc_enum","intent":"BehaviorPreservation"}]}"#;
+    // Four refusals, then a readable answer. The caller's budget is THREE, so a
+    // fifth request is only sent if a parse failure really raised the limit.
+    server.script_raw_replies(&[bad_enum, bad_enum, bad_enum, bad_enum, good]);
+
+    let reply = itemc_structured_call(&server, 3)
+        .await
+        .expect("the fifth attempt must be made, and its answer read");
+
+    assert_eq!(reply.tests[0].intent, ItemCIntent::BehaviorPreservation);
+    assert_eq!(
+        server.request_count(),
+        5,
+        "the caller's budget is three and a parse failure adds two: five attempts, \
+         and recovery on the last one must be reached"
+    );
+
+    let bodies = server.request_bodies();
+    for (index, body) in bodies.iter().enumerate().skip(1) {
+        assert!(
+            body.contains("unknown variant"),
+            "attempt {} must carry the parser's complaint: it is the turn that makes \
+             the retry a different question; got:\n{body}",
+            index + 1
+        );
+        assert!(
+            body.contains("ITEMC_MALFORMED_ENUM"),
+            "attempt {} must carry the failing preview too; got:\n{body}",
+            index + 1
+        );
+    }
+    assert!(
+        !bodies[0].contains("unknown variant"),
+        "attempt 1 carries no correction: nothing had failed when it was built"
+    );
+}
+
+/// The exhausted case must still SAY it was the parser, and how many attempts it
+/// cost — that string is what the driver classifies (item B) and what a reader
+/// greps when a wave loses a row.
+#[tokio::test]
+async fn itemc_an_exhausted_parse_failure_reports_five_attempts_and_the_parser_error() {
+    let _serial = serial_run();
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    server.script_raw_replies(&[r#"{"tests":[{"test_name":"itemc_dud","intent":"NotALabel"}]}"#]);
+
+    let error = itemc_structured_call(&server, 3)
+        .await
+        .expect_err("every attempt answers an unreadable reply, so the call must fail");
+
+    assert!(
+        error.contains("PARSE ERR"),
+        "an exhausted parse failure must carry the marker item B classifies on; \
+         got:\n{error}"
+    );
+    assert!(
+        error.contains("unknown variant `NotALabel`"),
+        "the final failure must quote the parser; got:\n{error}"
+    );
+    assert!(
+        error.contains("5/5 attempts FAILED"),
+        "the failure must report the RAISED limit, not the caller's three; \
+         got:\n{error}"
+    );
+    assert_eq!(server.request_count(), 5);
+}
+
+/// The extension is the PARSER's alone: a transport failure still gets exactly
+/// the caller's three attempts.
+///
+/// [VANTA-WHY] This is the test that keeps item C from becoming "retry everything
+/// five times". A 500 is not the model's output — the answer never arrived — and
+/// item B is explicit that such a failure stays `InfraFailure` (item D's row-level
+/// retry is the remedy for it, not more model attempts). If this loop were raised
+/// for every failure class, both claims would be false and every unreachable
+/// server would cost five requests a call.
+#[tokio::test]
+async fn itemc_a_transport_failure_still_gets_only_the_callers_three_attempts() {
+    let _serial = serial_run();
+    let server = StubLlmServer::start_streaming(None, SINGLE_BEHAVIOR_TEST, StubBehaviour::Fail);
+
+    let error = itemc_structured_call(&server, 3)
+        .await
+        .expect_err("a server that answers 500 to every call must fail the call");
+
+    assert!(
+        error.contains("3/3 attempts FAILED"),
+        "a transport failure must keep the caller's budget of three; got:\n{error}"
+    );
+    assert!(
+        error.contains("HTTP ERROR 500"),
+        "the failure must name the transport, not the parser; got:\n{error}"
+    );
+    assert!(
+        !error.contains("PARSE ERR"),
+        "a 500 is the machine, not the model's output — it must not be dressed as a \
+         parse failure; got:\n{error}"
+    );
+    assert_eq!(
+        server.request_count(),
+        3,
+        "the two extra attempts exist for the parser alone, so an unreachable server \
+         must not spend them"
     );
 }

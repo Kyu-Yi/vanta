@@ -43,6 +43,20 @@ pub const REVISE_BUDGET_EXHAUSTED: &str = "revise_budget_exhausted";
 /// two are recorded under different names rather than one `stopped=true`.
 pub const BUDGET_EXHAUSTED: &str = "budget_exhausted";
 
+/// The `stop_reason` a run records when a structured model call exhausted its
+/// attempts on the MODEL'S OWN OUTPUT — a schema parse error (`llm::PARSE_FAILURE_PREFIX`)
+/// or an answer the server cut off twice (`llm::TRUNCATED_TWICE_MARKER`) — and the
+/// run therefore ended without deciding anything about the candidate (v1-m3.2).
+///
+/// [VANTA-WHY] This is deliberately NOT `InfraFailure`. The machine was fine and the
+/// call was made; what came back could not be read. Reporting it as infrastructure
+/// blamed the harness for the model's mistake, was retried as one (D), and — the
+/// thing that cost a wave — halted the gate (§8.2) on one unreadable answer. A
+/// transport error (an unreachable server, a 5xx) or a `prompt_over_budget` refusal
+/// is a different claim about the run and keeps `InfraFailure`; only the two markers
+/// above take this one.
+pub const MODEL_OUTPUT_INVALID: &str = "model_output_invalid";
+
 /// One attempt's shared Attacker remediation budget (§14.14).
 ///
 /// [VANTA-WHY] Held by the attempt loop and borrowed by BATE and the
@@ -305,7 +319,7 @@ mod tests {
     }
 
     /// [VANTA-WHY] M3 item 19 (fix 4) — the chain that makes a prompt edit move
-    /// `config_hash`. `config_hash` is the SHA-256 of `configs/v1-m3.1.toml`, and
+    /// `config_hash`. `config_hash` is the SHA-256 of `configs/v1-m3.2.toml`, and
     /// the `[prompts]` block records this code's own hashes. Edit a template and
     /// this test fails; the only fix is to update `[prompts]`, which changes the
     /// file's bytes and therefore every row's `config_hash`. Without this link the
@@ -313,12 +327,12 @@ mod tests {
     /// gap item 16 fell into.
     #[test]
     fn the_committed_prompts_block_is_the_hash_of_the_templates_this_code_sends() {
-        let raw = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/configs/v1-m3.1.toml"));
-        let doc: toml::Value = toml::from_str(raw).expect("configs/v1-m3.1.toml must parse as TOML");
+        let raw = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/configs/v1-m3.2.toml"));
+        let doc: toml::Value = toml::from_str(raw).expect("configs/v1-m3.2.toml must parse as TOML");
         let recorded = doc
             .get("prompts")
             .and_then(|value| value.as_table())
-            .expect("configs/v1-m3.1.toml must carry a [prompts] table");
+            .expect("configs/v1-m3.2.toml must carry a [prompts] table");
 
         let expected: [(&str, String); 5] = [
             (
@@ -367,7 +381,7 @@ mod tests {
             .collect();
         assert!(
             mismatches.is_empty(),
-            "configs/v1-m3.1.toml [prompts] must be the hashes this code sends, or `config_hash` \
+            "configs/v1-m3.2.toml [prompts] must be the hashes this code sends, or `config_hash` \
              describes other text; update the file (which moves config_hash) or revert the \
              template edit. Mismatches: {mismatches:#?}"
         );

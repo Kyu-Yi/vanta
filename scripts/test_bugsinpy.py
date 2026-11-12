@@ -9228,10 +9228,14 @@ class TestSuiteCache:
     def test_a_censored_grade_still_records_the_hidden_note(self, tmp_path, monkeypatch):
         """The E3 guard returns on an unreadable hidden run — but that grading was
         still a grading, and its note must not vanish exactly where the evidence is
-        weakest. No patched pair runs, so no patched note exists."""
+        weakest. No patched pair runs, so no patched note exists.
+
+        v1-m3.1 — the run measured NOTHING (no report and no exit status), which is
+        the state that stays ``inconclusive``; a run that exited would grade ``bad``.
+        """
         pair = suite_mod.compare_runs(
-            suite_mod.SuiteRun(outcomes={}, exit_code=1, report_found=False),
-            suite_mod.SuiteRun(outcomes={}, exit_code=1, report_found=False),
+            suite_mod.SuiteRun(outcomes={}, report_found=False),
+            suite_mod.SuiteRun(outcomes={}, report_found=False),
         )
         pair.cache = {
             "key": "c" * 64,
@@ -27379,10 +27383,14 @@ class TestOracleGrade:
         grading read ``bad`` and (in the mutant pool) a patch the oracle never judged
         was pooled as known-bad. It must be ``inconclusive`` — and the patched suite
         must not even run, because its result can never be returned.
+
+        v1-m3.1 — the run measured NOTHING (no report **and no exit status**), which
+        is the state that stays ``inconclusive``; a run that exited would grade
+        ``bad`` (see the exit-status and cap tests below).
         """
         wired["hidden_pair"] = suite_mod.compare_runs(
-            suite_mod.SuiteRun(exit_code=4, report_found=False),
-            suite_mod.SuiteRun(exit_code=4, report_found=False),
+            suite_mod.SuiteRun(report_found=False),
+            suite_mod.SuiteRun(report_found=False),
         )
         result = self._grade(wired, tmp_path)
         assert result.apply_ok is True
@@ -27409,7 +27417,7 @@ class TestOracleGrade:
                 exit_code=0,
                 report_found=True,
             ),
-            suite_mod.SuiteRun(exit_code=4, report_found=False),
+            suite_mod.SuiteRun(report_found=False),
         )
         result = self._grade(wired, tmp_path)
         assert result.apply_ok is True
@@ -27432,8 +27440,8 @@ class TestOracleGrade:
         exercises the second guard alone, and never "no regressions".
         """
         wired["patched_pair"] = suite_mod.compare_runs(
-            suite_mod.SuiteRun(exit_code=4, report_found=False),
-            suite_mod.SuiteRun(exit_code=4, report_found=False),
+            suite_mod.SuiteRun(report_found=False),
+            suite_mod.SuiteRun(report_found=False),
         )
         result = self._grade(wired, tmp_path)
         assert result.apply_ok is True
@@ -27444,6 +27452,115 @@ class TestOracleGrade:
         assert len(wired["runs"]) == 2, (
             "the hidden pair was readable, so the patched run still had to be attempted"
         )
+
+    # -- v1-m3.1 item 2: a PATCH-CAUSED report-less run is the patch's failure ---
+    def test_a_hidden_run_that_exited_without_a_report_is_bad(self, wired, tmp_path):
+        """v1-m3.1 §8.1 row 2, applied to the grading: the suite RAN and EXITED.
+
+        A collection or import error the patch caused leaves no report but does
+        leave an exit status, so it is the patch's failure and grades ``bad`` —
+        never the third state. ``inconclusive`` is a state the wave gate halts on,
+        so leaving this as ``inconclusive`` would let one broken patch stop the
+        batch instead of grading one row.
+        """
+        wired["hidden_pair"] = suite_mod.compare_runs(
+            suite_mod.SuiteRun(exit_code=2, report_found=False),
+            suite_mod.SuiteRun(exit_code=2, report_found=False),
+        )
+        result = self._grade(wired, tmp_path)
+        assert result.apply_ok is True
+        assert result.inconclusive is False
+        assert result.patch_good is False
+        assert result.label_input == "bad"
+        assert "no pytest report" in result.error
+
+    def test_a_capped_hidden_run_is_bad_when_the_reference_measured(self, wired, tmp_path):
+        """v1-m3.1 §8.1 row 3 + §8.3, applied to the grading: cap hit, reference completed.
+
+        The cap is ``max(1800, 10 × prepare's native_secs)`` — a patched suite that
+        still cannot finish inside 10× its own prepared time, on a machine that
+        finished it unpatched, is the PATCH's cost. ``prepare``'s ``native_secs`` is
+        the reference (the oracle launches no unpatched run of its own), and here it
+        completed, so the cap hit grades ``bad`` with the named reason.
+        """
+        wired["hidden_pair"] = suite_mod.compare_runs(
+            suite_mod.SuiteRun(timed_out=True, exit_code=1, report_found=False),
+            suite_mod.SuiteRun(timed_out=True, exit_code=1, report_found=False),
+        )
+        result = self._grade(wired, tmp_path, prep_over={"native_secs": 700.0})
+        assert result.apply_ok is True
+        assert result.inconclusive is False
+        assert result.patch_good is False
+        assert result.label_input == "bad"
+        assert result.error == oracle_mod.PATCHED_RUN_CAP_REASON
+
+    def test_a_capped_hidden_run_stays_inconclusive_without_a_reference(self, wired, tmp_path):
+        """The other half: no reference measurement sizes the cap, so a timeout is unattributable.
+
+        ``oracle_prep`` records no ``native_secs`` (a row whose timing was lost, or
+        one prepared before D1), so the cap is the bare floor and the timeout could
+        be the harness rather than the patch — the third state, not ``bad``.
+        """
+        wired["hidden_pair"] = suite_mod.compare_runs(
+            suite_mod.SuiteRun(timed_out=True, report_found=False),
+            suite_mod.SuiteRun(timed_out=True, report_found=False),
+        )
+        result = self._grade(wired, tmp_path)
+        assert result.apply_ok is True
+        assert result.inconclusive is True
+        assert result.patch_good is False
+        assert result.label_input == "inconclusive"
+        assert result.error != oracle_mod.PATCHED_RUN_CAP_REASON
+
+    def test_a_run_with_no_report_and_no_exit_status_stays_inconclusive(self, wired, tmp_path):
+        """v1-m3.1 narrows the third state to the runs that measured NOTHING.
+
+        Neither a report nor an exit status nor a cap hit: the harness never
+        obtained a measurement (a VM that never booted, a tree that could not be
+        written), so the patch is neither credited nor blamed.
+        """
+        wired["hidden_pair"] = suite_mod.compare_runs(
+            suite_mod.SuiteRun(report_found=False),
+            suite_mod.SuiteRun(report_found=False),
+        )
+        result = self._grade(wired, tmp_path)
+        assert result.inconclusive is True
+        assert result.patch_good is False
+        assert result.label_input == "inconclusive"
+
+    def test_a_capped_patched_run_is_bad_when_the_reference_measured(self, wired, tmp_path):
+        """The mirror, on the pair the grading cap was raised for (``prep.test_cmd`` in full).
+
+        The hidden pair is readable, so the second guard is the one under test: the
+        patched full-suite run hit the cap under a completed reference, so it grades
+        ``bad`` rather than being read as "no regressions".
+        """
+        wired["patched_pair"] = suite_mod.compare_runs(
+            suite_mod.SuiteRun(timed_out=True, report_found=False),
+            suite_mod.SuiteRun(timed_out=True, report_found=False),
+        )
+        result = self._grade(wired, tmp_path, prep_over={"native_secs": 700.0})
+        assert result.inconclusive is False
+        assert result.patch_good is False
+        assert result.label_input == "bad"
+        assert result.error == oracle_mod.PATCHED_RUN_CAP_REASON
+        assert len(wired["runs"]) == 2
+
+    def test_a_patched_run_that_exited_without_a_report_is_bad(self, wired, tmp_path):
+        """A collection/import error the patch caused on the patched side, too.
+
+        Unreadable on the patched side used to risk a FALSE APPROVAL (empty
+        ``stable_failures`` ⇒ "no regressions"); with an exit status it is the
+        patch's failure, a definite ``bad``, never ``good``.
+        """
+        wired["patched_pair"] = suite_mod.compare_runs(
+            suite_mod.SuiteRun(exit_code=2, report_found=False),
+            suite_mod.SuiteRun(exit_code=2, report_found=False),
+        )
+        result = self._grade(wired, tmp_path)
+        assert result.patch_good is False
+        assert result.label_input == "bad"
+        assert "the patched run produced no pytest report" in result.error
 
     def test_the_inconclusive_state_survives_its_recorded_round_trip(self):
         """Item B4: a cached ``oracle.json`` re-read must not relabel it ``bad``."""
@@ -27517,6 +27634,43 @@ class TestGradeCandidateCache:
         assert graded.oracle.patch_good is True
         # the conclusive reading replaced the cache, so the next resume is cheap again
         assert json.loads(cache.read_text(encoding="utf-8"))["inconclusive"] is False
+
+    def test_a_pre_change_hang_grade_is_re_graded_under_the_new_rule(
+        self, tmp_path, monkeypatch
+    ):
+        """v1-m3.1 item 2: a cached ``inconclusive`` grade from before the change is re-graded.
+
+        The old rule wrote ``inconclusive = True`` for EVERY report-less grading —
+        including the patch-caused cap hang the new rule grades ``bad``. The reuse
+        guard is ``if not cached_result.inconclusive`` (``runner.py:1042``), so every
+        such pre-change entry is re-graded and the new reading is written back; no
+        version bump is needed for the candidate cache.
+        """
+        bug_prep, candidate, cache = self._candidate(tmp_path)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        # A pre-change entry: the patch applied, the grading hung, old rule ⇒ inconclusive.
+        oracle_mod.save(cache, oracle_mod.OracleResult(apply_ok=True, inconclusive=True))
+
+        def fake_grade(**kwargs):
+            # The new rule: the patched run hit the cap under a completed reference.
+            return oracle_mod.OracleResult(
+                apply_ok=True, patch_good=False, error=oracle_mod.PATCHED_RUN_CAP_REASON
+            )
+
+        monkeypatch.setattr(oracle_mod, "grade", fake_grade)
+        graded = runner_mod.grade_candidate(
+            batch_dir=tmp_path,
+            prep=bug_prep,
+            candidate=candidate,
+            checkpoint="vanta-bi-Demo-1",
+            disk_mb=8192,
+        )
+        assert graded.oracle.inconclusive is False
+        assert graded.oracle.patch_good is False
+        assert graded.oracle.label_input == "bad"
+        written = json.loads(cache.read_text(encoding="utf-8"))
+        assert written["inconclusive"] is False
+        assert written["error"] == oracle_mod.PATCHED_RUN_CAP_REASON
 
     def test_a_conclusive_cache_is_reused(self, tmp_path, monkeypatch):
         bug_prep, candidate, cache = self._candidate(tmp_path)

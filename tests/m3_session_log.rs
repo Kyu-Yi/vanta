@@ -5803,6 +5803,238 @@ fn a_zero_denominator_prints_not_applicable_never_a_zero_percent() {
     );
 }
 
+/// Finding #5 — a spent attempt whose Creator produced NOTHING still spends the
+/// attempt, and both ends of every transition row name the right patch.
+///
+/// [VANTA-WHY] Two facts the old code got wrong, and the runner leans on both.
+/// The Governor counts an attempt whether or not it produced a patch — item B's
+/// failed Creator spends the budget — so `attempts_run` must be the number of
+/// attempts the Governor SPENT, not the number of patches the run produced:
+/// `grade_best_attempt` treats attempt `attempts_run` as the one the primary
+/// grading already describes (and skips it), so a short count makes it grade an
+/// older attempt as if it were the last and drops the newest produced patch.
+/// And a transition row names BOTH of its ends by attempt NUMBER, so the patch
+/// ids must be resolved in that same attempt space: the attempt that produced
+/// nothing resolves to NO patch, never to its neighbour's.
+#[test]
+fn a_creator_failure_on_one_attempt_spends_it_and_keeps_the_patch_index_aligned() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let _ = write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+
+    // THREE different wrong patches, so every produced candidate has its OWN id
+    // and a row that names the wrong neighbour is visible. All three keep the
+    // tree importable and fail the probe (`add(2, 3) == 5`), so the loop runs on.
+    let patch = |body: &str| {
+        format!(
+            "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n\
+             @@ -1,2 +1,2 @@\n def add(a, b):\n-    return a + b\n+    return {body}\n"
+        )
+    };
+    // A well-formed JSON object that is NOT a `CreatorResponse`: the Creator call
+    // cannot read it however many times it is re-asked, so attempt 2 is SPENT with
+    // no patch. Served for every retry of that attempt (the array's element per
+    // Creator call, last repeating), then repaired patches answer the attempts
+    // after it.
+    let unreadable = serde_json::json!({"note": "this answer is not a CreatorResponse"});
+    let script = serde_json::json!([
+        {
+            "patch_text": patch("a - b"),
+            "explanation": "wrong arithmetic",
+            "files_touched": ["calc.py"],
+            "confidence": 0.3
+        },
+        unreadable.clone(),
+        unreadable.clone(),
+        unreadable.clone(),
+        unreadable.clone(),
+        unreadable.clone(),
+        {
+            "patch_text": patch("a + b + 1"),
+            "explanation": "still wrong",
+            "files_touched": ["calc.py"],
+            "confidence": 0.4
+        },
+        {
+            "patch_text": patch("a * b"),
+            "explanation": "still wrong",
+            "files_touched": ["calc.py"],
+            "confidence": 0.5
+        }
+    ])
+    .to_string();
+    let server = StubLlmServer::start_with_creator_script(&script, SINGLE_BEHAVIOR_TEST);
+
+    let output = run_creator_mode_with_output(workspace.path(), &server, 4, &[]);
+    assert!(
+        !output.status.success(),
+        "no candidate ever passed the probe, so the budget must be exhausted; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let summary = run_summary(workspace.path());
+    assert_eq!(
+        summary_value(&summary.summary, "attempts_run"),
+        "4",
+        "four attempts were SPENT — the one whose Creator produced nothing counts like \
+         any other, because the Governor advanced on it; got {}",
+        summary.summary
+    );
+    assert_eq!(
+        summary_value(&summary.summary, "final_decision"),
+        "MaxAttemptsReached",
+        "the run used its whole budget; got {}",
+        summary.summary
+    );
+
+    let rows = read_transition_rows(&find_transitions(workspace.path()));
+    let row_at = |from: u32, to: u32| {
+        rows.iter()
+            .find(|r| r.from_attempt == from && r.to_attempt == to)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no transition row {from}->{to}; rows: {:?}",
+                    rows.iter()
+                        .map(|r| (
+                            r.from_attempt,
+                            r.to_attempt,
+                            r.from_patch_attempt_id.is_some(),
+                            r.to_patch_attempt_id.is_some(),
+                        ))
+                        .collect::<Vec<_>>()
+                )
+            })
+    };
+
+    // Attempt 1 (Governor attempt 0) produced a patch; attempt 2 (Governor
+    // attempt 1) produced NONE. Its side of the row must be NULL, not the patch
+    // its neighbour produced.
+    let unobserved = row_at(0, 1);
+    assert!(
+        unobserved.from_patch_attempt_id.is_some(),
+        "attempt 0 DID produce a patch, so the row's FROM side must name it"
+    );
+    assert!(
+        unobserved.to_patch_attempt_id.is_none(),
+        "attempt 1 produced no patch, so its side of the row must be null — a \
+         neighbouring attempt's id would report a candidate nobody made; got {:?}",
+        unobserved.to_patch_attempt_id
+    );
+
+    // Attempt 3 (Governor attempt 2) produced the SECOND patch. Its row compares
+    // against the last attempt anyone OBSERVED (attempt 0), and its patch id must
+    // be attempt 2's own — the same id the NEXT row names on its FROM side.
+    let observed = row_at(0, 2);
+    assert_eq!(
+        observed.from_patch_attempt_id, unobserved.from_patch_attempt_id,
+        "both rows' FROM side is attempt 0's patch"
+    );
+    assert!(
+        observed.to_patch_attempt_id.is_some(),
+        "attempt 2 produced a patch, so the row's TO side must name it"
+    );
+
+    // Attempt 4 (Governor attempt 3) produced the THIRD patch.
+    let last = row_at(2, 3);
+    assert_eq!(
+        last.from_patch_attempt_id, observed.to_patch_attempt_id,
+        "attempt 2's patch must carry the SAME id on both rows that name it"
+    );
+    assert_ne!(
+        last.from_patch_attempt_id, last.to_patch_attempt_id,
+        "the three patches are different candidates"
+    );
+
+    // The graded final attempt is the LAST attempt that produced a patch — here
+    // attempt 4 — and that is the id every terminal row carries.
+    assert_eq!(
+        summary.patch_attempt_id, last.to_patch_attempt_id,
+        "the run's last PRODUCED patch is attempt 4's, not the patchless attempt's \
+         and not a fabricated id"
+    );
+}
+
+/// Finding #5 — a Creator that NEVER returns a readable patch spends every
+/// attempt and fabricates no patch id.
+///
+/// [VANTA-WHY] The mirror of the test above, and the one that pins the
+/// "no placeholder" rule: `attempt_patch_ids.last()` is the run's
+/// `patch_attempt_id` on every terminal row and in `run.summary`. If a
+/// patchless attempt were padded with a placeholder to keep indices aligned,
+/// that placeholder would be reported as a real candidate. Here nothing is ever
+/// produced, so every one of those fields must be null — and the attempt count
+/// must still be the full budget.
+#[test]
+fn a_creator_that_never_produces_a_patch_spends_every_attempt_and_fabricates_no_patch_id() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let _ = write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+
+    // Every Creator call gets the same unreadable answer (the array's last
+    // element repeats), so every attempt is SPENT and produces nothing.
+    let unreadable = serde_json::json!({"note": "this answer is not a CreatorResponse"});
+    let script = serde_json::json!([
+        unreadable.clone(),
+        unreadable.clone(),
+        unreadable.clone(),
+        unreadable.clone(),
+        unreadable.clone()
+    ])
+    .to_string();
+    let server = StubLlmServer::start_with_creator_script(&script, SINGLE_BEHAVIOR_TEST);
+
+    let output = run_creator_mode_with_output(workspace.path(), &server, 4, &[]);
+    assert!(
+        !output.status.success(),
+        "no candidate was ever produced, so the budget must be exhausted; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let summary = run_summary(workspace.path());
+    assert_eq!(
+        summary_value(&summary.summary, "attempts_run"),
+        "4",
+        "the Governor spent four attempts even though none produced a patch; got {}",
+        summary.summary
+    );
+    assert_eq!(
+        summary_value(&summary.summary, "final_decision"),
+        "MaxAttemptsReached",
+        "the run used its whole budget; got {}",
+        summary.summary
+    );
+
+    // NO patch was ever produced, so the run's `patch_attempt_id` must be NULL —
+    // never a placeholder that a reader would take for a real candidate.
+    assert!(
+        summary.patch_attempt_id.is_none(),
+        "no attempt produced a patch, so the terminal row must carry no patch id; \
+         got {:?}",
+        summary.patch_attempt_id
+    );
+
+    let rows = read_transition_rows(&find_transitions(workspace.path()));
+    assert!(
+        rows.iter()
+            .all(|r| r.from_patch_attempt_id.is_none() && r.to_patch_attempt_id.is_none()),
+        "no attempt produced a patch, so no transition row may name one; got {:?}",
+        rows.iter()
+            .map(|r| (&r.from_patch_attempt_id, &r.to_patch_attempt_id))
+            .collect::<Vec<_>>()
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    assert!(
+        records.iter().all(|r| r.patch_attempt_id.is_none()),
+        "no patch was produced, so no session record may carry a patch id; got {:?}",
+        records
+            .iter()
+            .filter(|r| r.patch_attempt_id.is_some())
+            .map(|r| (&r.phase, &r.patch_attempt_id))
+            .collect::<Vec<_>>()
+    );
+}
+
 // ============================================================================
 // LLM call robustness: streaming liveness, cancel, InfraFailure
 // ============================================================================

@@ -2114,6 +2114,23 @@ pub async fn run(
     // must carry `apply_failed` for ITS OWN attempt — and the same list's length
     // is the run-level `apply_failed_attempts` counter.
     let mut apply_failed_attempt_indices: Vec<u32> = Vec::new();
+    // [VANTA-WHY] v1-m3.2 item #5 — the patch id of every attempt, IN THE
+    // GOVERNOR'S OWN ATTEMPT SPACE (index == attempt number), `None` for an
+    // attempt that produced no patch at all (its Creator answered with output the
+    // call could not read, or its patch never applied). A transition row names
+    // BOTH of its ends by attempt number, so resolving `from_attempt` /
+    // `to_attempt` needs an attempt-indexed map: `attempt_patch_ids` (above)
+    // holds only the REAL patches, in order, so an attempt that produced nothing
+    // shifts every later index and a row would name another attempt's patch — or
+    // read the wrong end as "no patch".
+    //
+    // [VANTA-WHY] Two lists rather than one because they answer two different
+    // questions and neither can be derived from the other without lying.
+    // `attempt_patch_ids` exists so `.last()` is the run's LAST PRODUCED patch —
+    // what `run.summary` and every terminal row carry as `patch_attempt_id` — and
+    // that value must be a real patch id: padding the list with a placeholder to
+    // keep indices aligned would report the placeholder as a real patch.
+    let mut attempt_patch_records: Vec<Option<PatchAttemptId>> = Vec::new();
     // [VANTA-WHY] Rows are flushed to vanta_sessions/{id}_transitions.jsonl as
     // each transition is computed, so a run that aborts mid-way (HarnessFailure
     // is terminal by design) still leaves every row it produced on disk. The
@@ -2367,6 +2384,20 @@ pub async fn run(
     // row. `None` means the guard has not run yet (and, for a plain judge arm,
     // never will). It runs ONCE, before the run's first sandbox.
     let mut import_guard_line: Option<String> = None;
+    // [VANTA-WHY] v1-m3.2 item #5 — how many attempts the Governor has spent when
+    // the loop ends. This is deliberately NOT `attempt_patch_ids.len()`: that list
+    // holds only the attempts that PRODUCED a patch, so a failed Creator (item B)
+    // or a failed apply shortens it by one while the Governor's budget still spent
+    // the attempt. `attempts_run` travels to the runner, which reads attempt
+    // `attempts_run` as the one the primary grading already describes (and skips
+    // it); under-counting it there re-grades an older attempt as if it were the
+    // last and drops the newest produced patch, and it mislabels the final graded
+    // attempt for a dataset row. `attempt` is read from the Governor at the top of
+    // each round, so `attempt + 1` is exactly the number of attempts started —
+    // which also stays right when the loop exits through a path that never calls
+    // `decide` (`AllTestsPassed` in repair mode) or through the deadline check
+    // above the read.
+    let mut attempts_spent: u32 = 0;
     let decision = 'attempts: loop {
         // [VANTA-WHY] §14.15 — the deadline is checked here as well as in the LLM
         // layer, and this is the check that turns "the calls stopped" into "the
@@ -2396,6 +2427,12 @@ pub async fn run(
             break 'attempts GovernorDecision::NeedsReview;
         }
         let attempt = governor.current_attempt();
+        // [VANTA-WHY] v1-m3.2 item #5 — this round is now STARTED, so the count of
+        // spent attempts is this attempt's number plus one, whatever the round goes
+        // on to do. Written here (not after `decide`) so every exit — the item-B
+        // failed Creator, the failed apply, a judge error, `MaxAttemptsReached` —
+        // reports the attempts the Governor really spent.
+        attempts_spent = attempt + 1;
 
         // [VANTA-WHY] §14.14 — this ATTEMPT's shared revise+simplify budget. Fresh
         // per attempt (a new round may revise again), shared by every test in it
@@ -2582,7 +2619,7 @@ pub async fn run(
                             &mut transition_writer,
                             persisted_transitions,
                             &session_id,
-                            &attempt_patch_ids,
+                            &attempt_patch_records,
                             &apply_failed_attempt_indices,
                             &mut metric_rows,
                         )?;
@@ -2661,7 +2698,13 @@ pub async fn run(
         );
         println!("  Patch spans {} file(s)", patch_files.len());
         let patch_attempt_id = patch_attempt_id_for_patch(&patch_text);
+        // [VANTA-WHY] v1-m3.2 item #5 — `attempt_patch_ids` stays the run's list of
+        // REAL patches (`.last()` is `patch_attempt_id` on every terminal row and in
+        // `run.summary`, so a placeholder here would be reported as a patch that
+        // never existed); `attempt_patch_records` is the same id filed under this
+        // attempt's own number, which is what a transition row is stamped from.
         attempt_patch_ids.push(patch_attempt_id.clone());
+        record_attempt_patch(&mut attempt_patch_records, attempt, patch_attempt_id.clone());
         let testing_iteration_id = fresh_testing_iteration_id();
 
         // [VANTA-WHY] M3 item 9 — store the patch THIS attempt produced, so
@@ -2915,7 +2958,7 @@ pub async fn run(
                     &mut transition_writer,
                     persisted_transitions,
                     &session_id,
-                    &attempt_patch_ids,
+                    &attempt_patch_records,
                     &apply_failed_attempt_indices,
                     &mut metric_rows,
                 )?;
@@ -4592,7 +4635,7 @@ pub async fn run(
             &mut transition_writer,
             persisted_transitions,
             &session_id,
-            &attempt_patch_ids,
+            &attempt_patch_records,
             &apply_failed_attempt_indices,
             &mut metric_rows,
         )?;
@@ -5364,7 +5407,14 @@ pub async fn run(
     // AttackerGenerated rows and the line still claimed there was no transition,
     // which is false about the file on disk. When rows exist, print the metric
     // they carry instead.
-    let attempts_run = attempt_patch_ids.len();
+    // [VANTA-WHY] v1-m3.2 item #5 — the attempt count is the Governor's spent
+    // attempts, not the number of patches produced: a run whose Creator failed on
+    // one attempt of four spent four, and its LAST produced patch is the one the
+    // primary grading describes. Reporting the patch count here made the runner
+    // treat an earlier attempt as the primary (and skip it) while grading the last
+    // produced tree separately, so the row's `attempts_run`, its per-attempt
+    // grading and its label disagreed about which attempt the verdict was about.
+    let attempts_run = attempts_spent as usize;
     let fixed_at_attempt_1 = decision == GovernorDecision::AllTestsPassed && attempts_run == 1;
 
     // ---- Per-call token accounting (plans/bugsinpy.md §4.3) ----
@@ -7393,18 +7443,20 @@ fn append_derived_rows(
 
 /// Append every transition not yet persisted and return the new cursor.
 ///
-/// [VANTA-WHY] One definition, called from two places: the ordinary post-attempt
-/// flush, and the repair-mode failed-apply path (which must persist its censored
-/// rows BEFORE the loop continues, because if the budget is then exhausted the
-/// ordinary flush never runs again and the hole would be lost). The rows are
-/// also kept in memory so the live EIR/ECR print derives from the same rows with
-/// the one shared function rather than a second rule.
+/// [VANTA-WHY] One definition, called from THREE places: the ordinary
+/// post-attempt flush, the repair-mode failed-apply path (which must persist its
+/// censored rows BEFORE the loop continues, because if the budget is then
+/// exhausted the ordinary flush never runs again and the hole would be lost),
+/// and item B's failed-Creator path (which spends the attempt with no patch and
+/// must persist its censored rows for the same reason). The rows are also kept
+/// in memory so the live EIR/ECR print derives from the same rows with the one
+/// shared function rather than a second rule.
 fn flush_transition_rows(
     governor: &Governor,
     writer: &mut TransitionWriter,
     persisted: usize,
     session_id: &SessionId,
-    attempt_patch_ids: &[PatchAttemptId],
+    attempt_patch_records: &[Option<PatchAttemptId>],
     apply_failed_attempts: &[u32],
     metric_rows: &mut Vec<TransitionRow>,
 ) -> Result<usize, io::Error> {
@@ -7415,7 +7467,7 @@ fn flush_transition_rows(
     let rows: Vec<TransitionRow> = transitions[persisted..]
         .iter()
         .map(|t| {
-            stamp_transition_row(t, session_id, attempt_patch_ids, apply_failed_attempts)
+            stamp_transition_row(t, session_id, attempt_patch_records, apply_failed_attempts)
         })
         .collect();
     writer.append(&rows)?;
@@ -7423,18 +7475,55 @@ fn flush_transition_rows(
     Ok(transitions.len())
 }
 
+/// File `attempt`'s patch id under the attempt's OWN number.
+///
+/// [VANTA-WHY] v1-m3.2 item #5 — a transition row names both of its ends by
+/// Governor attempt NUMBER (`from_attempt`/`to_attempt`), so resolving them needs
+/// a map keyed that way. `attempt_patch_ids` is a list of the patches the run
+/// PRODUCED, which is index-aligned with the attempt numbers only while every
+/// attempt produces one: after an attempt with no patch (its Creator's answer
+/// could not be read) the list is one shorter than the attempt space, and a row
+/// asking for attempt N would be handed attempt N+1's patch — or, at the end,
+/// nothing, which reads as "that patch never existed" for an attempt that did
+/// produce one.
+///
+/// [VANTA-WHY] Growth, not a placeholder: indices below `attempt` that were never
+/// recorded are filled with `None`, which is the honest value for "this attempt
+/// produced no patch". Nothing is ever written into `attempt_patch_ids` for such
+/// an attempt, because every terminal row and `run.summary` carries
+/// `attempt_patch_ids.last()` as the run's `patch_attempt_id`.
+fn record_attempt_patch(
+    records: &mut Vec<Option<PatchAttemptId>>,
+    attempt: u32,
+    patch_attempt_id: PatchAttemptId,
+) {
+    let index = attempt as usize;
+    if records.len() <= index {
+        records.resize(index + 1, None);
+    }
+    records[index] = Some(patch_attempt_id);
+}
+
 fn stamp_transition_row(
     transition: &AttemptTransition,
     session_id: &SessionId,
-    attempt_patch_ids: &[PatchAttemptId],
+    attempt_patch_records: &[Option<PatchAttemptId>],
     apply_failed_attempts: &[u32],
 ) -> TransitionRow {
-    let from_id = attempt_patch_ids
+    // [VANTA-WHY] v1-m3.2 item #5 — look the id up in the GOVERNOR'S attempt
+    // space, and keep `None` when the attempt at that number produced no patch.
+    // `record_attempt_patch` pads every gap with `None`, so the map never hands a
+    // row the id of a different attempt. A number past the end of the map is an
+    // attempt that has not run (or a trailing patchless attempt, which pads
+    // nothing) and is `None` for the same reason.
+    let from_id = attempt_patch_records
         .get(transition.from_attempt as usize)
-        .cloned();
-    let to_id = attempt_patch_ids
+        .cloned()
+        .flatten();
+    let to_id = attempt_patch_records
         .get(transition.to_attempt as usize)
-        .cloned();
+        .cloned()
+        .flatten();
     // [VANTA-WHY] The flag belongs to the NEWER side: the row exists because that
     // attempt's patch never reached the tree. Taken from the attempt index rather
     // than a run-level bool so a later successful attempt's rows are not tainted
@@ -8107,6 +8196,7 @@ mod tests {
         open_fixed_round_record,
         patch_attempt_id_for_patch,
         prompt_over_budget_reason,
+        record_attempt_patch,
         record_new_static_findings,
         refuse_reasoning_budget_on_judge_arm,
         rejection_signal_message, render_committed_test_file, require_clean_target_repo_for_open_pr,
@@ -9340,7 +9430,10 @@ mod tests {
             test_intent: TestIntent::BehaviorPreservation,
         };
         let session_id = SessionId::new("apply-failed-test");
-        let attempt_ids = vec![PatchAttemptId::new("p0"), PatchAttemptId::new("p1")];
+        let attempt_ids = vec![
+            Some(PatchAttemptId::new("p0")),
+            Some(PatchAttemptId::new("p1")),
+        ];
 
         let row = stamp_transition_row(&transition, &session_id, &attempt_ids, &[1]);
         assert!(row.apply_failed, "the failed-apply attempt must be marked");

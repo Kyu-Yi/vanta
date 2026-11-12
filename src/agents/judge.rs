@@ -282,6 +282,15 @@ fn is_unreadable_answer(message: &str) -> bool {
 // third attempt would make the judge arm's call count depend on the invocation
 // rather than on the arm, which is exactly what the arm registry exists to
 // prevent.
+//
+// [VANTA-WHY] v1-m3.2 item C — the ONE exception is the failure a retry is FOR.
+// An answer the parser could not read raises this call's limit to
+// `max_attempts + PARSE_FAILURE_EXTRA_ATTEMPTS`, so a judge that cannot be read
+// sends FOUR requests, not two, the last two carrying the parser's own complaint
+// (`append_parse_correction`). Every other failure — a transport error, the
+// deadline, a prompt over the window, an answer cut off at the cap — keeps the
+// two, so "one call plus one retry" is still what this arm costs unless the
+// model answered with something unreadable.
 pub async fn judge_candidate(
     cfg: &LlmConfig,
     request: &JudgeRequest,

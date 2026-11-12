@@ -2335,7 +2335,8 @@ fn append_truncation_nudge(messages: &mut Vec<Value>) {
 /// The ordinary budget is the caller's own (`cfg.retry_attempts`, three by
 /// default, and two for the judge, which is deliberately one call plus one
 /// retry), so the extension is relative: two more attempts than the caller's
-/// budget, five at the default three. Every other failure class — transport,
+/// budget — five at the default three, and FOUR for the judge, whose two-attempt
+/// budget this is the one exception to. Every other failure class — transport,
 /// deadline, truncation — keeps the caller's budget exactly.
 pub const PARSE_FAILURE_EXTRA_ATTEMPTS: u32 = 2;
 

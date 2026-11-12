@@ -1317,9 +1317,11 @@ const JUDGE_APPROVE_ANSWER: &str =
 const JUDGE_REJECT_ANSWER: &str =
     r#"{"verdict":"reject","confidence":0.8,"reason":"the diff leaves the reported bug in place"}"#;
 
-/// Prose the judge parser cannot read as a verdict — not JSON at all, so after
-/// the one retry the run ends as `JudgeFailed`. Served RAW (unnormalised), which
-/// is why `start_with_judge` takes a string rather than a `serde_json::Value`.
+/// Prose the judge parser cannot read as a verdict — not JSON at all, so the
+/// call spends its whole parse budget (four requests: `max_attempts` two plus the
+/// two item C adds) and the run ends as `JudgeFailed`. Served RAW
+/// (unnormalised), which is why `start_with_judge` takes a string rather than a
+/// `serde_json::Value`.
 const JUDGE_UNREADABLE_ANSWER: &str = "I am sorry, I cannot decide from this diff.";
 
 
@@ -7384,8 +7386,9 @@ fn the_judge_suite_arm_shows_the_model_the_failing_tests_and_the_summary() {
     assert_eq!(summary_value(&summary.summary, "llm_calls_site_judge"), "1");
 }
 
-/// M3 item 7 — an answer the judge cannot read is retried ONCE, then ends the run
-/// as `JudgeFailed` with its own exit code 4 — never `InfraFailure`, never a
+/// M3 item 7 — an answer the judge cannot read is retried until the parse budget
+/// is spent (v1-m3.2 item C raised it to four requests), then ends the run as
+/// `JudgeFailed` with its own exit code 4 — never `InfraFailure`, never a
 /// rejection.
 ///
 /// [VANTA-WHY] "The machine is broken" and "the model said something we cannot
@@ -7394,7 +7397,7 @@ fn the_judge_suite_arm_shows_the_model_the_failing_tests_and_the_summary() {
 /// not be. The exit code (4) is what lets the harness map it to `judge_failed`
 /// without treating it as an infra fault.
 #[test]
-fn an_unreadable_judge_answer_is_retried_once_then_fails_with_exit_four() {
+fn an_unreadable_judge_answer_spends_the_parse_budget_then_fails_with_exit_four() {
     let _serial = serial_run();
     let workspace = TempDir::new().unwrap();
     let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
@@ -7426,9 +7429,15 @@ fn an_unreadable_judge_answer_is_retried_once_then_fails_with_exit_four() {
     );
     assert_eq!(
         server.request_kinds(),
-        vec!["judge".to_string(), "judge".to_string()],
-        "the plan fixes the judge at one call plus ONE retry on malformed JSON, and \
-         nothing more; kinds={:?}",
+        vec![
+            "judge".to_string(),
+            "judge".to_string(),
+            "judge".to_string(),
+            "judge".to_string()
+        ],
+        "an unreadable answer is the one failure a retry can fix, so item C's \
+         extension applies: `max_attempts` two plus `PARSE_FAILURE_EXTRA_ATTEMPTS` \
+         two is four requests, and nothing more; kinds={:?}",
         server.request_kinds()
     );
 

@@ -6057,6 +6057,41 @@ fn a_creator_that_never_produces_a_patch_spends_every_attempt_and_fabricates_no_
             .map(|r| (&r.phase, &r.patch_attempt_id))
             .collect::<Vec<_>>()
     );
+
+    // Finding #1 (CodeRabbit round 2) — the recovery feedback a spent Creator
+    // attempt hands the next one must RESTATE the contract the parser requires.
+    // `creator_generate_patch` deserialises a `CreatorResponse` JSON object, but
+    // the old wording asked for "ONLY the corrected unified diff" — the one shape
+    // the parser rejects — so a Creator that obeyed it was refused again and the
+    // recovery round was spent for nothing.
+    let feedback_tails: Vec<String> = server
+        .request_bodies()
+        .into_iter()
+        .filter_map(|body| {
+            body.split("PRIOR FEEDBACK (from previous attempt, address this):")
+                .nth(1)
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        !feedback_tails.is_empty(),
+        "the attempts after the first carry the recovery feedback, so at least one Creator \
+         body must quote it; got {} request(s)",
+        server.request_count()
+    );
+    for tail in &feedback_tails {
+        for field in ["patch_text", "explanation", "files_touched", "confidence"] {
+            assert!(
+                tail.contains(field),
+                "the recovery feedback must restate the required JSON field `{field}`; got {tail}"
+            );
+        }
+        assert!(
+            !tail.to_lowercase().contains("unified diff"),
+            "the recovery feedback must NOT ask for a bare diff, which the Creator parser \
+             rejects; got {tail}"
+        );
+    }
 }
 
 // ============================================================================

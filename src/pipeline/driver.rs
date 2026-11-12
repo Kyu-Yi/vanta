@@ -2616,10 +2616,20 @@ pub async fn run(
                             &apply_failed_attempt_indices,
                             &mut metric_rows,
                         )?;
+                        // [VANTA-WHY] v1-m3.2 CodeRabbit round 2 — the re-ask must
+                        // state the shape the PARSER requires, not a different one:
+                        // the old "return ONLY the corrected unified diff" asked for
+                        // exactly the format `creator_generate_patch` rejects, so a
+                        // Creator that obeyed it was refused again and the recovery
+                        // round was spent for nothing. The contract is quoted from the
+                        // same text the system prompt ends with, so the two cannot
+                        // drift apart.
                         prior_feedback = Some(format!(
-                            "The previous attempt produced no usable patch — the answer could not \
-                             be read as a patch:\n{message}\nPlease return ONLY the corrected \
-                             unified diff."
+                            "The previous attempt produced no usable patch — the answer could \
+                             not be read as the CreatorResponse JSON object the parser \
+                             requires:\n{message}\nReturn ONLY a corrected JSON object. Its \
+                             required shape is:\n{contract}",
+                            contract = crate::agents::creator::CREATOR_OUTPUT_CONTRACT
                         ));
                         let decision =
                             governor.decide(governor_mode, AttemptVerdict::Inconclusive, false);

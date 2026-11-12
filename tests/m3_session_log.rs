@@ -3246,9 +3246,12 @@ fn the_batched_audit_is_one_call_per_round_with_the_same_decisions() {
 
 /// [VANTA-WHY] §14.5 — an answer that does not cover the round is a parse failure
 /// of the whole response, so it is retried like any other malformed structured
-/// output; and when it finally fails, every test falls back to EXACTLY the
-/// single-call failure shape. Both halves are asserted against the flag-off run
-/// of the same fixture, whose calls fail the same way at the same place.
+/// output — and, since v1-m3.2 item C, that retry spends EACH call's raised parse
+/// budget of five (`max_attempts` three plus the two `PARSE_FAILURE_EXTRA_ATTEMPTS`),
+/// not the caller's three; and when it finally fails, every test falls back to
+/// EXACTLY the single-call failure shape. Both halves are asserted against the
+/// flag-off run of the same fixture, whose calls fail the same way at the same
+/// place.
 ///
 /// This is also the other half of the truncation test's contract: an answer that
 /// was NOT cut off keeps its retries, and the session log tells the two events
@@ -3291,7 +3294,11 @@ fn a_batch_the_auditor_cannot_answer_falls_back_to_the_single_call_failure_shape
     let (kinds_on, bodies_on, decisions_on, transports_on, output_on) =
         run(&[("VANTA_BATCH_AUDIT", "on")]);
 
-    // Off: three tests, each call retried the full budget = 1 + 3x3.
+    // Off: three tests, each call spends the FULL parse budget. v1-m3.2 item C
+    // raised that budget from the caller's three to FIVE (`max_attempts` + the two
+    // `PARSE_FAILURE_EXTRA_ATTEMPTS`), because an unreadable answer — unlike a
+    // transport failure or a cut-off one — is the one failure a corrective re-ask
+    // can fix. So this is 1 generate + 3 tests x 5 attempts.
     assert_eq!(
         kinds_off,
         vec![
@@ -3305,15 +3312,30 @@ fn a_batch_the_auditor_cannot_answer_falls_back_to_the_single_call_failure_shape
             "intent_audit",
             "intent_audit",
             "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
         ],
-        "with the flag off an unparseable audit is retried per test"
+        "with the flag off an unparseable audit is retried per test, on item C's raised parse budget"
     );
-    // On: ONE logical call, retried three times. The retries are the point: this
-    // answer was NOT cut off, so the model can answer it differently next time,
-    // and only a cut-off answer skips the budget (see the truncation test).
+    // On: ONE logical call, retried on the SAME raised budget — five attempts spent
+    // on the batch instead of five on each of three calls. The retries are the
+    // point: this answer was NOT cut off, so the model can answer it differently
+    // next time, and only a cut-off answer skips the budget (see the truncation
+    // test).
     assert_eq!(
         kinds_on,
-        vec!["generate", "intent_audit", "intent_audit", "intent_audit"],
+        vec![
+            "generate",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+        ],
         "an incomplete batch must be retried as ONE call, not split into three"
     );
     // …and the session log names the event, since the call count no longer has to

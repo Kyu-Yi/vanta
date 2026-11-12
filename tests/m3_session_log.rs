@@ -122,6 +122,17 @@ struct StubLlmServer {
     /// hosted API uses when a `flex` tier has no capacity, so the run records the
     /// refusal under `resource_unavailable` rather than the generic rate limit.
     busy_next: Arc<Mutex<Vec<String>>>,
+    /// Exact reply texts served one per CHAT request, in order, the last
+    /// repeating. Installed after `start*` with `script_raw_replies`.
+    ///
+    /// [VANTA-WHY] v1-m3.2 item C — the kind-based scripts above cannot express
+    /// every malformed reply the parser tests need. A duplicate JSON key is
+    /// COLLAPSED by `serde_json::Value` (last one wins), so
+    /// `{"test_name":"a","test_name":"b"}` cannot survive the round trip through
+    /// the stub's own `Value` — and "the parser saw a duplicate field" is exactly
+    /// the fixture item C's corrective-reprompt test needs. Serving the text
+    /// verbatim is the only way to hand the client the bytes the test wrote.
+    scripted_raw: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
 }
@@ -327,6 +338,7 @@ impl StubLlmServer {
         let truncate_batch_audit = Arc::new(AtomicBool::new(false));
         let truncate_next = Arc::new(Mutex::new(Vec::new()));
         let busy_next = Arc::new(Mutex::new(Vec::new()));
+        let scripted_raw = Arc::new(Mutex::new(Vec::<String>::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
         let request_count_clone = Arc::clone(&request_count);
@@ -336,6 +348,7 @@ impl StubLlmServer {
         let truncate_batch_audit_clone = Arc::clone(&truncate_batch_audit);
         let truncate_next_clone = Arc::clone(&truncate_next);
         let busy_next_clone = Arc::clone(&busy_next);
+        let scripted_raw_clone = Arc::clone(&scripted_raw);
         let stop_clone = Arc::clone(&stop);
         // The Attacker has two call sites with different response shapes: a
         // generation call expects `{"tests":[...]}` (AttackerResponse), while a
@@ -365,6 +378,9 @@ impl StubLlmServer {
             // How many Creator calls have been answered, so a scripted array of
             // answers can be served in order.
             let mut creator_calls = 0_usize;
+            // How many chat requests have consumed a `scripted_raw` reply, so the
+            // verbatim script is likewise served in order (item C).
+            let mut scripted_calls = 0_usize;
             while !stop_clone.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _addr)) => {
@@ -531,6 +547,23 @@ impl StubLlmServer {
                                 .cloned()
                                 .unwrap_or_else(|| attacker_value.clone())
                         };
+                        // [VANTA-WHY] v1-m3.2 item C — the verbatim script, consumed
+                        // one reply per chat request and repeating its last entry. Taken
+                        // BEFORE the kind-based answers because a reply the test wrote
+                        // byte for byte (a duplicate JSON key) outranks a reply
+                        // reconstructed from a `Value`.
+                        let scripted_now: Option<String> = {
+                            let queued = scripted_raw_clone
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if queued.is_empty() {
+                                None
+                            } else {
+                                let index = scripted_calls.min(queued.len() - 1);
+                                scripted_calls += 1;
+                                Some(queued[index].clone())
+                            }
+                        };
                         let content = if request_kind == "creator" {
                             // [VANTA-WHY] A creator answer may be a SCRIPT: a JSON
                             // array whose elements are served one per Creator call
@@ -623,7 +656,9 @@ impl StubLlmServer {
                         } else {
                             None
                         };
-                        let (content_text, finish_reason) = if let Some(raw) = judge_raw {
+                        let (content_text, finish_reason) = if let Some(raw) = scripted_now {
+                            (raw, None)
+                        } else if let Some(raw) = judge_raw {
                             (raw, None)
                         } else if cut_off_batch {
                             (
@@ -767,6 +802,7 @@ impl StubLlmServer {
             truncate_batch_audit,
             truncate_next,
             busy_next,
+            scripted_raw,
             stop,
             join: Some(join),
         }
@@ -802,6 +838,19 @@ impl StubLlmServer {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         queued.clear();
         queued.extend(kinds.iter().map(|kind| kind.to_string()));
+    }
+
+    /// Serve these exact reply texts, one per chat request, in order, the last
+    /// repeating — the item C fixture for replies that cannot round-trip through
+    /// `serde_json::Value` (a duplicate JSON key is collapsed by it). Called
+    /// after `start*`.
+    fn script_raw_replies(&self, replies: &[&str]) {
+        let mut queued = self
+            .scripted_raw
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queued.clear();
+        queued.extend(replies.iter().map(|reply| reply.to_string()));
     }
 
     fn request_count(&self) -> usize {
@@ -9940,5 +9989,267 @@ fn the_api_key_never_reaches_a_file_stream_or_record_when_the_provider_echoes_it
         "the echoed credential must have been replaced by the marker, proving \
          the message was built and redacted rather than never built; got {}",
         infra.summary
+    );
+}
+
+// ============================================================================
+// v1-m3.2 item C — the corrective reprompt and the parse-failure attempt budget
+// ============================================================================
+//
+// [VANTA-WHY] v1-m3.1's wave 1 lost two rows to a structured call that answered
+// three times with JSON the schema parser refused, and each retry asked the
+// IDENTICAL question — a re-draw at the same prompt, which on a pinned seed has
+// every reason to come back wrong the same way. Item C makes the retry a
+// DIFFERENT question: the next request carries the parser's own complaint and the
+// head of the reply that earned it (`llm::append_parse_correction`), and a call
+// that fails on the PARSER is allowed two attempts beyond the caller's budget.
+//
+// [VANTA-WHY] These tests drive `structured_call_with_retry` DIRECTLY rather than
+// through `vanta_m3`: what is under test is the helper's own turn-taking, and a
+// process run would only reach it through a sandbox and a real pytest — the
+// property would then be observable only where that holds. The stub is the one
+// the fixture runs use, so the bytes asserted here are the bytes every call site
+// really sends.
+//
+// [VANTA-WHY] Two of the replies are served VERBATIM through `script_raw_replies`
+// because one of them cannot survive `serde_json::Value`: `serde`'s own duplicate
+// key check is the malformed fixture the plan names, and a `Value` map keeps only
+// the last of two equal keys.
+
+/// The answer shape these tests parse. Deliberately tiny, so a reply can only be
+/// rejected for the two reasons the plan names: a duplicate field, or an intent
+/// outside the enum.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ItemCReply {
+    tests: Vec<ItemCProbe>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ItemCProbe {
+    test_name: String,
+    intent: ItemCIntent,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+enum ItemCIntent {
+    BugReproduction,
+    BehaviorPreservation,
+}
+
+/// One `structured_call_with_retry` against `server`, at the caller's ordinary
+/// budget, parsing `ItemCReply`.
+async fn itemc_structured_call(
+    server: &StubLlmServer,
+    max_attempts: u32,
+) -> Result<ItemCReply, String> {
+    let cfg = vanta::config::LlmConfig {
+        base_url: server.base_url.clone(),
+        model_id: "stub-model".to_string(),
+        ..Default::default()
+    };
+    let client = vanta::llm::build_reqwest_client(&cfg).expect("a reqwest client can be built");
+    // The call site's own turns. They are the same on every attempt — the
+    // CORRECTION is the helper's, appended after them, which is what lets this
+    // test see it as a separate turn in the recorded body.
+    let build_messages = |_attempt: u32| {
+        vec![serde_json::json!({
+            "role": "system",
+            "content": "item C fixture: answer with the tests JSON the schema asks for",
+        })]
+    };
+    // The parse closure mirrors a real call site's: the transport hands back the
+    // `===CONTENT=== … ===REASONING=== …` envelope, so the JSON is LOCATED first
+    // and the schema is applied to that. A closure that parsed the envelope
+    // directly would fail on a shape no call site ever sees.
+    let parse_into_typed = |raw: &str| -> Result<ItemCReply, String> {
+        let candidate = vanta::llm::extract_json_candidate(raw).map_err(|err| err.to_string())?;
+        serde_json::from_str::<ItemCReply>(candidate).map_err(|err| err.to_string())
+    };
+
+    vanta::llm::structured_call_with_retry(
+        &client,
+        &cfg,
+        max_attempts,
+        "itemc",
+        "itemc_fixture",
+        build_messages,
+        serde_json::Value::Null,
+        parse_into_typed,
+    )
+    .await
+    .map_err(|err| err.to_string())
+}
+
+/// Item C, half one: the retry after a parse failure is a CORRECTED question.
+///
+/// [VANTA-WHY] The assertion that matters is not "it recovered" — a re-draw
+/// recovers too, sometimes — but that the SECOND request carries the parser's
+/// complaint and the head of the reply that earned it. Without that, "the retry
+/// asks the same thing again" and "the retry corrects" are indistinguishable
+/// from the outside, and the wave-1 rows are the cost of the difference.
+#[tokio::test]
+async fn itemc_a_duplicate_field_reprompts_with_the_parser_error_and_recovers_on_try_two() {
+    let _serial = serial_run();
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    server.script_raw_replies(&[
+        // Attempt 1: `test_name` twice. `serde` refuses the duplicate, and a
+        // `serde_json::Value` cannot even REPRESENT this reply — which is why the
+        // stub serves it verbatim. The `note` is a plain marker so the test can
+        // prove the PREVIEW travelled, not merely the error.
+        r#"{"tests":[{"test_name":"itemc_dup","test_name":"itemc_dup_again","intent":"BugReproduction"}],"note":"ITEMC_MALFORMED_DUPLICATE"}"#,
+        // Attempt 2: the corrected object.
+        r#"{"tests":[{"test_name":"itemc_dup","intent":"BugReproduction"}]}"#,
+    ]);
+
+    let reply = itemc_structured_call(&server, 3)
+        .await
+        .expect("the stub's second answer is a readable object, so the call must recover");
+
+    assert_eq!(reply.tests.len(), 1);
+    assert_eq!(reply.tests[0].test_name, "itemc_dup");
+    assert_eq!(
+        server.request_count(),
+        2,
+        "a parse failure must cost exactly one extra request here: the retry is the \
+         second request, and nothing else is sent"
+    );
+
+    let bodies = server.request_bodies();
+    assert_eq!(bodies.len(), 2);
+    let retry = &bodies[1];
+    assert!(
+        retry.contains("could not be read as the required JSON"),
+        "the retry must say the previous reply was unreadable; got:\n{retry}"
+    );
+    assert!(
+        retry.contains("duplicate field"),
+        "the retry must carry the PARSER's own complaint, quoted from the failure; \
+         got:\n{retry}"
+    );
+    assert!(
+        retry.contains("ITEMC_MALFORMED_DUPLICATE"),
+        "the retry must carry the head of the reply that earned the refusal — the \
+         model cannot correct a mistake it is not shown; got:\n{retry}"
+    );
+    // The control: attempt 1 is the call site's own prompt and nothing else. A
+    // correction turn here would mean the helper corrects before anything failed,
+    // which would move the cacheable prefix of every run.
+    assert!(
+        !bodies[0].contains("could not be read as the required JSON"),
+        "attempt 1 must carry no correction; got:\n{}",
+        bodies[0]
+    );
+}
+
+/// Item C, half two: the parser's failure buys TWO extra attempts, so a call can
+/// recover as late as the fifth, and every retry is corrected.
+#[tokio::test]
+async fn itemc_a_parse_failure_gets_two_extra_attempts_and_recovers_on_the_fifth() {
+    let _serial = serial_run();
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let bad_enum = r#"{"tests":[{"test_name":"itemc_enum","intent":"NotALabel"}],"note":"ITEMC_MALFORMED_ENUM"}"#;
+    let good = r#"{"tests":[{"test_name":"itemc_enum","intent":"BehaviorPreservation"}]}"#;
+    // Four refusals, then a readable answer. The caller's budget is THREE, so a
+    // fifth request is only sent if a parse failure really raised the limit.
+    server.script_raw_replies(&[bad_enum, bad_enum, bad_enum, bad_enum, good]);
+
+    let reply = itemc_structured_call(&server, 3)
+        .await
+        .expect("the fifth attempt must be made, and its answer read");
+
+    assert_eq!(reply.tests[0].intent, ItemCIntent::BehaviorPreservation);
+    assert_eq!(
+        server.request_count(),
+        5,
+        "the caller's budget is three and a parse failure adds two: five attempts, \
+         and recovery on the last one must be reached"
+    );
+
+    let bodies = server.request_bodies();
+    for (index, body) in bodies.iter().enumerate().skip(1) {
+        assert!(
+            body.contains("unknown variant"),
+            "attempt {} must carry the parser's complaint: it is the turn that makes \
+             the retry a different question; got:\n{body}",
+            index + 1
+        );
+        assert!(
+            body.contains("ITEMC_MALFORMED_ENUM"),
+            "attempt {} must carry the failing preview too; got:\n{body}",
+            index + 1
+        );
+    }
+    assert!(
+        !bodies[0].contains("unknown variant"),
+        "attempt 1 carries no correction: nothing had failed when it was built"
+    );
+}
+
+/// The exhausted case must still SAY it was the parser, and how many attempts it
+/// cost — that string is what the driver classifies (item B) and what a reader
+/// greps when a wave loses a row.
+#[tokio::test]
+async fn itemc_an_exhausted_parse_failure_reports_five_attempts_and_the_parser_error() {
+    let _serial = serial_run();
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    server.script_raw_replies(&[r#"{"tests":[{"test_name":"itemc_dud","intent":"NotALabel"}]}"#]);
+
+    let error = itemc_structured_call(&server, 3)
+        .await
+        .expect_err("every attempt answers an unreadable reply, so the call must fail");
+
+    assert!(
+        error.contains("PARSE ERR"),
+        "an exhausted parse failure must carry the marker item B classifies on; \
+         got:\n{error}"
+    );
+    assert!(
+        error.contains("unknown variant `NotALabel`"),
+        "the final failure must quote the parser; got:\n{error}"
+    );
+    assert!(
+        error.contains("5/5 attempts FAILED"),
+        "the failure must report the RAISED limit, not the caller's three; \
+         got:\n{error}"
+    );
+    assert_eq!(server.request_count(), 5);
+}
+
+/// The extension is the PARSER's alone: a transport failure still gets exactly
+/// the caller's three attempts.
+///
+/// [VANTA-WHY] This is the test that keeps item C from becoming "retry everything
+/// five times". A 500 is not the model's output — the answer never arrived — and
+/// item B is explicit that such a failure stays `InfraFailure` (item D's row-level
+/// retry is the remedy for it, not more model attempts). If this loop were raised
+/// for every failure class, both claims would be false and every unreachable
+/// server would cost five requests a call.
+#[tokio::test]
+async fn itemc_a_transport_failure_still_gets_only_the_callers_three_attempts() {
+    let _serial = serial_run();
+    let server = StubLlmServer::start_streaming(None, SINGLE_BEHAVIOR_TEST, StubBehaviour::Fail);
+
+    let error = itemc_structured_call(&server, 3)
+        .await
+        .expect_err("a server that answers 500 to every call must fail the call");
+
+    assert!(
+        error.contains("3/3 attempts FAILED"),
+        "a transport failure must keep the caller's budget of three; got:\n{error}"
+    );
+    assert!(
+        error.contains("HTTP ERROR 500"),
+        "the failure must name the transport, not the parser; got:\n{error}"
+    );
+    assert!(
+        !error.contains("PARSE ERR"),
+        "a 500 is the machine, not the model's output — it must not be dressed as a \
+         parse failure; got:\n{error}"
+    );
+    assert_eq!(
+        server.request_count(),
+        3,
+        "the two extra attempts exist for the parser alone, so an unreachable server \
+         must not spend them"
     );
 }

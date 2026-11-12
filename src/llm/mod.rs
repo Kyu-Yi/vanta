@@ -2325,6 +2325,44 @@ fn append_truncation_nudge(messages: &mut Vec<Value>) {
     }));
 }
 
+/// How many EXTRA attempts a call gets once it has failed on the parser
+/// (v1-m3.2 item C).
+///
+/// [VANTA-WHY] A parse failure is the one failure a retry can actually fix from
+/// the inside: the transport never delivered, the context gate never sent, and a
+/// cut-off answer needs a smaller question or a bigger cap — but a wrong answer
+/// to a schema question is correctable by TELLING the model what the parser saw.
+/// The ordinary budget is the caller's own (`cfg.retry_attempts`, three by
+/// default, and two for the judge, which is deliberately one call plus one
+/// retry), so the extension is relative: two more attempts than the caller's
+/// budget, five at the default three. Every other failure class — transport,
+/// deadline, truncation — keeps the caller's budget exactly.
+pub const PARSE_FAILURE_EXTRA_ATTEMPTS: u32 = 2;
+
+/// Append the corrective user turn that follows a parse failure (item C).
+///
+/// [VANTA-WHY] The call sites already append their own `REPROMPT (attempt #N)`
+/// turn, but that turn can only restate the SCHEMA — it is built before the call
+/// is made and cannot know what went wrong. This turn carries the two facts the
+/// generic reprompt cannot: the parser's own error and the head of the reply that
+/// earned it. That is what makes the retry a NEW question rather than the same
+/// one asked again, which matters most at the pinned temperature the auditor
+/// runs at: the identical request would reach the identical wrong prefix.
+///
+/// A trailing turn rather than a rewrite, for the same reason as
+/// `append_truncation_nudge`: attempt 1 — the only attempt a run that parses
+/// first time ever makes — stays byte-identical, so no cacheable prefix moves.
+fn append_parse_correction(messages: &mut Vec<Value>, parse_err: &str, preview: &str) {
+    messages.push(json!({
+        "role": "user",
+        "content": format!(
+            "Your previous reply could not be read as the required JSON, so it was discarded. The \
+             parser reported:\n{parse_err}\nThe reply began:\n{preview}\nReturn ONLY the corrected \
+             JSON object the task asks for — no prose and no markdown fences."
+        ),
+    }));
+}
+
 /// The role a call site's truncations are counted under (§14.5).
 ///
 /// [VANTA-WHY] The three roles the paper reports are `creator`, `attacker` and
@@ -2677,6 +2715,15 @@ where
     // how many were spent rather than how many were allowed: a call that stops
     // early (a cut-off answer) did not fail `max_attempts` times.
     let mut attempts_made = 0_u32;
+    // [VANTA-WHY] v1-m3.2 item C — the attempt loop's own limit, which a parse
+    // failure raises by `PARSE_FAILURE_EXTRA_ATTEMPTS`. It starts AT the caller's
+    // budget, so a call that never fails on the parser behaves exactly as before;
+    // only a call that reaches the parser and is refused gets the two extra tries.
+    let mut attempt_limit = max_attempts;
+    // The parser's complaint and the head of the reply that earned it, carried to
+    // the NEXT attempt as its corrective turn (item C). `None` until a parse
+    // failure has happened, so attempt 1 of every call is unchanged.
+    let mut parse_correction: Option<(String, String)> = None;
 
     // [VANTA-WHY] §14.5 — whether this call is PINNED at temperature 0.0, and
     // therefore answers identically on every attempt. It is read from the
@@ -2694,7 +2741,11 @@ where
         .unwrap_or(0.2)
         <= 0.0;
 
-    for attempt in 1..=max_attempts {
+    // [VANTA-WHY] v1-m3.2 item C — a `while` over the dynamic `attempt_limit`
+    // rather than `for attempt in 1..=max_attempts`: the limit is what a parse
+    // failure raises, and a `for` range cannot be extended from inside the body.
+    let mut attempt = 1_u32;
+    while attempt <= attempt_limit {
         // [VANTA-WHY] §14.15 — the run's own wall clock, checked before EVERY
         // request. This is the one place every structured call site passes
         // through, so it is the one place a check is a check before all of them —
@@ -2724,8 +2775,15 @@ where
             // the only kind that can come back different on a pinned temperature.
             append_truncation_nudge(&mut messages);
         }
+        if let Some((parse_err, preview)) = &parse_correction {
+            // [VANTA-WHY] v1-m3.2 item C — the retry after a parse failure carries
+            // what the parser said about the LAST reply. The call site's own
+            // `REPROMPT` turn can only restate the schema; this one names the
+            // mistake, which is the difference between re-asking and correcting.
+            append_parse_correction(&mut messages, parse_err, preview);
+        }
         if attempt > 1 {
-            warn!(attempt, max_attempts, "retrying structured call");
+            warn!(attempt, attempt_limit, "retrying structured call");
         }
         // [VANTA-WHY] §14.23 — the ROUND offset is applied first and the ATTEMPT
         // offset on top of it, so the two sequences compose: round 1's first attempt
@@ -2772,9 +2830,14 @@ where
                 warn!(%msg);
                 last_err = Some(msg);
                 last_was_truncated = false;
-                if attempt < max_attempts {
+                // [VANTA-WHY] v1-m3.2 item C — a transport failure does NOT buy the
+                // two extra attempts: the loop is bounded by `attempt_limit`, which
+                // only a parse failure raises. What this branch does need is the
+                // increment the `for` loop used to do for it.
+                if attempt < attempt_limit {
                     back_off(attempt).await;
                 }
+                attempt += 1;
                 continue;
             }
         };
@@ -2828,9 +2891,14 @@ where
                 break;
             }
             nudge_next = true;
-            if attempt < max_attempts {
+            // [VANTA-WHY] v1-m3.2 item C — a cut-off answer does NOT buy the two
+            // extra attempts either: a smaller question or a bigger cap is the
+            // remedy, not another identical generation. The limit stays the
+            // caller's budget.
+            if attempt < attempt_limit {
                 back_off(attempt).await;
             }
+            attempt += 1;
             continue;
         }
 
@@ -2856,17 +2924,29 @@ where
                 // mistake forever. A CUT-OFF answer never reaches this arm at all
                 // (it is handled above), so the remedy the two need — a smaller
                 // question versus a correct one — can no longer be confused.
-                if attempt < max_attempts {
+                //
+                // [VANTA-WHY] v1-m3.2 item C — this is the ONE failure the call
+                // buys extra attempts for, and the next request carries the
+                // parser's own complaint plus the head of the reply that earned it
+                // (`append_parse_correction`). Reseeding alone was a fresh draw at
+                // the same question; the correction makes it a different one. The
+                // budget is raised ONCE and stays raised, so a call that parses
+                // wrong four times gets the fifth try even if the fourth failed
+                // another way.
+                parse_correction = Some((parse_err, preview));
+                attempt_limit = max_attempts + PARSE_FAILURE_EXTRA_ATTEMPTS;
+                if attempt < attempt_limit {
                     back_off(attempt).await;
                 }
             }
         }
+        attempt += 1;
     }
 
     let mut message = format!(
         "structured_call_with_retry {}/{} attempts FAILED. Last:\n{}",
         attempts_made,
-        max_attempts,
+        attempt_limit,
         last_err.as_deref().unwrap_or("(no details)")
     );
     // [VANTA-WHY] §14.5 — say WHY the last attempt failed, when the server said.

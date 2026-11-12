@@ -1606,9 +1606,11 @@ mod tests {
             failure_outputs: std::collections::HashMap::new(),
             ran,
             timed_out: false,
+            secs: None,
             exit_code: Some(0),
             stderr_tail: String::new(),
             collection: None,
+            setup_failed: false,
         }
     }
 
@@ -1641,10 +1643,12 @@ mod tests {
             failure_outputs: std::collections::HashMap::new(),
             ran: false,
             timed_out: false,
+            secs: None,
             exit_code: Some(127),
             stderr_tail:
                 "env: /Users/nathan/heretic/.venv/bin/python: No such file or directory".to_string(),
             collection: None,
+            setup_failed: false,
         };
 
         let (bad_r, good_r, note) = native_signal_observation(

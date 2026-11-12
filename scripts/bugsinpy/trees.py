@@ -742,8 +742,8 @@ def _strip_source(
             # class whose whole span a removed outer definition covers. There is no
             # block left for the `pass` to live in: emitting one at the body's
             # indent leaves the surrounding scope with nothing to indent under, and
-            # the file dies `unexpected indent` (measured on pandas/90 and pandas/158,
-            # whose hidden classes nest). The enclosing definition's own removal
+            # the file dies `unexpected indent` (measured on two bake-era pandas
+            # bugs, whose hidden classes nest). The enclosing definition's own removal
             # already accounts for the lines, so nothing is inserted here.
             continue
         body_lines = {stmt.lineno for stmt in node.body}

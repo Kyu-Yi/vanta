@@ -2057,7 +2057,7 @@ class TestStripHiddenTests:
         ast.parse(new)
 
     def test_a_removed_class_carrying_a_nested_class_gets_no_pass(self, tmp_path):
-        """pandas/90, pandas/158: a nested class's header is dropped with its outer.
+        """A nested class's header is dropped with its outer.
 
         The emptied-class rule used to insert a ``pass`` for the *nested* class too,
         at the nested body's deeper indent, while the class statement that block
@@ -5325,7 +5325,7 @@ class TestTheFreezeGatesTheText:
         ]
 
     def test_declared_test_files_splits_a_semicolon_joined_declaration(self):
-        """fastapi/11's ``bug.info`` names two files in one ``;``-joined token."""
+        """A ``bug.info`` that names two files in one ``;``-joined token."""
         both = bug_info(test_file="tests/test_a.py;tests/test_b.py")
         assert prepare_mod.declared_test_files(both) == [
             "tests/test_a.py",
@@ -6310,6 +6310,93 @@ class TestNativeTimeoutDerivation:
         assert suite_mod._marker_duration(stdout, "1") is None
 
 
+class TestNativeSessionTimeoutDerivation:
+    """v1-m3.1 §8.3 — the in-session GATE's cap, ``max(1200, 10 × measured)``.
+
+    [VANTA-WHY] The D1 rule above (``max(120, 3 × measured)``) is the MEASUREMENT
+    rule and stays where it is: its remaining callers run ONE tree. The gate runs
+    TWO — the original and the patched tree — and the patched side is that suite
+    plus the patch. A dev probe measured a legitimate one-file
+    ``luigi/scheduler.py`` change at ~3.6× the unpatched control (119/116 s vs
+    33/31 s) with no load, so D1's 3× sat BELOW the patched suite's own cost and
+    reported the patch as the harness's fault. These pin the new number, the new
+    floor, and that the two rules are no longer the same function.
+    """
+
+    def test_the_rule_is_ten_times_the_measured_run(self):
+        # pandas/1's native run is ~487 s (D1's own measurement); 10 × 487 clears
+        # both the 1200 s floor and the patched side's own cost.
+        assert suite_mod.native_session_timeout_secs(487.0, floor=1200) == 4870
+        # The grader's slowest case is a 725 s suite, and the oracle and
+        # replay call this rule at floor 1800, so both grade the patch under
+        # max(1800, 10 × 725) = 7250 — clear of a 3.6× (2610 s) or 5× (3625 s) patch.
+        assert suite_mod.native_session_timeout_secs(725.0, floor=1800) == 7250, "a 725 s suite"
+        assert suite_mod.native_session_timeout_secs(725.0, floor=1200) == 7250, (
+            "the gate's own floor is below 10 × 725, so the measurement decides"
+        )
+
+    def test_a_short_suite_stays_at_the_1200_second_floor(self):
+        """Short suites, so 10 × is below the floor.
+
+        A 33 s unpatched control (a dev probe's own measurement) gives
+        ``10 × 33 = 330 < 1200`` and the floor is what ships. A 10 s native
+        suite is likewise sub-minute — the point of the example is that under the
+        OLD rule such a suite was sent the 120 s cap, and the new floor is what
+        that side now runs under.
+        """
+        assert suite_mod.native_session_timeout_secs(33.0, floor=1200) == 1200, "a 33 s suite"
+        assert suite_mod.native_session_timeout_secs(10.0, floor=1200) == 1200, "a 10 s suite"
+        for measured in (5.0, 20.0, 59.0, 60.0):
+            assert suite_mod.native_session_timeout_secs(measured, floor=1200) == 1200, (
+                f"a suite measured at {measured}s must not fall below the 1200 s floor"
+            )
+
+    def test_a_raised_environment_floor_wins_over_1200(self):
+        """F4 — the floor is the run's EFFECTIVE ``VANTA_TEST_TIMEOUT_SECS``.
+
+        ``resolve_native_timeout_secs`` refuses a ``--native-timeout-secs`` below
+        its own ``test_timeout_secs()``, so a bare 1200 would be refused on a host
+        whose environment sets ``VANTA_TEST_TIMEOUT_SECS=1800`` and the job would
+        end ``infra_failure`` with no ``run.summary``. ``max(1200, …)`` keeps the
+        flag acceptable and never lowers an operator's own cap.
+        """
+        assert suite_mod.native_session_timeout_floor({}) == 1200
+        env = {suite_mod.NATIVE_TIMEOUT_ENV: "1800"}
+        floor = suite_mod.native_session_timeout_floor(env)
+        assert floor == 1800, "the environment's 1800 s cap is above the 1200 s floor"
+        assert suite_mod.native_session_timeout_secs(10.0, floor=floor) == 1800, (
+            "a short suite still runs under the raised floor"
+        )
+        assert suite_mod.native_session_timeout_secs(487.0, floor=floor) == 4870, (
+            "10 × the measurement still wins when it is the larger number"
+        )
+
+    def test_a_sub_1200_environment_floor_does_not_lower_the_gate(self):
+        assert suite_mod.native_session_timeout_floor(
+            {suite_mod.NATIVE_TIMEOUT_ENV: "600"}
+        ) == 1200, "the value the floor used to be does not lower it"
+        assert suite_mod.native_session_timeout_floor(
+            {suite_mod.NATIVE_TIMEOUT_ENV: "300"}
+        ) == 1200, "the gate's own 1200 s floor is not lowered by a smaller caller cap"
+
+    def test_no_measurement_keeps_the_floor(self):
+        assert suite_mod.native_session_timeout_secs(None, floor=1200) == 1200
+
+    def test_the_gate_rule_is_not_the_measurement_rule(self):
+        """The two rules are one call apart, and must not be one function.
+
+        The 10x session rule is what the GATE, the oracle and replay all use; the
+        3x rule remains the MEASUREMENT probe's only (``scripts/probe_xdist.py``).
+        The same 487 s measurement is 4870 under the session rule and 1461 under
+        the measurement probe's rule.
+        """
+        floor = suite_mod.native_session_timeout_floor({})
+        assert suite_mod.native_timeout_secs(487.0, floor=floor) == 1461
+        assert suite_mod.native_session_timeout_secs(487.0, floor=floor) == 4870
+        assert suite_mod.NATIVE_SESSION_TIMEOUT_MULTIPLIER == 10
+        assert suite_mod.NATIVE_SESSION_TIMEOUT_FLOOR_SECS == 1200
+
+
 class TestSuiteCommand:
     def test_substitutes_the_report_placeholder(self):
         cmd = suite_mod.build_command(
@@ -6397,7 +6484,7 @@ def _alive(pid: int) -> bool:
 class TestExitPluginScript:
     """The run-time exit plugin that ends pytest's own interpreter (§8.6 round 13).
 
-    [VANTA-WHY] luigi/8, 9, 11 and 12 (round 12) start a non-daemon worker thread in
+    [VANTA-WHY] Four luigi bugs (round 12) start a non-daemon worker thread in
     their own ``test/worker_test.py`` and never stop it, so ``python`` blocked in
     interpreter shutdown *after* pytest had written its report and printed its
     summary. The harness measures a run by the markers the script prints after the
@@ -9142,10 +9229,14 @@ class TestSuiteCache:
     def test_a_censored_grade_still_records_the_hidden_note(self, tmp_path, monkeypatch):
         """The E3 guard returns on an unreadable hidden run — but that grading was
         still a grading, and its note must not vanish exactly where the evidence is
-        weakest. No patched pair runs, so no patched note exists."""
+        weakest. No patched pair runs, so no patched note exists.
+
+        v1-m3.1 — the run measured NOTHING (no report and no exit status), which is
+        the state that stays ``inconclusive``; a run that exited would grade ``bad``.
+        """
         pair = suite_mod.compare_runs(
-            suite_mod.SuiteRun(outcomes={}, exit_code=1, report_found=False),
-            suite_mod.SuiteRun(outcomes={}, exit_code=1, report_found=False),
+            suite_mod.SuiteRun(outcomes={}, report_found=False),
+            suite_mod.SuiteRun(outcomes={}, report_found=False),
         )
         pair.cache = {
             "key": "c" * 64,
@@ -9242,6 +9333,38 @@ class TestCleanTreeNoise:
         write(tree / "demo.py", "x = 1\n")
         suite_mod._clean_tree_noise(tree)
         assert (tree / "demo.py").exists()
+
+
+class TestHarnessDirtyStagingTrees:
+    """v1-m3.1 §5 — the harness's own seed staging tree is not a source edit.
+
+    [VANTA-WHY] `harness::prepare_seed_tree` stages the repo into a
+    `tempdir_in(current_dir())` named ``vanta-seed-*``, i.e. INSIDE the repo root.
+    While any run is in flight ``git status --porcelain`` is therefore non-empty
+    for a reason that has nothing to do with a source edit, and
+    ``runner.git_revision()`` — read once per bug — recorded ``harness_dirty=True``
+    for 153 of Phase-3's 187 rows from the first run that staged a seed tree, with
+    no tracked file modified. The ``.gitignore`` entry is what makes that flag mean
+    what it says. Telemetry only: no behaviour and no measurement changes.
+    """
+
+    def test_the_staging_tree_pattern_is_in_gitignore(self):
+        gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        assert "vanta-seed-*/" in gitignore
+
+    def test_git_itself_ignores_a_staging_tree(self):
+        proc = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "check-ignore", "vanta-seed-abc123/"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert proc.returncode == 0, (
+            "a `vanta-seed-*` staging tree in the repo root must be ignored, or "
+            "`git status --porcelain` reports it and every row reads "
+            f"harness_dirty=True: {proc.stdout!r} {proc.stderr!r}"
+        )
 
 
 class TestDropTestFileHunks:
@@ -13994,7 +14117,7 @@ class TestBuildRequirementPins:
         assert bake_mod._declarer_pin_cutoff("ujson==9.9.9", releases) is None
 
     def test_the_declarers_own_release_date_widens_a_window_that_found_nothing(self):
-        """``fastapi/11``: the declaring pin landed after the bug, and its own date admits
+        """The declaring pin landed after the bug, and its own date admits
         the release its ``setup_requires`` asks for.
 
         [VANTA-WHY] ``ujson==3.0.0`` is a BugsInPy reference pin installed *as written*
@@ -14022,7 +14145,7 @@ class TestBuildRequirementPins:
         assert pins[0].build_requirement_of == "ujson==3.0.0"
 
     def test_a_window_widened_to_the_declaring_releases_own_date_is_recorded(self):
-        """``fastapi/11`` in the JSON: the fallback was used, and what anchored it.
+        """In the JSON: the fallback was used, and what anchored it.
 
         [VANTA-WHY] ``declared_by`` alone cannot say *which* rule placed the pin — a pin
         the bug's own date reaches and one only the declaring pin's own date reaches carry
@@ -14237,7 +14360,7 @@ class TestABuildRequirementNoPinCoversReachesTheLayer:
     def test_a_build_requirement_only_the_declarers_own_date_can_place(
         self, monkeypatch
     ):
-        """The ``fastapi/11`` shape end to end: the bug's date finds nothing and the
+        """The widened-window shape end to end: the bug's date finds nothing and the
         declaring pin's own release date admits the release its build asked for.
 
         [VANTA-WHY] ``ujson==3.0.0`` is a reference pin — admitted though it landed after
@@ -16280,7 +16403,7 @@ class TestTheAbsentNamePass:
         "mpl-toolkits-clifford==0.0.3",
         "numpy==1.18.4",
     )
-    """``pandas/7``'s shape at the retry: the unbuildable ``h5py`` is dropped and the two
+    """The retry's shape: the unbuildable ``h5py`` is dropped and the two
     pins that declare it, directly and through each other, move with it."""
 
     def _metadata_of(self, name: str, version: str):
@@ -16381,7 +16504,7 @@ class TestTheAbsentNamePass:
         assert "could not be read" in caught.value.why
 
     def test_the_closure_is_transitive_over_the_pins_it_moves(self):
-        """``pandas/7``: dropping ``h5py`` moves ``clifford`` moves ``mpl-toolkits-clifford``.
+        """Dropping ``h5py`` moves ``clifford`` moves ``mpl-toolkits-clifford``.
 
         Moving a dependent out of the main pass makes *its* name a name the main pass
         installs nothing for, so the walk runs to a fixpoint (D3): nothing left in the
@@ -17292,7 +17415,7 @@ class TestUnresolvablePins:
         bare), the interpreter makes it redundant, and its ``enum`` shadows the stdlib's.
 
         ``luigi/7`` and ``luigi/5`` die at pytest start-up with ``TypeError: an integer
-        is required (got type bytes)``. ``luigi/9`` and ``luigi/12`` carry no ``enum34``
+        is required (got type bytes)``. Two further luigi bugs carry no ``enum34``
         but fail an earlier gate (``empty FAIL_TO_PASS``) and never run, so they are not
         evidence that the suite runs without it.
         """
@@ -17373,7 +17496,7 @@ class TestUnresolvablePins:
         return classify
 
     def test_a_self_pin_built_from_an_unreviewed_sdist_is_dropped(self):
-        """``pandas/154``'s ``pandas==1.0.4``: the tree's own name, built from its sdist."""
+        """A self-pin naming the tree's own project, built from its sdist."""
         self_pin = self._self_pin("pandas", "pandas==1.0.4")
         kept = bake_mod.drop_self_pin(
             (self_pin,),
@@ -17384,11 +17507,12 @@ class TestUnresolvablePins:
         assert kept == []
 
     def test_a_self_pin_that_installs_from_a_wheel_is_kept(self):
-        """``fastapi/3``'s ``fastapi==0.55.1`` and ``scrapy/1``'s ``scrapy==2.1.0``.
+        """A wheel self-pin names the tree's own project — ``fastapi==0.55.1``,
+        ``scrapy==2.1.0``.
 
         A wheel self-pin is harmless — it installs the project over itself from a wheel —
         so the narrow rule leaves it alone, which is what keeps this drop a no-op for every
-        layer measured but ``pandas/154`` and ``pandas/160``.
+        layer measured but two pandas bugs.
         """
         self_pin = self._self_pin("fastapi", "fastapi==0.55.1")
         kept = bake_mod.drop_self_pin(
@@ -17591,7 +17715,7 @@ class TestUnresolvablePins:
         assert "no unconditional import of it is in" in found.reason
 
     def test_a_commit_without_the_failing_test_file_does_not_stand_in_with_its_tree(self):
-        """``pandas/66``: the buggy commit lacks the test file the fix carries.
+        """The buggy commit lacks the test file the fix carries.
 
         The only unconditional ``import pyarrow`` is in the buggy commit's
         ``demo/extra.py``, which the fix's test never reaches. Standing the buggy tree
@@ -18312,7 +18436,7 @@ def _resolve_with_drops(
     return fetched, layers, flagged
 
 
-_PANDAS_7_BUILD_LOG = (
+_UNBUILDABLE_PINS_BUILD_LOG = (
     "Collecting h5py==2.10.0\n"
     "  Building wheel for h5py (setup.py) ... error\n"
     "  ERROR: Failed building wheel for h5py\n"
@@ -18322,7 +18446,7 @@ _PANDAS_7_BUILD_LOG = (
     "ERROR: Could not build wheels for h5py, scikit-learn, which is required to\n"
     "install pyproject.toml-based projects\n"
 )
-"""The measured shape of ``pandas/7``'s first-pass build failure.
+"""The measured shape of a first-pass build failure.
 
 Both pins the layer holds fail inside the image (``h5py`` wants ``libhdf5.so``,
 ``scikit-learn`` wants a ``scipy`` pip never got), so pip's own summary line names
@@ -18358,7 +18482,7 @@ frame, the ``.eggs/setuptools_scm-10.3.4-py3.8.egg`` frame, the ``ImportError`` 
 ``egg_info`` summary line), not invented.
 """
 
-_PANDAS_66_BUILD_LOG = (
+_HASH_MISMATCH_BUILD_LOG = (
     "+ python -m pip install --no-cache-dir -c /tmp/constraints.txt "
     "--no-build-isolation --use-deprecated=legacy-resolver -r /tmp/req.txt\n"
     "WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, "
@@ -18378,7 +18502,7 @@ _PANDAS_66_BUILD_LOG = (
     "             Got        "
     "a126ab08efbd1508221af0aa54bdac70f782587567710a5d54e4a6c9c2795bb9\n"
 )
-"""``pandas/66``'s failure: a *download* whose bytes were not the ones the index names.
+"""A *download* whose bytes were not the ones the index names.
 
 The index's own link advertises ``db3121…`` (PyPI's recorded sdist hash) and the body
 that arrived hashed to ``a126ab08…``, one line under a ``RemoteDisconnected`` on a
@@ -18417,7 +18541,7 @@ class TestTheSafeguardsEntryPointQuestion:
     ``False`` — **read, and it registers nothing** — lets the drop proceed. Reading the
     last two as one answer is the failure this class exists against: measured on
     ``h5py==2.10.0``, whose 28 wheels carry no ``entry_points.txt`` at all, it protected
-    the very pin ``pandas/7``'s retry was to drop and turned the retry into a flag.
+    the very pin the retry was meant to drop and turned the retry into a flag.
     """
 
     def test_a_release_pypi_does_not_list_registers_nothing(self):
@@ -18606,7 +18730,7 @@ class TestTheRetryOnAnUnbuildablePin:
     The trigger is an **observed** build failure, never a static prediction, which is
     what leaves every already-baked layer untouched by construction: a retry runs only
     after a build has already failed, and the first-pass recipe is byte-identical. The
-    **R2(ii)** half (measured on ``pandas/7``) answers ``None`` for every failure it does
+    **R2(ii)** half (measured on a pandas bug) answers ``None`` for every failure it does
     not cover, drops only pins **outside the failing tests' closure** that the safeguard
     does not protect, records each drop in the layer metadata, and fails **closed** if
     the retry also fails. The **R1** half (rows 11–12, luigi's ``egg_info`` crash, the
@@ -18655,7 +18779,7 @@ class TestTheRetryOnAnUnbuildablePin:
             drops=(),
             rule=bake_mod.RETRY_RULE_TRANSIENT,
             why="re-fetched",
-            transient=bake_mod.transient_download_failure(_PANDAS_66_BUILD_LOG),
+            transient=bake_mod.transient_download_failure(_HASH_MISMATCH_BUILD_LOG),
         )
 
     def _declares_nothing(self, name: str, version: str):
@@ -18663,7 +18787,7 @@ class TestTheRetryOnAnUnbuildablePin:
         return ((), None)
 
     def _cascade_metadata(self, name: str, version: str):
-        """``pandas/7``'s retry: ``clifford`` declares the dropped ``h5py``, and
+        """A retry's cascade: ``clifford`` declares the dropped ``h5py``, and
         ``mpl-toolkits-clifford`` declares ``clifford``."""
         declared = {
             ("clifford", "1.3.1"): ("h5py",),
@@ -18697,8 +18821,8 @@ class TestTheRetryOnAnUnbuildablePin:
         )
         pins = self.INSTALLS if installs is None else installs
         return bake_mod.BugDeps(
-            entry={"project": "pandas", "bug_id": 7},
-            checkpoint="vanta-bi-pandas-7",
+            entry={"project": "Demo", "bug_id": 1},
+            checkpoint="vanta-bi-Demo-1",
             installs=pins,
             provenance=(
                 provenance
@@ -18717,7 +18841,7 @@ class TestTheRetryOnAnUnbuildablePin:
 
     # ---- reading the failing layer's own log -----------------------------
     def test_the_summary_line_names_the_pins_pip_failed_to_build(self):
-        assert bake_mod.failed_builds(_PANDAS_7_BUILD_LOG) == (
+        assert bake_mod.failed_builds(_UNBUILDABLE_PINS_BUILD_LOG) == (
             "h5py",
             "scikit-learn",
         )
@@ -18732,7 +18856,7 @@ class TestTheRetryOnAnUnbuildablePin:
         assert bake_mod.failed_builds(_LUIGI_30_BUILD_LOG) == ()
 
     def test_the_evidence_is_the_line_that_names_the_pin(self):
-        line = bake_mod.failed_build_line(_PANDAS_7_BUILD_LOG, "h5py")
+        line = bake_mod.failed_build_line(_UNBUILDABLE_PINS_BUILD_LOG, "h5py")
         assert line.startswith("build log line ")
         assert line.endswith("ERROR: Failed building wheel for h5py")
 
@@ -18743,7 +18867,7 @@ class TestTheRetryOnAnUnbuildablePin:
     # ---- retry_drops: the drop, and every ``None`` ------------------------
     def test_an_unbuildable_pin_outside_the_closure_is_dropped(self):
         drops = bake_mod.retry_drops(
-            _PANDAS_7_BUILD_LOG,
+            _UNBUILDABLE_PINS_BUILD_LOG,
             installs=self.INSTALLS,
             declared=self.DECLARED,
             audit=self._audit(),
@@ -18815,13 +18939,13 @@ class TestTheRetryOnAnUnbuildablePin:
 
     # ---- retry_plan: the recipe the second attempt runs ------------------
     def test_a_layer_without_retry_material_is_never_retried(self):
-        assert bake_mod.retry_plan(self._deps(retry=False), _PANDAS_7_BUILD_LOG) is None
+        assert bake_mod.retry_plan(self._deps(retry=False), _UNBUILDABLE_PINS_BUILD_LOG) is None
 
     def test_the_retry_recipe_is_the_first_pass_minus_exactly_the_dropped_pins(self):
         deps = self._deps(
             build_pins=("numpy==1.18.1",), early_pins=("numpy==1.18.1",)
         )
-        plan = bake_mod.retry_plan(deps, _PANDAS_7_BUILD_LOG)
+        plan = bake_mod.retry_plan(deps, _UNBUILDABLE_PINS_BUILD_LOG)
         assert plan is not None
         assert [drop.pin for drop in plan.drops] == ["h5py==2.10.0", "scikit-learn==0.22.1"]
         assert plan.script == bake_mod.requirements_recipe(
@@ -18848,7 +18972,7 @@ class TestTheRetryOnAnUnbuildablePin:
     )
 
     def test_a_moved_dependent_takes_its_own_dependents_with_it(self):
-        """``pandas/7``: the retry **moves**, it does not merely drop (D3).
+        """The retry **moves**, it does not merely drop (D3).
 
         Dropping ``h5py`` leaves ``clifford`` (which declares it) in the main pass, so
         ``clifford`` moves too — and ``mpl-toolkits-clifford`` (which declares
@@ -18886,7 +19010,7 @@ class TestTheRetryOnAnUnbuildablePin:
 
         A ``--no-deps`` pin's name is in ``/tmp/constraints.txt``, so a main-pass pin
         that only declares one gives pip no version to choose and leaks nothing. Measured
-        on ``pandas/7``: ``pytest==5.4.3`` declares ``hypothesis`` behind an ``extra``,
+        on a measured retry: ``pytest==5.4.3`` declares ``hypothesis`` behind an ``extra``,
         ``hypothesis`` is one of the layer's eight ``--no-deps`` pins, and the old seed —
         the dropped names **and** the ``--no-deps`` names — moved pytest out of the
         resolving pass, where the safeguard then refused the whole retry.
@@ -18925,8 +19049,8 @@ class TestTheRetryOnAnUnbuildablePin:
             "hypothesis==5.16.0\nclifford==1.3.1\nmpl-toolkits-clifford==0.0.3\n"
         )
 
-    def test_pandas_7_s_real_pins_move_nothing_new_under_the_narrowed_seed(self):
-        """``pandas/7``'s own retry: the eight ``--no-deps`` pins stay exactly as they
+    def test_the_real_pins_move_nothing_new_under_the_narrowed_seed(self):
+        """The measured retry: the eight ``--no-deps`` pins stay exactly as they
         are, ``clifford`` and ``mpl-toolkits-clifford`` re-close on the ``h5py`` they
         already declared, nothing joins the pass, and the retry is rendered — not
         refused. ``pytest`` stays in the resolving pass throughout."""
@@ -19025,7 +19149,7 @@ class TestTheRetryOnAnUnbuildablePin:
         deps = self._deps()
         bake_mod.write_deps(tmp_path, deps)
         before = bake_mod.load_deps(tmp_path, deps.checkpoint)
-        plan = bake_mod.retry_plan(deps, _PANDAS_7_BUILD_LOG)
+        plan = bake_mod.retry_plan(deps, _UNBUILDABLE_PINS_BUILD_LOG)
         bake_mod.record_retry(tmp_path, deps.checkpoint, plan)
         after = bake_mod.load_deps(tmp_path, deps.checkpoint)
         assert [record["pin"] for record in after["dropped"]] == [
@@ -19040,10 +19164,10 @@ class TestTheRetryOnAnUnbuildablePin:
         assert after["checkpoint_id"] != before["checkpoint_id"]
 
     # ---- R1: the early pins move before the build requirements -----------
-    def test_the_egg_info_detector_reads_luigi_30_and_not_pandas_7(self):
+    def test_the_egg_info_detector_reads_luigi_30_but_not_the_wheel_build_log(self):
         """R1's trigger, and the positive ``failed_builds`` documents as its negative."""
         assert bake_mod.failed_build_requirement_metadata(_LUIGI_30_BUILD_LOG) is True
-        assert bake_mod.failed_build_requirement_metadata(_PANDAS_7_BUILD_LOG) is False
+        assert bake_mod.failed_build_requirement_metadata(_UNBUILDABLE_PINS_BUILD_LOG) is False
         assert bake_mod.failed_build_requirement_metadata("") is False
 
     # ``pytest-runner`` is luigi/30's real build requirement and is *not* a build tool,
@@ -19113,7 +19237,7 @@ class TestTheRetryOnAnUnbuildablePin:
         assert [spelling for spelling, _ in evidence] == ["cffi", "cffi"]
 
     def test_a_log_that_names_no_fetch_has_no_evidence(self):
-        assert bake_mod.easy_install_fetch_evidence(_PANDAS_7_BUILD_LOG) == ()
+        assert bake_mod.easy_install_fetch_evidence(_UNBUILDABLE_PINS_BUILD_LOG) == ()
         assert bake_mod.easy_install_fetch_evidence("") == ()
 
     def test_the_hoist_is_the_early_pin_the_fetched_name_satisfies(self):
@@ -19203,8 +19327,8 @@ class TestTheRetryOnAnUnbuildablePin:
 
     # ---- R4: a download that did not match the hash the index named -------
     def test_the_mismatch_block_names_the_package_and_both_hashes(self):
-        """``pandas/66``'s shape: the index's own ``#sha256=`` link, the body arriving."""
-        transient = bake_mod.transient_download_failure(_PANDAS_66_BUILD_LOG)
+        """A mismatch block: the index's own ``#sha256=`` link, the body arriving."""
+        transient = bake_mod.transient_download_failure(_HASH_MISMATCH_BUILD_LOG)
         assert transient is not None
         assert transient.spec == "matplotlib==3.1.3"
         assert transient.expected.startswith("db3121f1")
@@ -19218,7 +19342,7 @@ class TestTheRetryOnAnUnbuildablePin:
     def test_a_log_with_no_mismatch_is_not_this_rule(self):
         """The three other logs reach their own rules: R2(ii) and R1 named nothing here."""
         assert bake_mod.transient_download_failure("") is None
-        assert bake_mod.transient_download_failure(_PANDAS_7_BUILD_LOG) is None
+        assert bake_mod.transient_download_failure(_UNBUILDABLE_PINS_BUILD_LOG) is None
         assert bake_mod.transient_download_failure(_LUIGI_30_BUILD_LOG) is None
 
     def test_a_mismatch_block_that_names_no_package_is_not_this_rule(self):
@@ -19232,7 +19356,7 @@ class TestTheRetryOnAnUnbuildablePin:
         """§8.6 R4 drops nothing, reorders nothing, and re-runs the identical recipe: the
         bytes were wrong, not the layer. ``--no-cache-dir`` is what makes it a re-fetch."""
         deps = self._deps()
-        plan = bake_mod.retry_plan(deps, _PANDAS_66_BUILD_LOG)
+        plan = bake_mod.retry_plan(deps, _HASH_MISMATCH_BUILD_LOG)
         assert plan is not None
         assert plan.rule == bake_mod.RETRY_RULE_TRANSIENT
         assert plan.drops == ()
@@ -19243,9 +19367,9 @@ class TestTheRetryOnAnUnbuildablePin:
 
     def test_each_rule_reads_its_own_log_and_not_the_others(self):
         """The order is R2(ii) then R1 then R4, and each log reaches exactly its own."""
-        pandas_66 = self._deps()
+        transient_deps = self._deps()
         assert (
-            bake_mod.retry_plan(pandas_66, _PANDAS_7_BUILD_LOG).rule
+            bake_mod.retry_plan(transient_deps, _UNBUILDABLE_PINS_BUILD_LOG).rule
             == bake_mod.RETRY_RULE_DROP
         )
         r1 = self._deps(build_pins=self._R1_BUILD, early_pins=self._R1_EARLY)
@@ -19254,7 +19378,7 @@ class TestTheRetryOnAnUnbuildablePin:
             == bake_mod.RETRY_RULE_EARLY
         )
         assert (
-            bake_mod.retry_plan(pandas_66, _PANDAS_66_BUILD_LOG).rule
+            bake_mod.retry_plan(transient_deps, _HASH_MISMATCH_BUILD_LOG).rule
             == bake_mod.RETRY_RULE_TRANSIENT
         )
 
@@ -19262,7 +19386,7 @@ class TestTheRetryOnAnUnbuildablePin:
         deps = self._deps()
         bake_mod.write_deps(tmp_path, deps)
         before = bake_mod.load_deps(tmp_path, deps.checkpoint)
-        plan = bake_mod.retry_plan(deps, _PANDAS_66_BUILD_LOG)
+        plan = bake_mod.retry_plan(deps, _HASH_MISMATCH_BUILD_LOG)
         bake_mod.record_retry(tmp_path, deps.checkpoint, plan)
         after = bake_mod.load_deps(tmp_path, deps.checkpoint)
         assert after["retry"]["rule"] == bake_mod.RETRY_RULE_TRANSIENT
@@ -19369,7 +19493,7 @@ class TestTheRetryOnAnUnbuildablePin:
         summary, projects, logged = self._retry_run(
             retry=retry,
             record_drops=lambda name, value: recorded.append((name, value)),
-            first_error=_PANDAS_7_BUILD_LOG,
+            first_error=_UNBUILDABLE_PINS_BUILD_LOG,
             second_ok=True,
         )
         attempts = [script for name, script in projects if name == "vanta-bi-Demo-1"]
@@ -19389,7 +19513,7 @@ class TestTheRetryOnAnUnbuildablePin:
             self._retry_run(
                 retry=retry,
                 record_drops=lambda name, value: recorded.append((name, value)),
-                first_error=_PANDAS_7_BUILD_LOG,
+                first_error=_UNBUILDABLE_PINS_BUILD_LOG,
                 second_ok=False,
             )
         assert recorded == [], "a layer whose retry failed has no drop to record"
@@ -19418,7 +19542,7 @@ class TestTheRetryOnAnUnbuildablePin:
             self._retry_run(
                 retry=retry,
                 record_drops=lambda name, value: recorded.append((name, value)),
-                first_error=_PANDAS_7_BUILD_LOG,
+                first_error=_UNBUILDABLE_PINS_BUILD_LOG,
                 second_ok=False,
                 projects=attempts,
             )
@@ -19438,7 +19562,7 @@ class TestTheRetryOnAnUnbuildablePin:
         with pytest.raises(bake_mod.BakeError) as excinfo:
             self._retry_run(
                 retry=retry,
-                first_error=_PANDAS_7_BUILD_LOG,
+                first_error=_UNBUILDABLE_PINS_BUILD_LOG,
                 second_ok=False,
                 logs_dir=tmp_path,
             )
@@ -19446,7 +19570,7 @@ class TestTheRetryOnAnUnbuildablePin:
         second = bake_mod.retry_log_path(tmp_path, "vanta-bi-Demo-1")
         assert first.is_file(), "the first pass's log is not overwritten"
         assert second.is_file(), "the retry's own output is written"
-        assert _PANDAS_7_BUILD_LOG in first.read_text(encoding="utf-8")
+        assert _UNBUILDABLE_PINS_BUILD_LOG in first.read_text(encoding="utf-8")
         assert "ERROR: retry blew up" in second.read_text(encoding="utf-8")
         message = str(excinfo.value)
         assert f"first-pass build log: {first}" in message
@@ -19457,7 +19581,7 @@ class TestTheRetryOnAnUnbuildablePin:
         plan = self._transient_plan()
         summary, projects, logged = self._retry_run(
             retry=lambda name, built: plan if name == "vanta-bi-Demo-1" else None,
-            first_error=_PANDAS_66_BUILD_LOG,
+            first_error=_HASH_MISMATCH_BUILD_LOG,
             second_ok=True,
         )
         attempts = [script for name, script in projects if name == "vanta-bi-Demo-1"]
@@ -19472,9 +19596,9 @@ class TestTheRetryOnAnUnbuildablePin:
         with pytest.raises(bake_mod.BakeError) as excinfo:
             self._retry_run(
                 retry=lambda name, built: plan if name == "vanta-bi-Demo-1" else None,
-                first_error=_PANDAS_66_BUILD_LOG,
+                first_error=_HASH_MISMATCH_BUILD_LOG,
                 second_ok=False,
-                second_error=_PANDAS_66_BUILD_LOG,
+                second_error=_HASH_MISMATCH_BUILD_LOG,
             )
         message = str(excinfo.value)
         assert "[FAILED] vanta-bi-Demo-1" in message
@@ -19488,7 +19612,7 @@ class TestTheRetryOnAnUnbuildablePin:
         with pytest.raises(bake_mod.BakeError):
             self._retry_run(
                 retry=None,
-                first_error=_PANDAS_7_BUILD_LOG,
+                first_error=_UNBUILDABLE_PINS_BUILD_LOG,
                 second_ok=True,
                 projects=projects,
             )
@@ -23827,8 +23951,8 @@ class TestSuitePythonpath:
     # The buggy commits the held-out split records (§8.6 round 10). Kept as literals
     # because the point of the test is that *these* commits, read from the mirror,
     # say what the canary needs — not that the split happens to agree with itself.
-    FASTAPI_11 = "bf229ad5d830eb5320f966d51a55e590e8d57008"
-    FASTAPI_3 = "869c7389e22dc9ad659940fa271da76c4f3ba3b1"
+    MOVED_COMMIT = "bf229ad5d830eb5320f966d51a55e590e8d57008"
+    SIBLING_COMMIT = "869c7389e22dc9ad659940fa271da76c4f3ba3b1"
 
     def test_the_project_s_own_export_is_read(self, monkeypatch):
         monkeypatch.setattr(
@@ -23865,7 +23989,7 @@ class TestSuitePythonpath:
         assert prepare_mod.suite_pythonpath(Path("/clones/luigi.git"), "c" * 40) is None
 
     def test_the_row_takes_the_commits_value_over_the_splits(self, monkeypatch):
-        """The stale recorded value does not win: fastapi/11's tree has no ``docs_src``."""
+        """The stale recorded value does not win: the tree has no ``docs_src``."""
         monkeypatch.setattr(
             tree_mod,
             "read_file_at",
@@ -23874,7 +23998,7 @@ class TestSuitePythonpath:
         env = prepare_mod._sandbox_env(
             {"sandbox_env": {"PYTHONPATH": "./docs_src"}},
             repo=Path("/clones/fastapi.git"),
-            commit=self.FASTAPI_11,
+            commit=self.MOVED_COMMIT,
         )
         assert env == {"PYTHONPATH": "./docs/src"}
 
@@ -23895,13 +24019,13 @@ class TestSuitePythonpath:
             lambda repo, commit, path: "export PYTHONPATH=./docs/src\n",
         )
         assert prepare_mod._sandbox_env(
-            {}, repo=Path("/clones/fastapi.git"), commit=self.FASTAPI_11
+            {}, repo=Path("/clones/fastapi.git"), commit=self.MOVED_COMMIT
         ) == {"PYTHONPATH": "./docs/src"}
 
-    def test_fastapi_11s_suite_run_sees_docs_src_on_the_path(self, monkeypatch, tmp_path):
+    def test_a_suite_run_sees_docs_src_on_the_path(self, monkeypatch, tmp_path):
         """The env that reaches the deps gate's collect is the commit's own ``./docs/src``.
 
-        [VANTA-WHY] The deps gate's collect is the run that failed on fastapi/11 — its
+        [VANTA-WHY] The deps gate's collect is the run that failed — its
         tutorial tests import the example apps out of the tree's docs directory — so
         that is the run this asserts. The row's ``sandbox_env`` is what every run of the
         row gets (``TestSandboxEnvReachesEveryRun``), and here it is built from the same
@@ -23915,7 +24039,7 @@ class TestSuitePythonpath:
         env = prepare_mod._sandbox_env(
             {"sandbox_env": {"PYTHONPATH": "./docs_src"}},
             repo=self.FASTAPI_REPO,
-            commit=self.FASTAPI_11,
+            commit=self.MOVED_COMMIT,
         )
         seen: dict = {}
         monkeypatch.setattr(
@@ -23927,11 +24051,11 @@ class TestSuitePythonpath:
             suite_mod,
             "import_probe",
             lambda **kwargs: seen.update(probe=kwargs)
-            or "/workspace/worktrees/fastapi_11/oracle_tree/fastapi/__init__.py",
+            or "/workspace/worktrees/fastapi_bug/oracle_tree/fastapi/__init__.py",
         )
         prepare_mod.check_deps(
             prep(
-                root=tmp_path / "batch" / "worktrees" / "fastapi_11",
+                root=tmp_path / "batch" / "worktrees" / "fastapi_bug",
                 sandbox_env=env,
             ),
             checkpoint="chk",
@@ -23942,17 +24066,17 @@ class TestSuitePythonpath:
         assert seen["probe"]["extra_env"] == {"PYTHONPATH": "./docs/src"}
 
     @needs_bare_repos
-    def test_fastapi_11s_own_commit_declares_docs_src(self):
+    def test_the_own_commit_declares_docs_src(self):
         """The canary's fact, read from the real mirror rather than a stub."""
         assert (
-            prepare_mod.suite_pythonpath(self.FASTAPI_REPO, self.FASTAPI_11) == "./docs/src"
+            prepare_mod.suite_pythonpath(self.FASTAPI_REPO, self.MOVED_COMMIT) == "./docs/src"
         )
 
     @needs_bare_repos
-    def test_fastapi_3s_own_commit_declares_docs_src(self):
-        """The other side of the move: /3's tree carries ``docs_src`` and it passes."""
+    def test_a_sibling_commit_declares_docs_src(self):
+        """The other side of the move: the sibling commit's tree carries ``docs_src``."""
         assert (
-            prepare_mod.suite_pythonpath(self.FASTAPI_REPO, self.FASTAPI_3) == "./docs_src"
+            prepare_mod.suite_pythonpath(self.FASTAPI_REPO, self.SIBLING_COMMIT) == "./docs_src"
         )
 
 
@@ -25137,7 +25261,7 @@ class TestBuildTreesInPlace:
         assert seen["env"]["CC"] == bake_mod.VANTA_CC_PATH
 
     def test_the_array_bounds_demotion_reaches_the_build(self, tmp_path, monkeypatch):
-        """M3 §8.6 round 12 (item 5) — ``pandas/6``'s C parser needs ``-Warray-bounds`` demoted.
+        """M3 §8.6 round 12 (item 5) — a C parser needs ``-Warray-bounds`` demoted.
 
         GCC 14 flags the out-of-range subscript in ``tokenizer.c`` and the tree's own
         ``-Werror`` fails the build on it. The demotion is appended at *prepare* time to
@@ -27115,14 +27239,14 @@ class TestOracleGrade:
         assert "tests" not in hidden["test_cmd"]
 
     def test_the_grading_cap_is_derived_from_the_row_measurement(self, wired, tmp_path):
-        """M3 item D1 — the grading runs cover the native suite, so they get the derived cap.
+        """v1-m3.1 §8.3 — the grading runs cover the PATCHED native suite, so they get the gate rule.
 
-        The floor here is the caller's 1800; a measured run whose 3× exceeds it raises
+        The floor here is the caller's 1800; a measured run whose 10× exceeds it raises
         both the hidden and the patched run, and a row with no measurement keeps 1800.
         """
         self._grade(wired, tmp_path, prep_over={"native_secs": 700.0})
-        assert [run["timeout_secs"] for run in wired["runs"]] == [2100, 2100], (
-            "max(1800, 3 × 700) = 2100, on both the hidden and the patched run"
+        assert [run["timeout_secs"] for run in wired["runs"]] == [7000, 7000], (
+            "max(1800, 10 × 700) = 7000, on both the hidden and the patched run"
         )
 
     def test_a_row_with_no_measurement_keeps_the_grading_floor(self, wired, tmp_path):
@@ -27260,10 +27384,14 @@ class TestOracleGrade:
         grading read ``bad`` and (in the mutant pool) a patch the oracle never judged
         was pooled as known-bad. It must be ``inconclusive`` — and the patched suite
         must not even run, because its result can never be returned.
+
+        v1-m3.1 — the run measured NOTHING (no report **and no exit status**), which
+        is the state that stays ``inconclusive``; a run that exited would grade
+        ``bad`` (see the exit-status and cap tests below).
         """
         wired["hidden_pair"] = suite_mod.compare_runs(
-            suite_mod.SuiteRun(exit_code=4, report_found=False),
-            suite_mod.SuiteRun(exit_code=4, report_found=False),
+            suite_mod.SuiteRun(report_found=False),
+            suite_mod.SuiteRun(report_found=False),
         )
         result = self._grade(wired, tmp_path)
         assert result.apply_ok is True
@@ -27290,7 +27418,7 @@ class TestOracleGrade:
                 exit_code=0,
                 report_found=True,
             ),
-            suite_mod.SuiteRun(exit_code=4, report_found=False),
+            suite_mod.SuiteRun(report_found=False),
         )
         result = self._grade(wired, tmp_path)
         assert result.apply_ok is True
@@ -27313,8 +27441,8 @@ class TestOracleGrade:
         exercises the second guard alone, and never "no regressions".
         """
         wired["patched_pair"] = suite_mod.compare_runs(
-            suite_mod.SuiteRun(exit_code=4, report_found=False),
-            suite_mod.SuiteRun(exit_code=4, report_found=False),
+            suite_mod.SuiteRun(report_found=False),
+            suite_mod.SuiteRun(report_found=False),
         )
         result = self._grade(wired, tmp_path)
         assert result.apply_ok is True
@@ -27325,6 +27453,115 @@ class TestOracleGrade:
         assert len(wired["runs"]) == 2, (
             "the hidden pair was readable, so the patched run still had to be attempted"
         )
+
+    # -- v1-m3.1 item 2: a PATCH-CAUSED report-less run is the patch's failure ---
+    def test_a_hidden_run_that_exited_without_a_report_is_bad(self, wired, tmp_path):
+        """v1-m3.1 §8.1 row 2, applied to the grading: the suite RAN and EXITED.
+
+        A collection or import error the patch caused leaves no report but does
+        leave an exit status, so it is the patch's failure and grades ``bad`` —
+        never the third state. ``inconclusive`` is a state the wave gate halts on,
+        so leaving this as ``inconclusive`` would let one broken patch stop the
+        batch instead of grading one row.
+        """
+        wired["hidden_pair"] = suite_mod.compare_runs(
+            suite_mod.SuiteRun(exit_code=2, report_found=False),
+            suite_mod.SuiteRun(exit_code=2, report_found=False),
+        )
+        result = self._grade(wired, tmp_path)
+        assert result.apply_ok is True
+        assert result.inconclusive is False
+        assert result.patch_good is False
+        assert result.label_input == "bad"
+        assert "no pytest report" in result.error
+
+    def test_a_capped_hidden_run_is_bad_when_the_reference_measured(self, wired, tmp_path):
+        """v1-m3.1 §8.1 row 3 + §8.3, applied to the grading: cap hit, reference completed.
+
+        The cap is ``max(1800, 10 × prepare's native_secs)`` — a patched suite that
+        still cannot finish inside 10× its own prepared time, on a machine that
+        finished it unpatched, is the PATCH's cost. ``prepare``'s ``native_secs`` is
+        the reference (the oracle launches no unpatched run of its own), and here it
+        completed, so the cap hit grades ``bad`` with the named reason.
+        """
+        wired["hidden_pair"] = suite_mod.compare_runs(
+            suite_mod.SuiteRun(timed_out=True, exit_code=1, report_found=False),
+            suite_mod.SuiteRun(timed_out=True, exit_code=1, report_found=False),
+        )
+        result = self._grade(wired, tmp_path, prep_over={"native_secs": 700.0})
+        assert result.apply_ok is True
+        assert result.inconclusive is False
+        assert result.patch_good is False
+        assert result.label_input == "bad"
+        assert result.error == oracle_mod.PATCHED_RUN_CAP_REASON
+
+    def test_a_capped_hidden_run_stays_inconclusive_without_a_reference(self, wired, tmp_path):
+        """The other half: no reference measurement sizes the cap, so a timeout is unattributable.
+
+        ``oracle_prep`` records no ``native_secs`` (a row whose timing was lost, or
+        one prepared before D1), so the cap is the bare floor and the timeout could
+        be the harness rather than the patch — the third state, not ``bad``.
+        """
+        wired["hidden_pair"] = suite_mod.compare_runs(
+            suite_mod.SuiteRun(timed_out=True, report_found=False),
+            suite_mod.SuiteRun(timed_out=True, report_found=False),
+        )
+        result = self._grade(wired, tmp_path)
+        assert result.apply_ok is True
+        assert result.inconclusive is True
+        assert result.patch_good is False
+        assert result.label_input == "inconclusive"
+        assert result.error != oracle_mod.PATCHED_RUN_CAP_REASON
+
+    def test_a_run_with_no_report_and_no_exit_status_stays_inconclusive(self, wired, tmp_path):
+        """v1-m3.1 narrows the third state to the runs that measured NOTHING.
+
+        Neither a report nor an exit status nor a cap hit: the harness never
+        obtained a measurement (a VM that never booted, a tree that could not be
+        written), so the patch is neither credited nor blamed.
+        """
+        wired["hidden_pair"] = suite_mod.compare_runs(
+            suite_mod.SuiteRun(report_found=False),
+            suite_mod.SuiteRun(report_found=False),
+        )
+        result = self._grade(wired, tmp_path)
+        assert result.inconclusive is True
+        assert result.patch_good is False
+        assert result.label_input == "inconclusive"
+
+    def test_a_capped_patched_run_is_bad_when_the_reference_measured(self, wired, tmp_path):
+        """The mirror, on the pair the grading cap was raised for (``prep.test_cmd`` in full).
+
+        The hidden pair is readable, so the second guard is the one under test: the
+        patched full-suite run hit the cap under a completed reference, so it grades
+        ``bad`` rather than being read as "no regressions".
+        """
+        wired["patched_pair"] = suite_mod.compare_runs(
+            suite_mod.SuiteRun(timed_out=True, report_found=False),
+            suite_mod.SuiteRun(timed_out=True, report_found=False),
+        )
+        result = self._grade(wired, tmp_path, prep_over={"native_secs": 700.0})
+        assert result.inconclusive is False
+        assert result.patch_good is False
+        assert result.label_input == "bad"
+        assert result.error == oracle_mod.PATCHED_RUN_CAP_REASON
+        assert len(wired["runs"]) == 2
+
+    def test_a_patched_run_that_exited_without_a_report_is_bad(self, wired, tmp_path):
+        """A collection/import error the patch caused on the patched side, too.
+
+        Unreadable on the patched side used to risk a FALSE APPROVAL (empty
+        ``stable_failures`` ⇒ "no regressions"); with an exit status it is the
+        patch's failure, a definite ``bad``, never ``good``.
+        """
+        wired["patched_pair"] = suite_mod.compare_runs(
+            suite_mod.SuiteRun(exit_code=2, report_found=False),
+            suite_mod.SuiteRun(exit_code=2, report_found=False),
+        )
+        result = self._grade(wired, tmp_path)
+        assert result.patch_good is False
+        assert result.label_input == "bad"
+        assert "the patched run produced no pytest report" in result.error
 
     def test_the_inconclusive_state_survives_its_recorded_round_trip(self):
         """Item B4: a cached ``oracle.json`` re-read must not relabel it ``bad``."""
@@ -27398,6 +27635,43 @@ class TestGradeCandidateCache:
         assert graded.oracle.patch_good is True
         # the conclusive reading replaced the cache, so the next resume is cheap again
         assert json.loads(cache.read_text(encoding="utf-8"))["inconclusive"] is False
+
+    def test_a_pre_change_hang_grade_is_re_graded_under_the_new_rule(
+        self, tmp_path, monkeypatch
+    ):
+        """v1-m3.1 item 2: a cached ``inconclusive`` grade from before the change is re-graded.
+
+        The old rule wrote ``inconclusive = True`` for EVERY report-less grading —
+        including the patch-caused cap hang the new rule grades ``bad``. The reuse
+        guard is ``if not cached_result.inconclusive`` (``runner.py:1042``), so every
+        such pre-change entry is re-graded and the new reading is written back; no
+        version bump is needed for the candidate cache.
+        """
+        bug_prep, candidate, cache = self._candidate(tmp_path)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        # A pre-change entry: the patch applied, the grading hung, old rule ⇒ inconclusive.
+        oracle_mod.save(cache, oracle_mod.OracleResult(apply_ok=True, inconclusive=True))
+
+        def fake_grade(**kwargs):
+            # The new rule: the patched run hit the cap under a completed reference.
+            return oracle_mod.OracleResult(
+                apply_ok=True, patch_good=False, error=oracle_mod.PATCHED_RUN_CAP_REASON
+            )
+
+        monkeypatch.setattr(oracle_mod, "grade", fake_grade)
+        graded = runner_mod.grade_candidate(
+            batch_dir=tmp_path,
+            prep=bug_prep,
+            candidate=candidate,
+            checkpoint="vanta-bi-Demo-1",
+            disk_mb=8192,
+        )
+        assert graded.oracle.inconclusive is False
+        assert graded.oracle.patch_good is False
+        assert graded.oracle.label_input == "bad"
+        written = json.loads(cache.read_text(encoding="utf-8"))
+        assert written["inconclusive"] is False
+        assert written["error"] == oracle_mod.PATCHED_RUN_CAP_REASON
 
     def test_a_conclusive_cache_is_reused(self, tmp_path, monkeypatch):
         bug_prep, candidate, cache = self._candidate(tmp_path)
@@ -28228,7 +28502,7 @@ class TestInvokeVantaCarriesTheNativeExpectedTestCount:
 
 
 class TestInvokeVantaCarriesTheNativeTimeout:
-    """M3 item D1 — the cap derived from prepare's measurement reaches ``--native-timeout-secs``.
+    """The cap derived from prepare's measurement reaches ``--native-timeout-secs``.
 
     [VANTA-WHY] The in-session native suite was run under a fixed 120 s cap while
     prepare's own runs of the same suite used 1800 s. pandas/1's native run is ~487 s,
@@ -28237,6 +28511,14 @@ class TestInvokeVantaCarriesTheNativeTimeout:
     blamed on the tree for a fact about the CAP. The cap is derived from the row's
     own measurement by the one shared rule (``max(120, 3 × measured)``); a row with
     no measurement (pre-D1, or a measure-only row) keeps the historical 120 s.
+
+    [VANTA-WHY] v1-m3.1 (§8.3) — the GATE's rule is now ``max(1200, 10 × measured)``
+    over the same measurement, because a dev probe measured a legitimate
+    one-file patch at ~3.6× its unpatched control on an idle machine: D1's 3× sat
+    below the patched side's own cost, so the cap, not the patch, ended the row.
+    ``max(120, 3 × measured)`` is now the MEASUREMENT probe's rule only
+    (``scripts/probe_xdist.py``); the oracle and replay callers that run ONE tree
+    use the same 10× session rule too, so it is no longer what reaches this flag.
     """
 
     @staticmethod
@@ -28264,41 +28546,51 @@ class TestInvokeVantaCarriesTheNativeTimeout:
         )
         return log_path.read_text(encoding="utf-8")
 
-    def test_a_measured_bug_gets_three_times_its_native_run(self, tmp_path, monkeypatch):
+    def test_a_measured_bug_gets_ten_times_its_native_run(self, tmp_path, monkeypatch):
         text = self._run(tmp_path, monkeypatch, native_secs=487.0)
-        assert "--native-timeout-secs 1461" in text, (
-            "pandas/1: max(120, 3 × 487) = 1461 s, room for the suite to finish"
+        assert "--native-timeout-secs 4870" in text, (
+            "pandas/1: max(1200, 10 × 487) = 4870 s, room for the suite to finish"
         )
         assert text.index("--max-attempts 2") < text.index("--native-timeout-secs"), (
             "the flag is appended after the fixed arguments"
         )
 
-    def test_a_row_with_no_measurement_keeps_the_historical_cap(
+    def test_a_row_with_no_measurement_keeps_the_1200_second_floor(
         self, tmp_path, monkeypatch
     ):
         text = self._run(tmp_path, monkeypatch)
-        assert "--native-timeout-secs 120" in text, (
-            "a pre-D1 or measure-only row keeps the old 120 s, never a cap derived "
-            "from a missing number"
+        assert "--native-timeout-secs 1200" in text, (
+            "a pre-D1 or measure-only row holds the gate's 1200 s floor, never a cap "
+            "derived from a missing number"
         )
 
     def test_a_raised_environment_timeout_raises_the_flag(self, tmp_path, monkeypatch):
-        """F4 — the finding's case: ``VANTA_TEST_TIMEOUT_SECS=300``, no measurement.
+        """F4 — the floor is the run's EFFECTIVE ``VANTA_TEST_TIMEOUT_SECS``.
 
         [VANTA-WHY] The old fixed 120 s floor emitted ``--native-timeout-secs 120``,
         which ``driver.rs::resolve_native_timeout_secs`` refuses as below its own
-        effective cap of 300 s: the binary exited before running, the row landed as
+        effective cap: the binary exited before running, the row landed as
         ``infra_failure`` with no ``run.summary``, and every affected job was blamed for
-        a discrepancy between two readings of one number.
+        a discrepancy between two readings of one number. Under v1-m3.1 the floor is
+        ``max(1200, that environment cap)``, so a raised environment still reaches the
+        flag and a lower one can never lower the gate below 1200.
         """
-        env = {"PATH": "/usr/bin", suite_mod.NATIVE_TIMEOUT_ENV: "300"}
+        env = {"PATH": "/usr/bin", suite_mod.NATIVE_TIMEOUT_ENV: "1800"}
         text = self._run(tmp_path, monkeypatch, env=env)
-        assert "--native-timeout-secs 300" in text, (
-            "an unmeasured suite must be sent the environment's own cap, not 120"
+        assert "--native-timeout-secs 1800" in text, (
+            "an unmeasured suite must be sent the environment's own cap"
         )
         measured = self._run(tmp_path, monkeypatch, env=env, native_secs=487.0)
-        assert "--native-timeout-secs 1461" in measured, (
-            "3 × the measurement is still the larger number and still wins"
+        assert "--native-timeout-secs 4870" in measured, (
+            "10 × the measurement is still the larger number and still wins"
+        )
+        lower = self._run(
+            tmp_path,
+            monkeypatch,
+            env={"PATH": "/usr/bin", suite_mod.NATIVE_TIMEOUT_ENV: "600"},
+        )
+        assert "--native-timeout-secs 1200" in lower, (
+            "an environment cap below 1200 must not lower the gate's own floor"
         )
 
     def test_the_cap_is_never_below_the_binarys_own_floor(self, tmp_path, monkeypatch):
@@ -29664,6 +29956,53 @@ class TestWaveGate:
         """
         rows = _healthy_wave()
         rows[0]["verdict"] = "NeedsReview"
+        rows[0]["label"] = "unobservable"
+        rows[0]["oracle"]["apply_ok"] = False
+        rows[0]["oracle"]["apply_detail"] = "no final.patch for verdict NeedsReview"
+        problems = runner_mod.wave_gate_failures(rows)
+        assert any(
+            "unobservable" in problem and "no final.patch" in problem for problem in problems
+        )
+
+    def test_a_graded_budget_exhausted_row_does_not_stop_the_wave(self):
+        """v1-m3.1 item 1: a deadline exit leaves a `final.patch`, so it is graded.
+
+        [WHY] Every driver deadline exit used to break out of the attempt loop
+        before the terminal `match decision` — the one place a plain `NeedsReview`
+        attaches the patch — so the runner censored the oracle, the row read
+        `unobservable`, and ONE clock expiry halted the whole wave (§8.2). With the
+        last produced tree attached, `label_for` names the row
+        `needs_review_on_good`/`needs_review_on_bad` and §14.6's NeedsReview
+        exemption applies exactly as it does to any other refusal. The gate reads
+        the LABEL, never `stop_reason`: the same row left with no patch stays
+        `unobservable` and is still gated (the test above).
+        """
+        labels = set()
+        for good in (True, False):
+            rows = _healthy_wave()
+            for row in rows:
+                if row["candidate"] and row["candidate"]["kind"] == runner_mod.DEV_FIX:
+                    row["verdict"] = "NeedsReview"
+                    row["stop_reason"] = "budget_exhausted"
+                    row["label"] = runner_mod.label_for(
+                        "NeedsReview", oracle_mod.OracleResult(apply_ok=True, patch_good=good)
+                    )
+                    labels.add(row["label"])
+            assert runner_mod.wave_gate_failures(rows) == []
+        assert labels == {"needs_review_on_good", "needs_review_on_bad"}
+
+    def test_a_budget_exhausted_row_with_no_tree_stays_ungraded_and_gated(self):
+        """The other half of item 1: no tree was ever produced, so nothing to grade.
+
+        [WHY] An attempt-1 deadline that refuses the Creator before any apply
+        leaves `last_applied_patched_files = None`, so the driver writes no
+        `final.patch`. That row is genuinely unobservable — the plumbing, not the
+        candidate — and the wave gate must keep halting on it, exactly as it does
+        for any ungraded `NeedsReview`.
+        """
+        rows = _healthy_wave()
+        rows[0]["verdict"] = "NeedsReview"
+        rows[0]["stop_reason"] = "budget_exhausted"
         rows[0]["label"] = "unobservable"
         rows[0]["oracle"]["apply_ok"] = False
         rows[0]["oracle"]["apply_detail"] = "no final.patch for verdict NeedsReview"
@@ -31935,6 +32274,100 @@ class TestRunJob:
         assert old["native_secs"] is None
         assert old["native_timeout_secs"] is None
         assert old["native_timeout"] is None
+
+    def test_a_row_records_the_per_side_native_seconds_and_the_cap_that_ran(
+        self, tmp_path, monkeypatch
+    ):
+        """v1-m3.1 §4 — the per-side in-session wall time, kill flags and the cap.
+
+        The §8.1 truth table is a claim about the two SIDES (original vs patched),
+        so the row has to state what each side did and the cap it did it under.
+        `native_original_secs`/`native_patched_secs` are seconds (float) or `None`
+        when a side produced no wall time; the two `*_timed_out` flags are bools;
+        `native_session_cap_secs` is the resolved cap (the `native_cap` the driver
+        declared once and passed to both native-suite call sites).
+        `native_gate_effective_cap_secs` is the cap the LAST gate ACTUALLY ran
+        under after the deadline clamp lowered it, and `native_gate_clamped` says
+        whether that clamp happened (F3/F5). A clamped row names the SHORTER limit
+        beside its kill flag; an unclamped row names the full cap.
+        """
+        base = _outcome(tmp_path)
+        # Clamped: the resolved cap is 1200 s (the session floor for a 33 s suite)
+        # but the gate ran under 240 s.
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path,
+                summary=dict(
+                    base.summary,
+                    native_timeout_secs="1200",
+                    native_timeout="true",
+                    native_original_secs="33.000",
+                    native_patched_secs="119.000",
+                    native_original_timed_out="false",
+                    native_patched_timed_out="true",
+                    native_session_cap_secs="1200",
+                    native_gate_effective_cap_secs="240",
+                    native_gate_clamped="true",
+                ),
+            ),
+        )
+        measured = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root", native_secs=33.0)),
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert measured["native_original_secs"] == 33.0
+        assert measured["native_patched_secs"] == 119.0
+        assert isinstance(measured["native_original_secs"], float)
+        assert measured["native_original_timed_out"] is False
+        assert measured["native_patched_timed_out"] is True
+        assert measured["native_session_cap_secs"] == 1200
+        # The rule (configured cap) and the fact (effective cap) stay apart.
+        assert measured["native_gate_effective_cap_secs"] == 240
+        assert measured["native_gate_clamped"] is True
+
+        # Unclamped: the gate ran under the full resolved cap.
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path,
+                summary=dict(
+                    base.summary,
+                    native_session_cap_secs="1200",
+                    native_gate_effective_cap_secs="1200",
+                    native_gate_clamped="false",
+                ),
+            ),
+        )
+        unclamped = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root", native_secs=33.0)),
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert unclamped["native_session_cap_secs"] == 1200
+        assert unclamped["native_gate_effective_cap_secs"] == 1200
+        assert unclamped["native_gate_clamped"] is False
+
+        # A row whose run.summary predates v1-m3.1 records `None`, never a guess.
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        old = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")),
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert old["native_original_secs"] is None
+        assert old["native_patched_secs"] is None
+        assert old["native_original_timed_out"] is None
+        assert old["native_patched_timed_out"] is None
+        assert old["native_session_cap_secs"] is None
+        assert old["native_gate_effective_cap_secs"] is None
+        assert old["native_gate_clamped"] is None
 
     def test_a_missing_final_patch_is_a_measurement_failure_not_a_creator_failure(
         self, tmp_path, monkeypatch
@@ -39107,6 +39540,43 @@ class TestReplaySessionReuse:
         assert (entry["n_pp"], entry["n_pf"]) == (2, 0)
         assert entry["by_source"][replay_mod.SOURCE_REPO_BASELINE]["n_pp"] == 1
 
+    def test_the_replay_cap_is_derived_from_the_row_measurement(self, tmp_path, monkeypatch):
+        """v1-m3.1 §8.3 — a replay column grades the PATCHED tree, so it gets the gate rule.
+
+        The column runs the same *native* suite the gate ran, plus the patch, so D1's
+        3× sat below a legitimate patch's own cost (a dev probe: 3.6×). The caller's
+        1800 is the floor: a 725 s measurement gives ``max(1800, 10 × 725) = 7250``
+        and a short suite keeps the caller's cap.
+        """
+        for native_secs, expected in ((725.0, 7250), (33.0, replay_mod.DEFAULT_TIMEOUT_SECS)):
+            prep = _replay_prep(tmp_path, native_secs=native_secs)
+            sessions, debug = _replay_session(tmp_path, attempts=1)
+            write(
+                debug / "shared_tests.json",
+                json.dumps([{"test_name": "g_c", "test_source": "assert 1"}]),
+            )
+            calls: list[dict] = []
+            _fake_column(monkeypatch, {0: {"generated:g_c": "passed"}}, calls=calls)
+
+            replay_mod.replay_row(
+                record=_replay_record(),
+                prep=prep,
+                checkpoint="ck",
+                batch_dir=tmp_path / "batch",
+                sessions_dir=sessions,
+                views=(replay_mod.VIEW_GENERATED,),
+                seed=replay_mod.DEFAULT_SEED,
+                sample_rate=0.0,
+                disk_mb=prepare_mod.DISK_MB,
+                timeout_secs=replay_mod.DEFAULT_TIMEOUT_SECS,
+                progress=False,
+            )
+
+            assert calls, "the column carrying the unreused g_c cell has to boot"
+            assert {call["timeout_secs"] for call in calls} == {expected}, (
+                f"native_secs={native_secs} must give every column the derived cap"
+            )
+
 
 class TestReplayBaselineParity:
     """Item 3 — the in-session native run is compared with prepare's baseline.
@@ -39650,7 +40120,7 @@ class TestReplayRow:
                 assert replay_mod.REPLAY_DIRNAME in path.parts
 
     def test_the_column_cap_is_derived_from_the_row_measurement(self, tmp_path, monkeypatch):
-        """M3 item D1 — a column runs the same native suite, so it gets the derived cap."""
+        """v1-m3.1 §8.3 — a column runs the same native suite the gate ran, so it gets the gate rule."""
         calls: list[dict] = []
         prep = _replay_prep(tmp_path, native_secs=700.0)
         sessions, debug = _replay_session(tmp_path, attempts=1)
@@ -39672,9 +40142,9 @@ class TestReplayRow:
         )
 
         assert calls, "the baseline column has to boot"
-        assert calls[0]["timeout_secs"] == 2100, (
-            "the replay floor is 1800, and a 700 s run derives max(1800, 3 × 700) = 2100, "
-            "so the per-bug cap reaches run_column"
+        assert calls[0]["timeout_secs"] == 7000, (
+            "the replay floor is 1800, and a 700 s run derives max(1800, 10 × 700) = 7000 "
+            "under the gate rule, so the per-bug cap reaches run_column"
         )
 
     def test_a_row_with_no_measurement_keeps_the_replay_floor(self, tmp_path, monkeypatch):
@@ -41477,7 +41947,7 @@ class TestFrozenConfig:
 
     def test_the_committed_config_loads_and_validates(self):
         config = frozen_mod.load()
-        assert config.name == "v1-m3"
+        assert config.name == "v1-m3.1"
         assert len(config.sha256) == 64
         assert config.sha256 == config.sha256.lower()
         # The two kinds of `[env]` statement: a literal the harness applies, and
@@ -41773,7 +42243,7 @@ class TestFrozenConfigResolution:
         config = self._config()
         block, _ = frozen_mod.resolve(config, environ={}, allow_override=False)
         assert block["config_hash"] == config.sha256
-        assert block["config_path"] == "configs/v1-m3.toml"
+        assert block["config_path"] == "configs/v1-m3.1.toml"
 
 
 class TestFrozenConfigWiring:
@@ -41971,7 +42441,7 @@ class TestPrepareFrozenConfig:
         assert payload["n_ctx"] == 262144
         assert payload["n_ctx_source"] == "VANTA_LLM_CONTEXT_TOKENS"
         # Q3 — the configuration block is recorded, the same four keys as a row.
-        assert payload["config_path"] == "configs/v1-m3.toml"
+        assert payload["config_path"] == "configs/v1-m3.1.toml"
         assert payload["config_hash"] == frozen_mod.load().sha256
         assert payload["config_override"] is False
         assert payload["config_overrides"] == []

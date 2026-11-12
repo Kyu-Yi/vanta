@@ -957,7 +957,7 @@ def _collect_flip_or_raise(
 
     [VANTA-WHY] The second admission, and why it is a harness rule (M3-plan §4). The
     gate collects the *whole* suite, but grading only ever runs the tests the bug
-    declares. Measured on ``luigi/33``: the bug's own tests collect perfectly, and the
+    declares. Measured on one luigi bug: the bug's own tests collect perfectly, and the
     only failing files are side modules its tests never import — ``test/_esindex_test.py``
     (elasticsearch), ``test/_mysqldb_test.py`` (mysql), ``s3``/``redshift`` (cryptography)
     — which need drivers a layer baked for this bug does not carry. The suite-total
@@ -1246,7 +1246,7 @@ def build_trees_in_place(
 
     env = dict(bake_mod.build_env_for(bake_mod.minor_version(prep.bug.python_version)))
     if "CFLAGS" in env:
-        # [VANTA-WHY] M3 §8.6 round 12, item 5 — measured on ``pandas/6``, whose C
+        # [VANTA-WHY] M3 §8.6 round 12, item 5 — measured on a pandas bug, whose C
         # parser is built from source in its own layer: ``tokenizer.c:1764`` reads one
         # element past a ``double[309]`` table, GCC 14's ``-Warray-bounds`` catches it,
         # and the tree's own ``-Werror`` turns that warning into a hard failure
@@ -1938,7 +1938,7 @@ def declared_test_files(bug: BugInfo) -> list[str]:
     alone, so a measure-only run — which has no ``FAIL_TO_PASS`` — reads a text gated
     exactly as a real run's would have been.
 
-    [VANTA-WHY] One declared token may name *several* files with ``;``. ``fastapi/11``'s
+    [VANTA-WHY] One declared token may name *several* files with ``;``. One fastapi bug's
     ``bug.info`` carries ``tests/test_union_body.py;tests/test_union_inherited_body.py``
     and its ``run_test.sh`` the same pair as ``::nodeid`` lines. Read as a single path the
     token was no file at all: :func:`read_declared_test_files` skipped it, so the report
@@ -2851,11 +2851,11 @@ def suite_pythonpath(repo: Path, commit: str) -> Optional[str]:
     which case the split's recorded value stands unchanged.
 
     [VANTA-WHY] §8.6 round 10. The split recorded one value, ``./docs_src``, for every
-    fastapi bug — the layout of its *newer* commits. fastapi/11, /5 and /6 are older
-    commits whose own ``scripts/test.sh`` export ``PYTHONPATH=./docs/src``, so the
+    fastapi bug — the layout of its *newer* commits. Some older fixes' own
+    ``scripts/test.sh`` export ``PYTHONPATH=./docs/src``, so the
     deps gate's collect imported the example apps from a directory that commit does
     not ship and refused the bug with ``No module named 'additional_responses'`` while
-    fastapi/3 passed, because only its tree carries a ``docs_src/``. The path moved
+    a later fix passed, because only its tree carries a ``docs_src/``. The path moved
     with the project, so it is read per commit rather than frozen into the protocol;
     the environment variable the suite runs under is named ``PYTHONPATH`` either way,
     whatever the project's file calls the directory.

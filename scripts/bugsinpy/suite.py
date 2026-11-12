@@ -337,17 +337,97 @@ def native_timeout_secs(native_secs: Optional[float], *, floor: int) -> int:
     so the gate could never finish there; matplotlib/1's ~103 s was already inside the
     margin.
 
-    One rule, one helper, applied everywhere a full native suite runs — the in-session
-    gate (floor :func:`native_timeout_floor`, which is the environment's own cap), the
-    replay columns and the oracle grading (floor 1800) — so the three can never disagree
-    about how long a bug's suite may take. ``floor`` is the caller's CURRENT cap, so the
-    rule can only raise a cap, never lower one that was already large enough;
-    ``native_secs is None`` (a row prepared before D1, or a run whose timing was lost)
-    returns ``floor`` unchanged.
+    [VANTA-WHY] v1-m3.1 — this is now the MEASUREMENT rule only, and its ONLY caller is
+    the development probe ``scripts/probe_xdist.py`` (floor 1800). ``oracle.py`` and
+    ``replay.py`` USED to call it here (both at floor 1800), but they grade a PATCHED
+    tree — and, in the oracle view, run the hidden nodeids — so a legitimate patch that
+    is ``3.6×`` the unpatched suite (a dev probe) exceeded their ``max(1800, 3 ×
+    native)`` cap and was censored. They now call :func:`native_session_timeout_secs`,
+    the same shared 10×/1200 rule the in-session GATE uses (§8.3 of the v1-m3.1
+    design note), and keep the floor 1800. Keeping the two
+    rules apart is what stops a raise meant for the gate from also raising the dev
+    probe's cap.
+
+    ``floor`` is the caller's CURRENT cap, so the rule can only raise a cap, never
+    lower one that was already large enough; ``native_secs is None`` (a row prepared
+    before D1, or a run whose timing was lost) returns ``floor`` unchanged.
     """
     if native_secs is None:
         return floor
     return max(floor, math.ceil(3 * native_secs))
+
+
+NATIVE_SESSION_TIMEOUT_FLOOR_SECS = 1200
+"""The in-session native GATE's cap floor — the smallest cap either side may run under.
+
+[VANTA-WHY] v1-m3.1 (§8.3). D1 derived the gate's cap as ``max(120, 3 × prepare's
+measured native seconds)``. A dev probe measured a LEGITIMATE patch at ~3.6× the
+unpatched control (``luigi/scheduler.py``: 119/116 s against 33/31 s), so 3× is not a
+margin at all — the old cap sat below the patched suite's own idle-machine cost, and the
+run's load then pushed it past the kill. The gate's two sides therefore get a floor of
+20 minutes, and the multiplier above it (:data:`NATIVE_SESSION_TIMEOUT_MULTIPLIER`) is
+the margin for a suite that is longer still.
+
+[VANTA-WHY] v1-m3.1 follow-up 7 — the floor was 600 s and is now 1200 s. A 600 s floor
+is only twice a dev probe's patched side's idle cost; under the batch's own load a
+legitimate patch there can still be killed, which is the same failure the floor exists
+to prevent. 20 minutes leaves that pair (and the sub-minute suites that sit on the
+floor) room to finish with the machine busy.
+
+It is the FALLBACK for :func:`native_session_timeout_floor`, not the floor itself (M3
+item F4's reasoning, at the new floor): a run whose environment raises
+``VANTA_TEST_TIMEOUT_SECS`` raises the floor with it.
+"""
+
+NATIVE_SESSION_TIMEOUT_MULTIPLIER = 10
+"""The in-session native GATE's multiplier over prepare's own measurement (v1-m3.1).
+
+[VANTA-WHY] §8.3. Ten, not D1's three, because the measured cost of a legitimate patch
+was 3.6× the control: a cap that a real fix can outrun is a cap that reports the patch
+as the harness's fault. With :data:`NATIVE_SESSION_TIMEOUT_FLOOR_SECS` beneath it, a
+patched side that still cannot finish inside ``10 ×`` its own prepared time is the
+patch's cost, not the machine's — see :func:`native_session_timeout_secs`.
+"""
+
+
+def native_session_timeout_floor(env: Mapping[str, str]) -> int:
+    """The floor the in-session native GATE's cap may not go below (v1-m3.1).
+
+    [VANTA-WHY] M3 item F4's reasoning, moved to the new floor.
+    ``driver.rs::resolve_native_timeout_secs`` refuses a ``--native-timeout-secs`` below
+    its own ``harness::test_timeout_secs()`` (:data:`NATIVE_TIMEOUT_ENV`, else 120 s), so
+    a bare 1200 would be refused on a host whose environment sets
+    ``VANTA_TEST_TIMEOUT_SECS=1800`` — and the job would end ``infra_failure`` with no
+    ``run.summary``. ``max(1200, …)`` keeps the flag acceptable whatever the environment
+    says, and never lowers an operator's own cap.
+    """
+    return max(NATIVE_SESSION_TIMEOUT_FLOOR_SECS, native_timeout_floor(env))
+
+
+def native_session_timeout_secs(native_secs: Optional[float], *, floor: int) -> int:
+    """The in-session native GATE's wall-clock cap for ONE bug, both sides (v1-m3.1).
+
+    [VANTA-WHY] §8.3, replacing :func:`native_timeout_secs`'s 3×/120 for the gate only.
+    The gate runs the ORIGINAL and the PATCHED tree, and the patched side is NOT the
+    suite prepare measured: it is that suite plus the patch. The cap therefore has to
+    absorb the patch's own cost as well as machine load, and D1's 3× does not — the
+    dev probe measured a one-file ``luigi/scheduler.py`` change at ~3.6× the
+    unpatched suite (119/116 s vs 33/31 s) with no load at all. The rule is
+    ``max(1200, 10 × measured)``.
+
+    BOTH sides get the SAME value. The original side's result is content-keyed in the
+    suite cache (M3 item S1) and the cap is PART of that key
+    (``suite_cache::native_key``), so a per-side cap would give the original side a new
+    key for every patched cap and re-measure it on every row — the cross-arm reuse the
+    cache exists for would be gone.
+
+    ``floor`` is :func:`native_session_timeout_floor`'s result, so the rule can only
+    raise a cap; ``native_secs is None`` (a row prepared before D1, a measure-only row)
+    returns ``floor`` unchanged, exactly as :func:`native_timeout_secs` does.
+    """
+    if native_secs is None:
+        return floor
+    return max(floor, math.ceil(NATIVE_SESSION_TIMEOUT_MULTIPLIER * native_secs))
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +511,7 @@ def precompile_lines(
 EXIT_PLUGIN_NAME = "vanta_exit_plugin"
 """The import name of the plugin that ends pytest's interpreter.
 
-[VANTA-WHY] M3 §8.6 round 13, item 1. luigi/8, 9, 11 and 12 (round 12) start a
+[VANTA-WHY] M3 §8.6 round 13, item 1. Four luigi bugs (round 12) start a
 non-daemon worker thread in their own ``test/worker_test.py`` and never stop it,
 so ``python`` blocks in orderly interpreter shutdown *after* pytest has written
 its JSON report and printed its summary. The harness measures a run by the

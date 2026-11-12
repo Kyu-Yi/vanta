@@ -35,9 +35,13 @@ un-upstreamed patch that will not apply is unattributable — it is a fact about
 artifact, not about Vanta, and both a `true_reject` and a `false_reject` would be
 inventions.
 
-An *applied* patch whose hidden run produced no pytest report at all is
+An *applied* patch whose grading run produced no pytest report at all is
 ``inconclusive`` (item B4): the grading is unreadable, so it is a third state —
 neither a pass nor a definite failure — and is never pooled as a known-bad patch.
+v1-m3.1 narrows that third state to the runs that measured *nothing*: a run that
+**exited** without a report (a collection or import error the patch caused), or one
+that hit the cap while this bug's own native measurement completed, is the patch's
+failure and grades ``bad`` — see :data:`PATCHED_RUN_CAP_REASON`.
 
 Everything third-party still runs in Shuru, through ``suite.py``: this module only
 decides *which* commands run and how their reports compare.
@@ -73,6 +77,70 @@ the "did the patch get refused" question answerable without equating "no oracle"
 "the patch would not apply".
 """
 
+PATCHED_RUN_CAP_REASON = "patched run exceeded the 10x cap"
+"""Why a patched-tree run that hit the cap grades ``bad``, not ``inconclusive`` (v1-m3.1).
+
+[VANTA-WHY] Item B4 made an applied patch whose grading run wrote no report a third
+state — ``inconclusive`` — on the reasoning that an unreadable run is no evidence that
+the patch fails. That reasoning holds for a run that measured NOTHING (no report, no
+exit status: a VM that never booted, a tree that could not be written), and it holds
+for a run that hit the cap when there is no reference measurement to size the cap
+against. It does not hold for the two cases v1-m3.1 names: a run that RAN and EXITED
+(a collection or import error the patch caused), and a run that hit the cap while the
+bug's own native measurement completed. The grading cap is
+``max(floor, 10 × prepare's native_secs)`` (``suite.native_session_timeout_secs``), so
+a patched suite that still cannot finish inside 10× its own prepared time, on a machine
+that finished the same suite unpatched, is the PATCH's cost and not the harness's —
+exactly the reading the in-session native gate makes (v1-m3.1 §8.1, rows 2 and 3).
+
+The cost of getting this wrong is not a wrong label but a stopped batch: an
+``inconclusive`` grade is one the wave gate halts on, so a single hanging patch would
+end a wave instead of producing one graded row.
+
+v1-m3.1 narrowed :attr:`OracleResult.inconclusive` to the runs that measured nothing;
+this is the reason a cap hit is *not* one of them.
+"""
+
+
+def _patched_run_failure(
+    pair: suite_mod.SuitePair, *, side: str, reference_measured: bool
+) -> tuple[bool, str]:
+    """Is a patched-tree pair with a missing report the PATCH's failure, or unreadable?
+
+    ``side`` names the pair (``"hidden"`` / ``"patched"``) for the recorded reason.
+    Returns ``(is_patch_failure, reason)``. A report-less grading is never a *pass*, so
+    the caller always records ``patch_good = False`` and takes the third state from the
+    flag: ``inconclusive = not is_patch_failure``.
+
+    The classification, in order (v1-m3.1 §8.1's table, applied to the grading):
+
+    * A run that hit the cap **and** this bug's completed reference measurement
+      (``prepare``'s ``native_secs`` — the oracle launches no unpatched reference run
+      of its own) ⇒ the patch's cost ⇒ ``is_patch_failure = True``.
+    * A run that hit the cap with **no** such reference ⇒ nothing sizes the cap, so the
+      timeout cannot be attributed to the patch ⇒ ``is_patch_failure = False``.
+    * A run that **exited without a report** (an exit status: the collection or import
+      error the patch caused) ⇒ ``is_patch_failure = True``.
+    * Anything else — no report and no exit status ⇒ the harness obtained no
+      measurement at all ⇒ ``is_patch_failure = False``.
+
+    A cap hit is checked before an exit status because a run killed by the cap may carry
+    a status too, and the cap is the stronger evidence. Only the timeout branch needs
+    the reference: a tree that cannot even collect or import is a fact about the tree
+    either way.
+    """
+    runs = [run for run in (pair.first, pair.second) if not run.report_found]
+    detail = (
+        f"the {side} run produced no pytest report at all (exit "
+        f"{pair.first.exit_code}/{pair.second.exit_code}); "
+        f"tail: {pair.first.stdout_tail[-600:]!r}"
+    )
+    if any(run.timed_out for run in runs):
+        return (True, PATCHED_RUN_CAP_REASON) if reference_measured else (False, detail)
+    if any(run.exit_code is not None for run in runs):
+        return True, detail
+    return False, detail
+
 
 @dataclass
 class OracleResult:
@@ -106,12 +174,19 @@ class OracleResult:
     oracle_secs: float = 0.0
     error: str = ""
     inconclusive: bool = False
-    """The patch applied but the grading is unreadable (item B4).
+    """The patch applied but the grading obtained no measurement at all (item B4).
 
-    Set when the hidden run produced no pytest report at all: the patch could be
-    applied, so this is not the ``unobservable`` censor, but there is no evidence
-    that it failed either. It is a third state — neither a pass nor a definite
-    failure — and must never be pooled as a known-bad patch.
+    Set when a grading run produced no pytest report **and no exit status and no cap
+    hit**: the patch could be applied, so this is not the ``unobservable`` censor, but
+    there is no evidence that it failed either. It is a third state — neither a pass
+    nor a definite failure — and must never be pooled as a known-bad patch.
+
+    v1-m3.1 narrowed it: a run that **ran and exited** without a report (the
+    collection/import error the patch caused), and a run that **hit the cap** while
+    this bug's native measurement completed, are the patch's failure and do NOT set
+    this flag — see :data:`PATCHED_RUN_CAP_REASON`. Only a run that measured nothing
+    does. ``inconclusive`` is a state the wave gate halts on, so widening it to those
+    two cases would let one hanging patch stop a batch rather than grade one row.
     """
 
     cache: Optional[list[dict[str, Any]]] = None
@@ -139,10 +214,10 @@ class OracleResult:
         """What §5.3's table switches on: ``patch_good``, the censor, or the
         inconclusive grading.
 
-        ``apply_ok = false`` is the censor; an applied patch whose hidden run was
-        unreadable is ``inconclusive`` (item B4), not ``bad`` — reading it as
-        ``bad`` would invent a ``true_reject`` out of a run that produced no
-        evidence either way.
+        ``apply_ok = false`` is the censor; an applied patch whose grading obtained no
+        measurement at all is ``inconclusive`` (item B4, narrowed by v1-m3.1), not
+        ``bad`` — reading it as ``bad`` would invent a ``true_reject`` out of a run
+        that produced no evidence either way.
         """
         if not self.apply_ok:
             return "unobservable"
@@ -286,12 +361,24 @@ def grade(
     grading exactly the serial pair it was.
     """
     started = time.monotonic()
-    # M3 item D1 — the grading runs cover the same *native* suite the in-session gate
-    # does (``patched_pair`` runs ``prep.test_cmd`` in full), so the cap is derived
-    # from prepare's own measurement by the one shared rule. The floor here is the
-    # caller's current value (1800), so a bug whose suite was measured fast keeps its
-    # cap and a slow one gets room; the rule can only ever raise it.
-    timeout_secs = suite_mod.native_timeout_secs(prep.native_secs, floor=timeout_secs)
+    # M3 item D1 / v1-m3.1 — the grading runs cover the same *native* suite the
+    # in-session gate does (``patched_pair`` runs ``prep.test_cmd`` in full) on a
+    # PATCHED tree, so the cap must absorb the patch's own cost exactly as the gate's
+    # does: the shared 10×/1200 rule (``native_session_timeout_secs``), NOT D1's 3×,
+    # which a dev probe showed sat below a legitimate patch's own idle cost
+    # (119/116 s vs 33/31 s). The floor is the caller's current value (1800), so a bug
+    # whose suite was measured fast keeps its cap and a slow one gets room (a 725 s
+    # suite: max(1800, 10 × 725) = 7250, which clears a 3.6× or 5× patch); the rule
+    # can only raise it.
+    timeout_secs = suite_mod.native_session_timeout_secs(
+        prep.native_secs, floor=timeout_secs
+    )
+    # v1-m3.1 — the reference measurement a patch-caused cap hit is read against:
+    # prepare's own native run of this bug, which is the number the cap is built from.
+    # The oracle launches no unpatched reference run of its own, so this is the only
+    # reference there is; ``None`` (a row whose timing was lost, or one prepared before
+    # D1) leaves a timeout unattributable and the grading stays ``inconclusive``.
+    reference_measured = prep.native_secs is not None
     # §3.4: ``hidden_nodeids`` is the declared ``FAIL_TO_PASS`` **plus** the recorded
     # collect-flips — the files that do not collect on the buggy source at all, so
     # they appear in no BugsInPy list yet are exactly the fail→pass flips the oracle
@@ -392,10 +479,11 @@ def grade(
     # and ``patch_good = false``, and the grading would read as a *definite*
     # ``bad`` — inventing a ``true_reject`` out of a run that produced no
     # evidence either way, and (in the mutant pool) putting a patch no reviewer
-    # can be credited for finding into a "known-bad" pool. This is a third
-    # state, ``inconclusive``: the patch is not credited and not blamed. The
-    # check runs before the patched suite so an unreadable hidden run does not
-    # spend a second full suite for a result that is never returned.
+    # can be credited for finding into a "known-bad" pool. A run that measured
+    # nothing is a third state, ``inconclusive``: the patch is not credited and
+    # not blamed. The check runs before the patched suite so an unreadable hidden
+    # run does not spend a second full suite for a result that is never returned.
+    # (v1-m3.1 narrows the third state — see the note below.)
     #
     # [VANTA-WHY] Item E3 — ``and`` BOTH reports, not ``or``. With ``or`` a run
     # where only ONE side wrote a report fell through to ``score``: the unreadable
@@ -403,13 +491,22 @@ def grade(
     # grade was a definite ``bad`` manufactured from a run that produced no
     # evidence. The error text is kept verbatim — ``pool.py`` matches the
     # ``"the hidden run produced no pytest report at all"`` substring.
+    #
+    # [VANTA-WHY] v1-m3.1 — a report-less run is not automatically the third state:
+    # ``_patched_run_failure`` reads the same three-way split the in-session gate does
+    # (§8.1), so a hidden run that RAN and EXITED (the patch broke collection/import)
+    # or that hit the cap while this bug's native measurement completed grades a
+    # definite ``bad``. Only a run that measured nothing — no report and no exit
+    # status — is ``inconclusive``. The hidden pair is the FIRST of the grading's two
+    # patched-tree pairs, so leaving it unclassified would let a hanging patch halt the
+    # wave from here, before the patched suite is ever reached.
     if not (hidden_pair.first.report_found and hidden_pair.second.report_found):
-        result.inconclusive = True
-        result.error = (
-            "the hidden run produced no pytest report at all (exit "
-            f"{hidden_pair.first.exit_code}/{hidden_pair.second.exit_code}); "
-            f"tail: {hidden_pair.first.stdout_tail[-600:]!r}"
+        is_patch_failure, reason = _patched_run_failure(
+            hidden_pair, side="hidden", reference_measured=reference_measured
         )
+        result.patch_good = False
+        result.inconclusive = not is_patch_failure
+        result.error = reason
         result.oracle_secs = time.monotonic() - started
         return result
 
@@ -441,14 +538,21 @@ def grade(
     # A patched run that wrote no report leaves ``stable_failures`` empty, so
     # ``regressions == []`` and ``patch_good = hidden_pass``: a FALSE APPROVAL,
     # the one grading error that must never be manufactured from absent evidence.
-    # Unreadable on the patched side is ``inconclusive``, never "no regressions".
+    # Unreadable on the patched side is never "no regressions".
+    #
+    # [VANTA-WHY] v1-m3.1 — and it is never *only* ``inconclusive`` either, when the
+    # run actually measured something: ``_patched_run_failure`` separates a cap hit
+    # under a completed reference measurement, and a run that exited without a report,
+    # from a run that measured nothing (see :data:`PATCHED_RUN_CAP_REASON`). This is
+    # the pair the grading cap was raised for (it runs ``prep.test_cmd`` in full on the
+    # patched tree), so it is the pair a hanging patch most often stops.
     if not (patched_pair.first.report_found and patched_pair.second.report_found):
-        result.inconclusive = True
-        result.error = (
-            "the patched run produced no pytest report at all (exit "
-            f"{patched_pair.first.exit_code}/{patched_pair.second.exit_code}); "
-            f"tail: {patched_pair.first.stdout_tail[-600:]!r}"
+        is_patch_failure, reason = _patched_run_failure(
+            patched_pair, side="patched", reference_measured=reference_measured
         )
+        result.patch_good = False
+        result.inconclusive = not is_patch_failure
+        result.error = reason
         result.oracle_secs = time.monotonic() - started
         return result
 

@@ -109,17 +109,23 @@ pub struct RunConfig {
     /// infrastructure failure instead of a pass. Zero and `None` leave every
     /// pre-item-W run byte-for-byte as it was.
     pub native_expected_tests: Option<usize>,
-    /// [VANTA-WHY] M3 item D1 — `--native-timeout-secs N`: the wall-clock cap for
-    /// the in-session native suite, derived per bug from the run's own prepare
-    /// measurement (`max(120, 3 × measured)`). `None` keeps the historical
-    /// `harness::test_timeout_secs()` (120 s, or `VANTA_TEST_TIMEOUT_SECS`), which
-    /// is every hand-run invocation and every row whose prepare recorded no time.
+    /// [VANTA-WHY] M3 item D1 / v1-m3.1 — `--native-timeout-secs N`: the wall-clock cap
+    /// for the in-session native suite, derived per bug from the run's own prepare
+    /// measurement (`max(1200, 10 × measured)`, floor `max(1200, test_timeout_secs())`).
+    /// `None` keeps the session floor (`harness::native_session_timeout_floor`, 1200 s),
+    /// which is every hand-run invocation and every row whose prepare recorded no time.
     ///
-    /// The native gate runs the repo's own suite twice in-session, and that suite
-    /// is not always fast: pandas/1's takes ~487 s through prepare while the fixed
-    /// 120 s cap killed BOTH in-session runs, so the row died as a false "collected
-    /// nothing" (measured session, night3). A per-bug cap derived from a measured
-    /// run is the only value that is both large enough for the bug and still bounded.
+    /// The native gate runs the repo's own suite twice in-session — original tree vs
+    /// patched tree, both under THIS one cap — and that suite is not always fast:
+    /// pandas/1's takes ~487 s through prepare while the fixed 120 s cap killed BOTH
+    /// in-session runs, so the row died as a false "collected nothing" (a dev run).
+    /// The patched side is the suite PLUS the patch, so the cap has
+    /// to absorb the patch's own cost as well: a one-file `luigi/scheduler.py`
+    /// patch cost ~3.6× the unpatched suite on an idle machine (119/116 s vs 33/31 s),
+    /// above D1's 3× (a dev probe, 2026-11-12). A per-bug cap
+    /// derived from a measured run is the only value that is both large enough for the
+    /// bug and still bounded; the two sides share it because the cap is part of the
+    /// suite-cache key (`suite_cache::native_key`, M3 item S1).
     pub native_timeout_secs: Option<u64>,
     /// Path to a clean original tree (git worktree of the base commit) for
     /// two-tree mode. If set, BATE runs against this tree instead of the
@@ -774,14 +780,20 @@ fn resolve_arm(
 /// The in-session native wall-clock cap, from `--native-timeout-secs` or the default.
 ///
 /// [VANTA-WHY] M3 item E13 — the flag RAISES the cap for a slow bug; it must never
-/// LOWER it. `harness::test_timeout_secs()` (120 s, or `VANTA_TEST_TIMEOUT_SECS`) is the
-/// cap this run would otherwise use, and the Python side already passes its value as
-/// `max(floor, 3 × measured)`, so a value below that floor asks every suite to time out
-/// sooner than the default — the gate could no longer measure the very bug the cap was
-/// raised for. Refused here, where the cap is resolved, naming the flag and the floor.
-/// `None` keeps the default; the CLI still refuses `0` at parse time.
+/// LOWER it. [`harness::native_session_timeout_floor`] (1200 s, or the environment's own
+/// `VANTA_TEST_TIMEOUT_SECS` when that is larger) is the cap this run would otherwise
+/// use, and the Python side already passes its own session rule, so a value below that
+/// floor asks every suite to time out sooner than the default — the gate could no longer
+/// measure the very bug the cap was raised for. Refused here, where the cap is resolved,
+/// naming the flag and the floor. `None` keeps the floor; the CLI still refuses `0` at
+/// parse time.
+///
+/// [VANTA-WHY] v1-m3.1 — the floor moved from `test_timeout_secs()` (120 s) to the
+/// session floor, because the in-session gate now gives BOTH sides one raised cap: a
+/// patched side can legitimately cost several times the suite prepare measured, so a cap
+/// that could sit at 120 would kill it and report the patch as an infrastructure fault.
 pub fn resolve_native_timeout_secs(requested: Option<u64>) -> Result<u64, String> {
-    let floor = harness::test_timeout_secs();
+    let floor = harness::native_session_timeout_floor();
     match requested {
         None => Ok(floor),
         Some(secs) if secs < floor => Err(format!(
@@ -789,6 +801,164 @@ pub fn resolve_native_timeout_secs(requested: Option<u64>) -> Result<u64, String
              {floor} s — the flag may only RAISE the cap, never lower it."
         )),
         Some(secs) => Ok(secs),
+    }
+}
+
+/// The native gate's per-attempt cap, clamped to what the run's clock has left
+/// (v1-m3.1 §8.4).
+///
+/// [VANTA-WHY] The gate runs AFTER the deadline check at the top of the attempt, so a
+/// row with a slow suite (a 725 s suite: 7250 s per side) can start the gate with less than
+/// 7250 s left and outlive `VANTA_DEADLINE_SECS` on its own. The harness then
+/// hard-kills the whole row at `RUN_TIMEOUT_SECS` before the next attempt top can
+/// honour the deadline, and a hard-killed row leaves no manifest entry — it is
+/// invisible to the wave-1 gate and re-runs identically on resume. BOTH sides of the
+/// `tokio::join!` therefore get `min(native_cap, remaining)`, so the gate can never
+/// outlive the deadline by more than one side's own duration. The clamp can only LOWER
+/// the cap, never raise it.
+///
+/// `remaining` is the value from [`crate::llm::remaining_secs`]: `None` when no deadline
+/// is armed (the caller keeps the full cap), `Some(0)` when nothing is left (the caller
+/// SKIPS the gate and takes the existing deadline exit), `Some(n)` otherwise.
+fn native_gate_cap(native_cap: u64, remaining: Option<u64>) -> Option<u64> {
+    match remaining {
+        None => Some(native_cap),
+        Some(0) => None,
+        Some(left) => Some(native_cap.min(left)),
+    }
+}
+
+/// Which exit a VACUOUS native gate takes (v1-m3.1 §8.5).
+///
+/// [VANTA-WHY] A gate is vacuous when the ORIGINAL side collected nothing (§8.1 row 1),
+/// which is normally an infrastructure fault (`InfraFailure`: the base tree could not
+/// be graded). But when the gate was CLAMPED to the deadline (`gate_clamped`) AND the
+/// original side was KILLED by that clamp (`original_timed_out`), its emptiness is the
+/// run's CLOCK and not the machine: the estimate of what the suite needs was never
+/// falsified, the run simply ran out of time. That case must take the SAME deadline
+/// exit the top of the attempt loop takes — `NeedsReview` with
+/// `stop_reason=budget_exhausted` — never `InfraFailure`, so a `budget_exhausted` row
+/// is not misreported as a machine fault. A clamp that did NOT kill the side (a real
+/// collection error inside the shortened window) and a run under the full cap both
+/// stay `InfraFailure`, exactly as before.
+fn native_vacuous_exit(gate_clamped: bool, original_timed_out: bool) -> GovernorDecision {
+    if gate_clamped && original_timed_out {
+        GovernorDecision::NeedsReview
+    } else {
+        GovernorDecision::InfraFailure
+    }
+}
+
+/// Does a VACUOUS native gate set the run-level INFRASTRUCTURE-vacuity flag
+/// (`run.summary`'s `native_vacuous`)?
+///
+/// [VANTA-WHY] v1-m3.1 F3 — that flag documents one thing: the base tree could not
+/// be graded, so the native check could not be performed (`InfraFailure`). A gate
+/// made vacuous by the DEADLINE CLAMP takes the deadline exit
+/// (`budget_exhausted`/`NeedsReview`) instead — a fact about the run's clock, not
+/// the machine — so it must NOT set the flag; it records `native_vacuous=false`
+/// and `native_gate_clamped=true`. This is the exact complement of
+/// `native_vacuous_exit`: the flag is set iff that function picks `InfraFailure`.
+fn native_vacuous_is_infrastructure(gate_clamped: bool, original_timed_out: bool) -> bool {
+    native_vacuous_exit(gate_clamped, original_timed_out) != GovernorDecision::NeedsReview
+}
+
+/// Does a VACUOUS native gate set the run-level TIMEOUT flag (`run.summary`'s
+/// `native_timeout`)?
+///
+/// [VANTA-WHY] Finding C (PR #4 review) — the flag names one thing: a side was
+/// KILLED by the CONFIGURED cap (`native_cap`), so the vacuity's cause is the
+/// cap and not a tree that collected nothing. A kill by the DEADLINE CLAMP
+/// lowered the cap below the configured one, so it is the run's CLOCK killing
+/// the side, not the cap the run was configured with; that case must NOT set
+/// this flag (it is recorded by `native_gate_clamped` instead). It is still set
+/// only for a VACUOUS gate, so `native_timeout=true` continues to imply
+/// `native_vacuous=true` — the contract every consumer of the field relies on.
+fn native_timeout_flag(
+    native_vacuous: bool,
+    gate_clamped: bool,
+    original_timed_out: bool,
+    patched_timed_out: bool,
+) -> bool {
+    native_vacuous && !gate_clamped && (original_timed_out || patched_timed_out)
+}
+
+/// Did the native gate end as an INFRASTRUCTURE fault because a side could not be
+/// SET UP or transported (Finding A, PR #4 review)?
+///
+/// [VANTA-WHY] An empty side is patch-attributable ONLY when the suite command ran
+/// and exited (`exit_code` is `Some` — a collection or import error, pytest exit
+/// 2/4/5) or hit the cap (`timed_out`); `NativeSuiteReport::setup_failed` is false
+/// for exactly those two. When it is set the harness never obtained a measurement,
+/// so `native_regressions` over it would list every ORIGINAL test as a regression
+/// against a suite Vanta never ran — a machine fault blamed on the patch.
+///
+/// An ORIGINAL side that could not be set up is this fault UNCONDITIONALLY: its
+/// emptiness is not the deadline clamp's doing, so it must not take the clamp's
+/// `budget_exhausted` exit. A PATCHED side's is this fault whenever the ORIGINAL
+/// side is not itself vacuous — an original vacuity already ends the run as
+/// `InfraFailure` through its own branch, with its own (more specific) reason.
+fn native_setup_failure(
+    original_setup_failed: bool,
+    patched_setup_failed: bool,
+    original_vacuous: bool,
+) -> bool {
+    original_setup_failed || (patched_setup_failed && !original_vacuous)
+}
+
+/// The run-level per-side NATIVE-gate facts that ride `run.summary` and
+/// `evidence.json` (v1-m3.1 §4, F2/F3 of the PR #4 review).
+///
+/// [VANTA-WHY] F3 (PR #4 review) — `original_secs`/`patched_secs`, the
+/// `*_timed_out_last` pair and `effective_cap_secs` all describe the SAME (last)
+/// gate the run reached, so a reader comparing them never pairs one attempt's
+/// wall time or cap with another attempt's kill. The `secs` are exactly the LAST
+/// gate's: a side's measured seconds when it completed, or `None` when it did not
+/// (timed out, failed to set up, or never ran) — never an earlier attempt's value.
+/// `*_timed_out_any` keeps the WIDER meaning the
+/// `native_original_timed_out`/`native_patched_timed_out` fields always had — a
+/// kill on ANY attempt — so a kill is not lost when a later attempt happens to
+/// finish.
+#[derive(Default)]
+struct NativeGateFacts {
+    original_secs: Option<f64>,
+    patched_secs: Option<f64>,
+    original_timed_out_last: bool,
+    patched_timed_out_last: bool,
+    original_timed_out_any: bool,
+    patched_timed_out_any: bool,
+    effective_cap_secs: Option<u64>,
+}
+
+impl NativeGateFacts {
+    /// Fold ONE native gate's per-side results in.
+    ///
+    /// [VANTA-WHY] F2 (PR #4 review) — called immediately after the two sides
+    /// `tokio::join!` and BEFORE the `native_setup_failure` guard. That ordering is
+    /// the point: a gate whose ORIGINAL side completed while the PATCHED side
+    /// failed to set up still obtained an original-side measurement, and recording
+    /// it here keeps that measurement on the row even though the guard ends the run
+    /// as `InfraFailure`.
+    ///
+    /// Each call REPLACES both sides' seconds with THIS gate's own value, so the
+    /// last-gate fields always describe one gate: a side that completed contributes
+    /// its measured seconds, a side that did not (timed out, failed to set up, never
+    /// ran) contributes `None`. A previous attempt's measurement is never carried
+    /// forward, because a reader must never pair the last gate's `*_timed_out_last`
+    /// or `effective_cap_secs` with an earlier attempt's wall time.
+    fn record(
+        &mut self,
+        cap: u64,
+        original: &harness::NativeSuiteReport,
+        patched: &harness::NativeSuiteReport,
+    ) {
+        self.original_secs = original.secs;
+        self.patched_secs = patched.secs;
+        self.original_timed_out_last = original.timed_out;
+        self.patched_timed_out_last = patched.timed_out;
+        self.original_timed_out_any |= original.timed_out;
+        self.patched_timed_out_any |= patched.timed_out;
+        self.effective_cap_secs = Some(cap);
     }
 }
 
@@ -1676,16 +1846,30 @@ pub async fn run(
     } else {
         "creator"
     };
+    // [VANTA-WHY] M3 item D1 — the two sides' GENERATED-TEST timeouts may differ only
+    // through the test-only seam. `VANTA_PATCHED_TEST_TIMEOUT_SECS` exists so the timeout
+    // signal path can be exercised end to end without making BATE's baseline
+    // load-sensitive, and a real run that carries it is not a real measurement — hence
+    // the warning.
+    //
+    // [VANTA-WHY] v1-m3.1 — the warning is about that seam ONLY, and now says so. It can
+    // no longer describe the in-session native gate: the gate hands the original and the
+    // patched tree ONE shared cap (`native_cap`, recorded as `native_session_cap_secs` on
+    // `run.summary`), so "the patched side's native cap differs from the baseline's" is
+    // impossible by construction. Read as written, the message invited the opposite
+    // reading — that the native gate ran its two sides under two different caps — which
+    // §8.5 of the v1-m3.1 design note removes.
     let baseline_test_timeout_secs = crate::pipeline::harness::test_timeout_secs();
     let patched_test_timeout_secs = crate::pipeline::harness::patched_test_timeout_secs();
     if baseline_test_timeout_secs != patched_test_timeout_secs {
         tracing::warn!(
             baseline_test_timeout_secs,
             patched_test_timeout_secs,
-            "patched-side test timeout differs from baseline timeout; this seam exists for tests and can bias a real run"
+            "patched-side test timeout differs from baseline timeout; this seam exists for tests and can bias a real run (generated tests only — the native gate runs both sides under one shared cap)"
         );
         eprintln!(
-            "  ⚠ patched-side test timeout differs from baseline timeout: baseline={}s patched={}s",
+            "  ⚠ patched-side test timeout differs from baseline timeout: baseline={}s patched={}s \
+             (generated tests only — the in-session native gate runs both sides under one shared cap)",
             baseline_test_timeout_secs, patched_test_timeout_secs
         );
     }
@@ -1965,7 +2149,34 @@ pub async fn run(
     // the two emptinesses have opposite remedies: raise the derived cap, or fix
     // the tree's import. A `true` here never changes the label — the run is
     // `InfraFailure` either way — it only records WHICH infra fault it was.
+    //
+    // [VANTA-WHY] Finding C (PR #4 review) — `native_timeout` means an in-session
+    // native run hit the CONFIGURED cap `native_cap` (either side). A kill by the
+    // DEADLINE CLAMP is NOT this flag: the clamp lowered the cap below the one the
+    // run was configured with, so the kill is the deadline's doing and is recorded
+    // by `native_gate_clamped` instead. Without the exclusion a clamped kill would
+    // set `native_timeout=true` and report a cap that the suite never actually ran
+    // under. The flag still implies `native_vacuous_seen` (it is set only when the
+    // gate is vacuous), which is what every consumer below relies on.
     let mut native_timeout_seen = false;
+    // [VANTA-WHY] v1-m3.1 (§4) and F3 (PR #4 review) — the per-side facts of the
+    // last native gate the run reached (its seconds, its kill flags, the cap it ran
+    // under) plus the any-attempt kill flags, carried out of the loop onto
+    // `run.summary` and `evidence.json` so the §8.1 reading is auditable from the
+    // artifact. `secs` are the side's own seconds (a cache hit carries the served
+    // report's measurement, which is still a measurement of identical bytes —
+    // `native_cache` names the source row). See `NativeGateFacts` for why the
+    // last-gate trio and the any-attempt pair are kept apart.
+    let mut native_gate = NativeGateFacts::default();
+    // [VANTA-WHY] v1-m3.1 F3 — was the LAST native gate run under a cap that the
+    // deadline clamp LOWERED below the resolved `native_cap`? Run-level, like the
+    // per-side fields above, and separate from `native_vacuous_seen` on purpose:
+    // an original side cut by the clamp takes the deadline exit
+    // (`budget_exhausted`/`NeedsReview`), NOT the infrastructure exit, so it must
+    // record `native_vacuous=false` and this flag instead. Without it the
+    // distinction is invisible: a clamped `budget_exhausted` row would look like a
+    // machine fault that could not grade the base tree.
+    let mut native_gate_clamped = false;
     // [VANTA-WHY] M3 item S1 — every native gate call's cache note, per attempt
     // and per side, so the reuse is auditable from the run's own artifacts: which
     // results were served from an earlier row, under which key, and from whose
@@ -1974,11 +2185,11 @@ pub async fn run(
     // having to walk `evidence.json`.
     let mut native_cache_records: Vec<serde_json::Value> = Vec::new();
     let mut native_cache_hits: u32 = 0;
-    // [VANTA-WHY] M3 item D1 — the wall-clock cap every in-session native suite
-    // of this run uses. Declared once, here, so the gate, the judge's run and the
-    // terminal `run.summary` all name the SAME number: `None` on the config keeps
-    // the historical `harness::test_timeout_secs()`, and a row whose prepare
-    // measured its native suite passes `max(120, 3 × measured)`.
+    // [VANTA-WHY] M3 item D1 / v1-m3.1 — the wall-clock cap every in-session native
+    // suite of this run uses. Declared once, here, so the gate, the judge's run and
+    // the terminal `run.summary` all name the SAME number: `None` on the config keeps
+    // the session floor (`harness::native_session_timeout_floor`, 1200 s), and a row
+    // whose prepare measured its native suite passes `max(1200, 10 × measured)`.
     let native_cap = resolve_native_timeout_secs(config.native_timeout_secs)?;
     // [VANTA-WHY] Every NEW static finding this run's patch introduced, per
     // attempt, so evidence.json can name the finding that rejected a review
@@ -2162,6 +2373,17 @@ pub async fn run(
                  NeedsReview ({BUDGET_EXHAUSTED}); the candidate has been neither approved nor \
                  rejected."
             );
+            // [VANTA-WHY] v1-m3.1 item 1 — a deadline exit is a terminal verdict, so
+            // it leaves a `final.patch` like every other: the run's last PRODUCED
+            // tree, picked by EXACTLY the rule `MaxAttemptsReached` uses
+            // (`final_patched_files = Some(patched_files)`, the attempt's own
+            // applied tree). Here the attempt top is reached BEFORE this round's
+            // apply, so the most recent produced tree is `last_applied_patched_files`
+            // — `None` until the first apply, which is what keeps a run that never
+            // produced one (`unobservable`) censored and halting, as intended.
+            // Without this the runner censors the oracle and a single deadline halts
+            // the whole wave.
+            final_patched_files = last_applied_patched_files.clone();
             break 'attempts GovernorDecision::NeedsReview;
         }
         let attempt = governor.current_attempt();
@@ -2311,6 +2533,13 @@ pub async fn run(
                          the run as NeedsReview ({BUDGET_EXHAUSTED}), not as an infrastructure \
                          failure."
                     );
+                    // [VANTA-WHY] v1-m3.1 item 1 — same rule as the attempt-top deadline
+                    // exit above: attach the run's last PRODUCED tree (the same one
+                    // `MaxAttemptsReached` attaches). This attempt's Creator was
+                    // refused, so no tree was produced THIS round; `last_applied_patched_files`
+                    // is the previous attempt's tree, and stays `None` on attempt 1 —
+                    // there the row is genuinely unobservable and halts, as intended.
+                    final_patched_files = last_applied_patched_files.clone();
                     break 'attempts GovernorDecision::NeedsReview;
                 }
                 Err(error) => {
@@ -2713,18 +2942,101 @@ pub async fn run(
                     &patch_deleted_paths(&patch_text),
                 );
                 let judge_patched_concat = build_source_concat(&native_tree.files);
+                // [VANTA-WHY] v1-m3.1 F2 — the judge's native run is CLAMPED to the
+                // run's clock exactly as the gate's two sides are (§8.4), because it
+                // is the same sized step and, unclamped, the same failure follows:
+                // the attempt top honours the deadline only once the deadline has
+                // ALREADY passed, so a run taken with the whole resolved cap can
+                // start at `VANTA_DEADLINE_SECS` (this attempt's own in-session
+                // import guard is allowed to start first, and it has its own cap)
+                // and then outlive `RUN_TIMEOUT_SECS` on its own. The harness
+                // SIGKILLs the row mid-run, and a killed row writes no manifest
+                // entry at all — invisible to the wave-1 gate. The margin between
+                // the deadline and that kill is ONE model call's worth, and this
+                // arm's single model call (the judge's, below and AFTER this run)
+                // already needs it: it cannot cover the suite as well. With nothing
+                // left there is no run to make, and the attempt takes the SAME
+                // deadline exit the top of the loop takes (`stop_reason =
+                // BUDGET_EXHAUSTED`, `NeedsReview`), adding no new outcome. The
+                // clamp can only LOWER the cap, so a run with time to spare keeps
+                // the resolved `native_cap`.
+                let remaining = crate::llm::remaining_secs();
+                let judge_suite_cap = match native_gate_cap(native_cap, remaining) {
+                    Some(cap) => cap,
+                    None => {
+                        stop_reason = Some(BUDGET_EXHAUSTED);
+                        println!(
+                            "\n  ⏱ Wall-clock deadline reached before the judge's native suite — \
+                             skipping it and ending the run as NeedsReview ({BUDGET_EXHAUSTED}); \
+                             the candidate has been neither approved nor rejected."
+                        );
+                        // [VANTA-WHY] v1-m3.1 item 1 — a deadline exit leaves a
+                        // `final.patch`, exactly as `MaxAttemptsReached` does
+                        // (`final_patched_files = Some(patched_files)`). This is the
+                        // judge arm, so the most recent produced tree IS the candidate
+                        // patch; attaching it lets the oracle grade the row instead of
+                        // censoring it to `unobservable` and halting the wave.
+                        final_patched_files = Some(patched_files);
+                        break 'attempts GovernorDecision::NeedsReview;
+                    }
+                };
                 println!("\n▌ JUDGE: running the repo's own suite on the candidate...");
                 let report = run_with_spinner("Running the native suite for the judge", async {
                     // [VANTA-WHY] M3 item D1 — the judge's native run is the same
-                    // full repo suite as the gate's, so it takes the same per-bug cap.
+                    // full repo suite as the gate's, so it takes the same per-bug
+                    // cap. v1-m3.1 — the RESOLVED `native_cap`, not the raw
+                    // config option: `None` would otherwise fall through to the
+                    // 120 s default inside `run_native_suite` and grade the
+                    // candidate under a cap the gate never used.
                     harness::run_native_suite(
                         &judge_patched_concat,
                         &test_cmd,
-                        config.native_timeout_secs,
+                        Some(judge_suite_cap),
                     )
                     .await
                 })
                 .await;
+                // [VANTA-WHY] Finding A (PR #4 review) — a judge suite the harness
+                // could not SET UP or transport measured nothing about the candidate,
+                // so the judge must not be handed an empty result as if the tree had
+                // no tests, and the row must not read as a REJECTED candidate. Take
+                // the same infrastructure exit the native gate takes.
+                if report.setup_failed {
+                    let reason = format!(
+                        "Judge's native suite could not be SET UP or transported (no exit status \
+                         and no cap timeout) — the candidate was neither graded nor rejected; \
+                         patched=not_run (tests={} exit_code={} stderr={:?})",
+                        report.tests.len(),
+                        report
+                            .exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "unset".to_string()),
+                        report.stderr_tail,
+                    );
+                    println!("  ✗ NATIVE SUITE SETUP FAILED: {reason}");
+                    infra_failure_error = Some(reason);
+                    break 'attempts GovernorDecision::InfraFailure;
+                }
+                // [VANTA-WHY] Finding B (PR #4 review) — the CLAMPED suite above may
+                // have consumed the last of the run's clock (the cap is derived from
+                // what is left, §8.4), so the deadline is honoured HERE, before the
+                // judge's model call: a run with nothing left takes the deadline exit
+                // instead of a refused call being read as an infrastructure failure.
+                // This is the same exit the top of the attempt loop takes.
+                if crate::llm::deadline_past() {
+                    stop_reason = Some(BUDGET_EXHAUSTED);
+                    println!(
+                        "\n  ⏱ The wall-clock deadline passed while the judge's native suite ran \
+                         — ending the run as NeedsReview ({BUDGET_EXHAUSTED}); the candidate has \
+                         been neither approved nor rejected."
+                    );
+                    // [VANTA-WHY] v1-m3.1 item 1 — deadline exit; attach the candidate
+                    // patch under the same rule `MaxAttemptsReached` uses
+                    // (`final_patched_files = Some(patched_files)`), so the oracle
+                    // grades the row instead of the runner censoring it.
+                    final_patched_files = Some(patched_files);
+                    break 'attempts GovernorDecision::NeedsReview;
+                }
                 Some(render_judge_suite_result(&report))
             } else {
                 None
@@ -2772,6 +3084,31 @@ pub async fn run(
                     GovernorDecision::JudgeFailed
                 }
                 Err(JudgeError::Call(message)) => {
+                    // [VANTA-WHY] §14.15 / Finding B (PR #4 review) — a call the
+                    // deadline refused is NOT an infrastructure failure. "The machine
+                    // broke" and "the run ran out of clock" are opposite claims, and
+                    // the judge's native suite (just above) is a sized step that can
+                    // consume the remaining clock, so the judge call can be refused
+                    // with the same `deadline_exceeded` marker the Creator call
+                    // carries. Matched BEFORE the arm that would blame the server, and
+                    // it takes the identical exit: `stop_reason=budget_exhausted` with
+                    // `NeedsReview` (see the `creator_generate_patch` arm above).
+                    // Every OTHER judge call error stays `InfraFailure`.
+                    if message.contains(crate::llm::DEADLINE_EXCEEDED_MARKER) {
+                        stop_reason = Some(BUDGET_EXHAUSTED);
+                        println!(
+                            "\n  ⏱ The wall-clock deadline passed before the Judge call — ending \
+                             the run as NeedsReview ({BUDGET_EXHAUSTED}), not as an infrastructure \
+                             failure."
+                        );
+                        // [VANTA-WHY] v1-m3.1 item 1 — deadline exit; attach the
+                        // candidate patch under the same rule `MaxAttemptsReached`
+                        // uses (`final_patched_files = Some(patched_files)`), so the
+                        // row is graded instead of censored to `unobservable` (which
+                        // would halt the wave).
+                        final_patched_files = Some(patched_files);
+                        break 'attempts GovernorDecision::NeedsReview;
+                    }
                     infra_failure_error = Some(format!("Judge LLM call failed: {message}"));
                     GovernorDecision::InfraFailure
                 }
@@ -2904,6 +3241,13 @@ pub async fn run(
                          the run as NeedsReview ({BUDGET_EXHAUSTED}); this round contributes no \
                          test."
                     );
+                    // [VANTA-WHY] v1-m3.1 item 1 — deadline exit; attach this
+                    // attempt's applied tree under the same rule `MaxAttemptsReached`
+                    // uses (`final_patched_files = Some(patched_files)`). The patch
+                    // already applied (the Attacker runs after it), so this IS the
+                    // run's most recent produced tree, and the row is graded rather
+                    // than censored.
+                    final_patched_files = Some(patched_files);
                     break 'attempts GovernorDecision::NeedsReview;
                 }
                 Err(error) => {
@@ -3529,10 +3873,10 @@ pub async fn run(
                     .join(", ")
             );
         }
-        // [VANTA-WHY] M3 item D1 — the suite runs under `native_cap` (declared
-        // once for the run, above): a row with a prepare measurement passes
-        // `max(120, 3 × measured)`, and every other row keeps the historical
-        // `harness::test_timeout_secs()`.
+        // [VANTA-WHY] M3 item D1 / v1-m3.1 — the suite runs under `native_cap`
+        // (declared once for the run, above): the row's own prepare measurement
+        // decides it (`max(1200, 10 × measured)`), and a row with no measurement
+        // keeps the session floor (`harness::native_session_timeout_floor`).
         // [VANTA-WHY] M3 item S1 — the two sides go through the content-keyed
         // cache. `native_original` is a function of the BUG (same original tree,
         // same command, same cap), so across a Phase-3 arm-and-seed grid it is
@@ -3550,24 +3894,95 @@ pub async fn run(
         // the reports, the cache keys and the entries written — is byte-identical
         // to running them in sequence: each is the same call with the same
         // arguments, joined rather than awaited one after the other.
+        //
+        // [VANTA-WHY] v1-m3.1 — ONE cap for BOTH sides, and it is the RESOLVED
+        // `native_cap` rather than the raw `config.native_timeout_secs`: passing
+        // the raw option would let `None` fall through to
+        // `harness::test_timeout_secs()` (120 s) inside `run_native_suite_cached`
+        // while the row recorded 1200 — a cap the suite did not run under. The two
+        // sides must also share the value, not merely both be raised: the cap is
+        // part of the suite-cache key (`suite_cache::native_key`), so a per-side
+        // cap would give the original side a new key on every row and destroy the
+        // cross-arm reuse (item S1) it is measured for.
+        // [VANTA-WHY] v1-m3.1 (§8.4/§8.5) — the gate is CLAMPED to the run's clock.
+        // The attempt top checked the deadline, but this attempt has already spent
+        // time (Attacker, BATE, the patched run), so a slow row's gate (a 725 s suite:
+        // 7250 s per side) can start with less than 7250 s left and outlive `VANTA_DEADLINE_SECS`
+        // on its own. The harness would then hard-kill the whole row at
+        // `RUN_TIMEOUT_SECS` before the next attempt top could honour the deadline, and a
+        // hard-killed row writes no manifest entry — invisible to the wave-1 gate. BOTH
+        // sides are therefore given `min(native_cap, remaining)` from the ONE value
+        // below, so the two sides stay the same experiment even when clamped; the clamp
+        // can only LOWER the cap.
+        //
+        // [VANTA-WHY] v1-m3.1 (§8.5) — with nothing left there is no run to make: a
+        // suite under a zero-second cap would only manufacture a kill. The attempt takes
+        // the SAME deadline exit the top of the loop takes (`stop_reason =
+        // BUDGET_EXHAUSTED`, `NeedsReview`), adding no new outcome. `native_gate_cap`
+        // returns `None` for that case, and the full cap when no deadline is armed (the
+        // behaviour of every run before §14.15).
+        //
+        // [VANTA-WHY] v1-m3.1 — the clamp is per-call, and the cap is part of the
+        // suite-cache key (`suite_cache::native_key`), so a clamped ORIGINAL side misses
+        // the cross-arm entry (item S1) and re-measures. That is confined to the ONE
+        // attempt that runs near the deadline — a warm, unclamped gate still hits — and a
+        // clamped side that is killed writes nothing (U1), so no tree is mislabelled by a
+        // shorter cap. `gate_cap` is what the suite actually ran under, so the row
+        // records it rather than the resolved `native_cap`.
+        let gate_cap = match native_gate_cap(native_cap, crate::llm::remaining_secs()) {
+            Some(cap) => cap,
+            None => {
+                stop_reason = Some(BUDGET_EXHAUSTED);
+                println!(
+                    "\n  ⏱ Wall-clock deadline reached before the native gate — skipping it and \
+                     ending the run as NeedsReview ({BUDGET_EXHAUSTED}); the candidate has been \
+                     neither approved nor rejected."
+                );
+                // [VANTA-WHY] v1-m3.1 item 1 — deadline exit; attach this attempt's
+                // applied tree under the same rule `MaxAttemptsReached` uses
+                // (`final_patched_files = Some(patched_files)`). The gate runs after
+                // the apply, so this is the run's most recent produced tree and the
+                // row is graded rather than censored to `unobservable`.
+                final_patched_files = Some(patched_files);
+                break 'attempts GovernorDecision::NeedsReview;
+            }
+        };
+        let gate_clamped = gate_cap < native_cap;
+        // [VANTA-WHY] v1-m3.1 F3 — the last gate's clamp state rides out to
+        // `run.summary` (`native_gate_clamped`), so a reader can tell a clamped
+        // gate from an unclamped one without comparing caps across rows.
+        native_gate_clamped = gate_clamped;
+        // [VANTA-WHY] v1-m3.1 F5 — and the cap the gate ACTUALLY ran under
+        // (`native_gate_effective_cap_secs`), which the clamp may have lowered
+        // below the resolved `native_cap`. Last gate wins, like the per-side secs;
+        // it is recorded with them by `native_gate.record` right after the two
+        // sides join, below.
         let original_origin = format!("{}/a{}/original", session_id.as_str(), attempt + 1);
         let patched_origin = format!("{}/a{}/patched", session_id.as_str(), attempt + 1);
         let ((native_original, original_cache), (native_patched, patched_cache)) = tokio::join!(
             harness::run_native_suite_cached(
                 &original_concat,
                 &test_cmd,
-                config.native_timeout_secs,
+                Some(gate_cap),
                 actual_backend,
                 &original_origin,
             ),
             harness::run_native_suite_cached(
                 &native_patched_concat,
                 &test_cmd,
-                config.native_timeout_secs,
+                Some(gate_cap),
                 actual_backend,
                 &patched_origin,
             ),
         );
+        // [VANTA-WHY] F2/F3 (PR #4 review) — fold this gate's per-side facts in
+        // NOW, before the `native_setup_failure` guard below can exit as
+        // `InfraFailure`: a gate whose ORIGINAL side completed but whose PATCHED
+        // side never set up still obtained an original-side measurement, and the
+        // guard must not discard it. Recording here (rather than after the guard)
+        // is also what keeps the last-gate seconds, kill flags and effective cap on
+        // the SAME gate.
+        native_gate.record(gate_cap, &native_original, &native_patched);
         for (side, note) in [("original", &original_cache), ("patched", &patched_cache)] {
             if note.state == "hit" {
                 native_cache_hits += 1;
@@ -3590,18 +4005,67 @@ pub async fn run(
         // original ran=true (0 tests), patched ran=true (0 tests), 0
         // regression(s)`) while the SAME tree collected 88643 tests through the
         // prepare path. When the row's own prepare recorded tests for this bug,
-        // a native run that collected nothing means the check could not be DONE:
-        // it is an infrastructure fact, never a pass, and it ends the run as
-        // `InfraFailure` (exit 2) so the row is `infra_failure`.
+        // a native run in which the ORIGINAL side collected nothing means the
+        // base tree could not be graded at all: an infrastructure fact, never a
+        // pass, and it ends the run as `InfraFailure` (exit 2) so the row is
+        // `infra_failure`.
+        //
+        // [VANTA-WHY] v1-m3.1 (§8.1) — the guard is keyed on the ORIGINAL side
+        // ALONE. The original side running is what makes the patched side's
+        // emptiness attributable to the PATCH: a patched side that collected
+        // nothing while the original ran (a collection error, OR a cap kill) is a
+        // FAILED ATTEMPT, never `InfraFailure`. It reaches the Governor on its
+        // own, because every original test is then absent from the patched report
+        // (`native_regressions`, and `native_suite_collapsed`). Reading it as
+        // vacuous is what labelled an in-batch session `infra_failure`
+        // and dropped the bug out of the attempt loop, though its patch alone
+        // broke collection while the original ran its full suite — the pre-registration
+        // counts a patch-caused import error as a `fail`, not censored.
         let native_expected = config.native_expected_tests.unwrap_or(0);
-        let native_vacuous =
-            harness::native_gate_vacuous(native_expected, &native_original, &native_patched);
-        native_vacuous_seen |= native_vacuous;
+        let native_vacuous = harness::native_gate_vacuous(native_expected, &native_original);
+        // [VANTA-WHY] Finding A (PR #4 review) — a side the harness could not even
+        // SET UP or transport measured nothing about the tree, so its emptiness must
+        // not be read as regressions against the candidate (nor, for the ORIGINAL
+        // side, as the deadline clamp's exit). Checked BEFORE `native_regressions`
+        // (below) and before the timeout flag, so a setup failure never counts as a
+        // candidate regression and never sets `native_timeout`; the run ends as
+        // `InfraFailure` in BOTH repair and review modes. `native_vacuous_seen` stays
+        // FALSE — that flag documents "the BASE tree could not be graded", which this
+        // is not.
+        if native_setup_failure(
+            native_original.setup_failed,
+            native_patched.setup_failed,
+            native_vacuous,
+        ) {
+            let reason = harness::native_setup_failure_reason(&native_original, &native_patched);
+            println!("  ✗ NATIVE SUITE SETUP FAILED: {reason}");
+            infra_failure_error = Some(reason);
+            break 'attempts GovernorDecision::InfraFailure;
+        }
+        // [VANTA-WHY] v1-m3.1 F3 — `native_vacuous_seen` documents an
+        // INFRASTRUCTURE fault (the base tree could not be graded), so it is set
+        // where that exit is actually taken, below — NOT here. A gate made vacuous
+        // by the DEADLINE clamp takes the `budget_exhausted`/`NeedsReview` exit a
+        // few lines down, and setting the flag here first would make a clamped row
+        // read as `native_vacuous=true`, i.e. a machine fault it is not. The clamp
+        // is recorded by `native_gate_clamped` instead.
         // [VANTA-WHY] M3 item D1 — record that the cause was a KILL, not a tree
         // that collected nothing. Only meaningful when the gate is actually
         // vacuous; a timed-out side on a non-vacuous gate would mean the suite
         // still measured something, which the flag does not claim.
-        native_timeout_seen |= native_vacuous && (native_original.timed_out || native_patched.timed_out);
+        //
+        // [VANTA-WHY] Finding C (PR #4 review) — a kill by the DEADLINE CLAMP is
+        // excluded (`!gate_clamped`): the clamp cut the cap below the CONFIGURED
+        // `native_cap`, so the kill is the clock's doing and must not be reported
+        // as a configured-cap timeout. The clamp is recorded by
+        // `native_gate_clamped` instead, and the original side it killed takes the
+        // `budget_exhausted`/`NeedsReview` exit below — not the timeout label.
+        native_timeout_seen |= native_timeout_flag(
+            native_vacuous,
+            gate_clamped,
+            native_original.timed_out,
+            native_patched.timed_out,
+        );
         let mut native_regressions =
             harness::native_regressions(&native_original.tests, &native_patched.tests);
         // [VANTA-WHY] A suite that ran N>0 tests on the original and collects
@@ -3655,6 +4119,12 @@ pub async fn run(
             // a killed run is indistinguishable from one whose tree failed to
             // import — the exact confusion that made pandas/1's night3 row read as
             // "collected nothing" when its suite simply needed ~487 s.
+            //
+            // [VANTA-WHY] v1-m3.1 (§8.4) — the value is `gate_cap`, which the
+            // deadline clamp may have LOWERED below the resolved `native_cap`. The
+            // field claims the cap the suite ran under, so a clamped attempt records
+            // the shorter number and a reader sees the clamp by comparing it with
+            // `run.summary`'s resolved cap.
             summary: format!(
                 "ran_original={} ran_patched={} original_tests={} patched_tests={} regressions={} \
                  native_vacuous={} native_expected_tests={} native_timeout_secs={} \
@@ -3667,7 +4137,7 @@ pub async fn run(
                 native_regressions.len(),
                 native_vacuous,
                 native_expected,
-                native_cap,
+                gate_cap,
                 native_original.timed_out,
                 native_patched.timed_out,
                 // [VANTA-WHY] M3 item S1 — each side's cache note
@@ -3688,14 +4158,51 @@ pub async fn run(
         // `InfraFailure` machinery (run.infra_failure row, exit code 2, row
         // verdict `InfraFailure` → label `infra_failure`) is what makes the row
         // unapprovable on this evidence rather than a silent false accept.
+        //
+        // [VANTA-WHY] v1-m3.1 (§8.1/§8.5) — the branch is reachable only on §8.1
+        // row 1 (`native_vacuous` is now "the ORIGINAL side collected nothing"),
+        // so it fires when the BASE tree could not be graded, whatever the patched
+        // side did. A patched side that collected nothing while the original ran
+        // does NOT reach here: it stays in the attempt loop as a failed attempt,
+        // which in review mode REJECTS the candidate (`attempt_verdict` sees the
+        // native regression) instead of ending the run as an infrastructure fault.
+        //
+        // [VANTA-WHY] v1-m3.1 (§8.5) — an ORIGINAL side cut by the DEADLINE clamp
+        // collected nothing because the clock ran out, not because the tree could
+        // not be graded: that is `budget_exhausted` (the same exit the attempt top
+        // takes), NEVER `InfraFailure`. `native_vacuous_exit` draws the line — a
+        // clamp that did not kill the original side, and a run under the full cap,
+        // both stay `InfraFailure`.
         if native_vacuous {
+            if !native_vacuous_is_infrastructure(gate_clamped, native_original.timed_out) {
+                stop_reason = Some(BUDGET_EXHAUSTED);
+                println!(
+                    "\n  ⏱ the native gate's original side was cut by the deadline clamp \
+                     (resolved cap {native_cap}s, clamped to {gate_cap}s) — ending the run as \
+                     NeedsReview ({BUDGET_EXHAUSTED}), not an infrastructure fault; the candidate \
+                     has been neither approved nor rejected."
+                );
+                // [VANTA-WHY] v1-m3.1 item 1 — deadline exit; attach this attempt's
+                // applied tree under the same rule `MaxAttemptsReached` uses
+                // (`final_patched_files = Some(patched_files)`). The gate ran after
+                // the apply, so the candidate tree is the run's most recent produced
+                // one — attaching it makes the row gradeable instead of censored.
+                final_patched_files = Some(patched_files);
+                break 'attempts GovernorDecision::NeedsReview;
+            }
             let reason = harness::native_vacuous_reason(
                 native_expected,
-                native_cap,
+                gate_cap,
                 &native_original,
                 &native_patched,
             );
-            println!("  ✗ NATIVE VACUOUS: {reason}");
+            // [VANTA-WHY] v1-m3.1 F3 — this is the INFRASTRUCTURE exit (the base
+            // tree could not be graded), so it is here, and only here, that the
+            // run-level vacuity flag is set. The clamp-caused exit above returns
+            // before this line, so it records `native_vacuous=false` and
+            // `native_gate_clamped=true`.
+            native_vacuous_seen = true;
+            println!("  ✗ NATIVE VACUOUS (original side collected nothing): {reason}");
             infra_failure_error = Some(reason);
             break 'attempts GovernorDecision::InfraFailure;
         }
@@ -5021,6 +5528,10 @@ pub async fn run(
              n_ctx={} creator_effort={} creator_effort_mechanism={} \
              creator_prompt_tokens={}{}{}{} fixed_rounds={} native_vacuous={} \
              native_timeout_secs={} native_timeout={} native_cache_hits={} \
+             native_original_secs={} native_patched_secs={} \
+             native_original_timed_out={} native_patched_timed_out={} \
+             native_original_timed_out_last={} native_patched_timed_out_last={} \
+             native_session_cap_secs={} native_gate_effective_cap_secs={} native_gate_clamped={} \
              peak_sandboxes={} sandbox_backend={} model_version={}",
             attempts_run,
             fixed_at_attempt_1,
@@ -5337,6 +5848,11 @@ pub async fn run(
             // `native_vacuous` so an older row's reader sees the same fields in
             // the same order; `native_timeout=true` always implies
             // `native_vacuous=true` and never changes the label.
+            //
+            // [VANTA-WHY] Finding C (PR #4 review) — the kill must be by the
+            // CONFIGURED cap. A side cut by the DEADLINE CLAMP is excluded here
+            // and recorded by `native_gate_clamped` instead, so `native_timeout`
+            // never names a cap the suite did not actually run under.
             native_cap,
             native_timeout_seen,
             // [VANTA-WHY] M3 item S1 — how many of this run's native gate calls
@@ -5344,6 +5860,43 @@ pub async fn run(
             // (nothing reads it), appended after `native_timeout` so an older
             // row's reader sees the same fields in the same order.
             native_cache_hits,
+            // [VANTA-WHY] v1-m3.1 (§4) and F3 (PR #4 review) — the per-side
+            // in-session seconds, the per-side kill flags and the cap those runs
+            // actually used. `unset` (never a bare `None`) for a side that produced
+            // no wall time, so a `key=value` reader sees a token, not a Rust Debug
+            // string. The `*_secs`, the `*_timed_out_last` pair and
+            // `native_gate_effective_cap_secs` describe the SAME (last) gate; the
+            // `*_timed_out` pair keeps the wider ANY-attempt meaning. Appended after
+            // `native_cache_hits` so an older row's reader is unaffected.
+            native_gate
+                .original_secs
+                .map(|s| format!("{:.3}", s))
+                .unwrap_or_else(|| "unset".to_string()),
+            native_gate
+                .patched_secs
+                .map(|s| format!("{:.3}", s))
+                .unwrap_or_else(|| "unset".to_string()),
+            native_gate.original_timed_out_any,
+            native_gate.patched_timed_out_any,
+            native_gate.original_timed_out_last,
+            native_gate.patched_timed_out_last,
+            native_cap,
+            // [VANTA-WHY] v1-m3.1 F5 — the cap the LAST native gate actually ran
+            // under (after the deadline clamp), which is what a clamped timeout
+            // must be attributed to. `native_session_cap_secs` above keeps its own
+            // meaning (the resolved/configured cap, the rule). `unset` when no gate
+            // ran, so a reader sees a token, never a bare `None`.
+            native_gate
+                .effective_cap_secs
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unset".to_string()),
+            // [VANTA-WHY] v1-m3.1 F3 — whether the LAST native gate ran under a
+            // clamp-lowered cap. `true` records the deadline clamp, which is how a
+            // `budget_exhausted`/`NeedsReview` row whose ORIGINAL side was cut
+            // differs from a real infrastructure fault: its `native_vacuous` stays
+            // false and this flag carries the clamp instead. Appended after every
+            // pre-existing key so an older row's reader is unaffected.
+            native_gate_clamped,
             // [VANTA-WHY] M3 item S6 — the exact peak of simultaneous live
             // microVMs this run booted (`sandbox::peak_sandboxes`), space-free so
             // it survives the `key=value` reader. The scheduler charges a row
@@ -5419,12 +5972,17 @@ pub async fn run(
                 false
             }
         },
-        // [VANTA-WHY] M3 item E — only `HarnessFailure` / `InfraFailure` still
-        // leave this `None`: the setup never ran or an LLM call failed, so no
-        // tree exists to diff and the row is genuinely unmeasurable
-        // (`unobservable`). Every other terminal verdict — including a
+        // [VANTA-WHY] M3 item E / v1-m3.1 item 1 — `None` here means the run never
+        // had a tree to diff, and that is exactly two histories: a setup / LLM
+        // fault stopped the run before anything applied (`HarnessFailure`,
+        // `InfraFailure`), OR a `budget_exhausted` deadline exit fired while no
+        // attempt had yet produced a tree (attempt 1's Creator was refused by the
+        // clock, say). Both are genuinely unmeasurable and stay `unobservable`.
+        // Note the deadline exits are the deadline exits: they attach
+        // `last_applied_patched_files` (or this attempt's `patched_files`), NOT the
+        // fabricated original. Every OTHER terminal verdict — including
         // `PatchApplicationFailed`, and a repair run that ended on a malformed
-        // patch — now attaches a tree (the last one produced, or the original when
+        // patch — attaches a tree (the last one produced, or the original when
         // nothing ever applied), so the oracle grades it instead of censoring it.
         None => false,
     };
@@ -5568,8 +6126,27 @@ pub async fn run(
             // `native_timeout` beside it means a side was KILLED by that cap rather
             // than a tree that failed to import — opposite fixes, so the row must
             // not have to guess which one it got.
+            //
+            // [VANTA-WHY] Finding C (PR #4 review) — the kill must be by the
+            // CONFIGURED cap. A side cut by the DEADLINE CLAMP is excluded and
+            // recorded by `native_gate_clamped` on the row instead.
             "native_timeout_secs": config.native_timeout_secs,
             "native_timeout": native_timeout_seen,
+            // [VANTA-WHY] v1-m3.1 (§4) and F3 (PR #4 review) — the per-side
+            // in-session wall time, the per-side kill flags and the cap those runs
+            // actually ran under, so the §8.1 reading and the number that produced
+            // it are both in the artifact. `None` = a side that produced no wall
+            // time. The `*_secs` and the `*_timed_out_last` pair describe the SAME
+            // (last) gate; `native_original_timed_out`/`native_patched_timed_out`
+            // (the any-attempt pair) keep the wider meaning. Appended after
+            // `native_timeout` so an older row's reader is unaffected.
+            "native_original_secs": native_gate.original_secs,
+            "native_patched_secs": native_gate.patched_secs,
+            "native_original_timed_out": native_gate.original_timed_out_any,
+            "native_patched_timed_out": native_gate.patched_timed_out_any,
+            "native_original_timed_out_last": native_gate.original_timed_out_last,
+            "native_patched_timed_out_last": native_gate.patched_timed_out_last,
+            "native_session_cap_secs": native_cap,
             // [VANTA-WHY] M3 item S1 — one entry per native gate call (attempt ×
             // side) recording whether the result was measured or served from the
             // suite cache, under which key, and from whose row. The reuse is
@@ -6116,6 +6693,20 @@ fn require_clean_target_repo_for_open_pr(target_repo_dirty: Option<bool>) -> Res
     }
 }
 
+/// Up to this many regressed nodeids are named in full in the Creator feedback.
+///
+/// [VANTA-WHY] A patched tree that collects NOTHING makes every nodeid the base
+/// tree passed a regression, so on a very large suite (pandas/1's ~88,642 tests)
+/// the regression list is the whole suite. Naming every one of them puts tens of
+/// thousands of nodeids into `prior_feedback`, the next Creator prompt then fails
+/// `prompt_over_budget_reason`, and the run ends as an `InfraFailure` instead of
+/// letting the Creator retry — the feedback meant to enable the retry is what
+/// kills it. At or below this many the message is byte-identical to the one the
+/// unbounded code produced; above it the list is bounded (see the sample size).
+const REGRESSION_FEEDBACK_LIMIT: usize = 50;
+/// How many nodeids the bounded (`> REGRESSION_FEEDBACK_LIMIT`) message names.
+const REGRESSION_FEEDBACK_SAMPLE: usize = 20;
+
 fn build_creator_feedback(
     failed: &[&TestEvidence],
     ruff_new: bool,
@@ -6173,11 +6764,67 @@ fn build_creator_feedback(
         );
     }
     if !native_regressions.is_empty() {
+        let total = native_regressions.len();
         fb.push_str("- The repository's own tests regressed (run with the ORIGINAL test files):\n");
-        for nodeid in native_regressions {
-            fb.push_str(&format!("  - {nodeid}\n"));
-            if let Some(output) = native_patched.failure_output(nodeid) {
-                fb.push_str(&format!("    failure: {output}\n"));
+        if total <= REGRESSION_FEEDBACK_LIMIT {
+            // Byte-identical to the unbounded message: at or below the limit every
+            // nodeid is named, in the suite's own order, with its failure output.
+            for nodeid in native_regressions {
+                fb.push_str(&format!("  - {nodeid}\n"));
+                if let Some(output) = native_patched.failure_output(nodeid) {
+                    fb.push_str(&format!("    failure: {output}\n"));
+                }
+            }
+        } else {
+            // [VANTA-WHY] Above the limit the list is bounded: a sorted sample of
+            // `REGRESSION_FEEDBACK_SAMPLE` nodeids, the true total, and how many are
+            // left to the evidence artifact (which keeps the COMPLETE list). Sorting
+            // makes the sample a stable prefix of the suite rather than whatever
+            // order the report parser happened to emit, so two runs that regress the
+            // same suite name the same 20.
+            //
+            // [VANTA-WHY] Finding D (PR #4 review) — the sample is taken in TWO
+            // groups, each sorted: nodeids the patched report actually recorded a
+            // `failure_output` for come FIRST, then the absent ones fill the
+            // remaining slots. A partially running patched suite (say 3 tests fail on
+            // assertion while 4,000 others are simply absent) would otherwise spend
+            // the whole sample on absent nodeids that sort before the failures,
+            // handing the Creator neither the one real assertion failure nor a
+            // collapsed suite's stderr. `with_output` preserves the suite order of the
+            // first group, `without_output` of the second.
+            let mut sorted: Vec<&String> = native_regressions.iter().collect();
+            sorted.sort();
+            let (with_output, without_output): (Vec<&String>, Vec<&String>) = sorted
+                .into_iter()
+                .partition(|nodeid| native_patched.failure_output(nodeid).is_some());
+            for nodeid in with_output
+                .iter()
+                .chain(without_output.iter())
+                .take(REGRESSION_FEEDBACK_SAMPLE)
+            {
+                fb.push_str(&format!("  - {nodeid}\n"));
+                if let Some(output) = native_patched.failure_output(nodeid) {
+                    fb.push_str(&format!("    failure: {output}\n"));
+                }
+            }
+            fb.push_str(&format!(
+                "  - {total} tests regressed; showing {REGRESSION_FEEDBACK_SAMPLE} sampled \
+                 (failures first, then sorted), {} more in the evidence artifact.\n",
+                total - REGRESSION_FEEDBACK_SAMPLE
+            ));
+        }
+        // [VANTA-WHY] A patched side that collected nothing has no `failure_output`
+        // for any nodeid — the regressed nodeids are simply ABSENT from its report —
+        // so the regression list alone cannot say WHY the suite collapsed. The
+        // patched run's stderr tail is that diagnostic (import error, collection
+        // error, crash), so it is added whenever the patched side collected nothing,
+        // bounded to the same tail length the harness already uses.
+        if native_patched.collected_nothing() {
+            let tail = harness::stderr_tail(&native_patched.stderr_tail);
+            if !tail.is_empty() {
+                fb.push_str(&format!(
+                    "  The patched suite collected no tests; its stderr tail: {tail}\n"
+                ));
             }
         }
     }
@@ -7287,6 +7934,7 @@ mod tests {
         ApplyFailure,
         approval_invariant_status, attempt_verdict, bate_baseline_concat, benchmark_config_name,
         blocking_static_findings,
+        build_creator_feedback,
         build_fixed_round_pass_feedback,
         build_source_concat, cache_hit_rate_value, collapse_decision, creator_effort_text,
         creator_prompt_tokens_text,
@@ -7296,7 +7944,10 @@ mod tests {
         harness_infrastructure_collapse,
         is_judge_site,
         ledger_text,
-        modified_test_config_records, new_files_from_patch, open_fixed_round_record,
+        modified_test_config_records, native_gate_cap, NativeGateFacts, native_setup_failure,
+        native_vacuous_exit,
+        native_vacuous_is_infrastructure, native_timeout_flag, new_files_from_patch,
+        open_fixed_round_record,
         patch_attempt_id_for_patch,
         prompt_over_budget_reason,
         record_new_static_findings,
@@ -7309,6 +7960,7 @@ mod tests {
         stable_patch_fingerprint, ARMS,
         INVARIANT_SATISFIED,
         JUDGE_ARM, NO_ADMITTED_TESTS, NO_REPRODUCTION_EVIDENCE,
+        REGRESSION_FEEDBACK_SAMPLE,
     };
     use crate::agents::attacker::GeneratedTest;
     use crate::config::{LlmBackend, LlmConfig};
@@ -7844,6 +8496,30 @@ mod tests {
             "the repo's own suite failing on the patch is a regression the generated \
              tests did not happen to cover"
         );
+    }
+
+    /// [VANTA-WHY] v1-m3.1 (§8.1 row 3) — an EMPTY patched side is a failed
+    /// attempt in BOTH modes, and the mode only decides what that costs.
+    ///
+    /// `native_regression` is the path row 3 takes to the Governor (every
+    /// original test is absent from an empty patched report, so every one is a
+    /// regression), and `attempt_verdict` rejects on it in any mode. In review
+    /// mode that rejection IS the candidate's verdict — a recorded reject, not a
+    /// censored `infra_failure`; in repair mode it is a round the Creator gets
+    /// back and retries. An in-batch session used to leave this path
+    /// entirely and end the row `infra_failure`, dropping the bug out of the
+    /// attempt loop, though its patch alone broke collection while the original
+    /// ran its full suite.
+    #[test]
+    fn an_empty_patched_side_fails_the_attempt_in_both_modes() {
+        for mode in [GovernorMode::Repair, GovernorMode::Review] {
+            assert_eq!(
+                attempt_verdict(true, &[], true, false, mode),
+                AttemptVerdict::Rejected,
+                "row 3 in {mode:?}: a patch that wiped the native suite must reject, \
+                 never read as a clean gate nor as an infrastructure fault"
+            );
+        }
     }
 
     fn audit_finding(file: &str, code: &str) -> StaticDiagnostic {
@@ -9210,11 +9886,12 @@ mod tests {
         assert!(resolve_arm(Some("b3"), true, false, true, 4, None, Some(9)).is_ok());
     }
 
-    // [VANTA-WHY] M3 item E13 — `--native-timeout-secs` may only RAISE the in-session
-    // native cap. Below the effective cap (`harness::test_timeout_secs()`, 120 s by
-    // default) the value would make every suite time out sooner than the default, which
-    // is the opposite of what the flag exists for; refused where the cap is resolved,
-    // naming the flag and the floor.
+    // [VANTA-WHY] M3 item E13 / v1-m3.1 — `--native-timeout-secs` may only RAISE the
+    // in-session native cap. Below the effective cap (the session floor,
+    // `harness::native_session_timeout_floor()`, 1200 s or `VANTA_TEST_TIMEOUT_SECS` when
+    // that is larger) the value would make every suite time out sooner than the default,
+    // which is the opposite of what the flag exists for; refused where the cap is
+    // resolved, naming the flag and the floor.
     //
     // [VANTA-WHY] M3 item F6 — every expectation is DERIVED from the floor the run
     // actually resolves, so this passes whatever `VANTA_TEST_TIMEOUT_SECS` is set to.
@@ -9222,8 +9899,12 @@ mod tests {
     // for no reason about the code — on any machine that raised the variable.
     #[test]
     fn a_native_timeout_below_the_effective_cap_is_refused() {
-        let floor = crate::pipeline::harness::test_timeout_secs();
+        let floor = crate::pipeline::harness::native_session_timeout_floor();
         assert!(floor > 0, "the effective cap is a positive number of seconds");
+        assert!(
+            floor >= crate::pipeline::harness::NATIVE_SESSION_TIMEOUT_FLOOR_SECS,
+            "the session floor is the floor of the effective cap"
+        );
         // Absent keeps the floor; the floor itself and anything above it are accepted.
         assert_eq!(resolve_native_timeout_secs(None).unwrap(), floor);
         assert_eq!(resolve_native_timeout_secs(Some(floor)).unwrap(), floor);
@@ -9251,6 +9932,752 @@ mod tests {
                 "got: {error}"
             );
         }
+    }
+
+    // [VANTA-WHY] v1-m3.1 (§8.4) — the native gate's cap is CLAMPED to the time the
+    // run's clock has left, so a slow row's gate (a 725 s suite: 7250 s per side) cannot
+    // start with less than its cap on the clock and outlive `VANTA_DEADLINE_SECS` on
+    // its own. `native_gate_cap` is the pure rule; the call site passes the ONE value
+    // it returns to BOTH sides of the `tokio::join!`, so the two sides stay the same
+    // experiment even when the clamp bites.
+    #[test]
+    fn the_native_gate_cap_is_clamped_to_the_time_left_and_can_only_lower() {
+        // Less time on the clock than the cap: the gate gets the time left —
+        // a 725 s suite's 7250 s resolved cap, with 3000 s left.
+        assert_eq!(native_gate_cap(7250, Some(3000)), Some(3000));
+        assert_eq!(native_gate_cap(1200, Some(1199)), Some(1199));
+        // At least the cap left: the FULL cap, unchanged. The clamp can only LOWER
+        // the cap, never raise it past the resolved value.
+        assert_eq!(native_gate_cap(7250, Some(7250)), Some(7250));
+        assert_eq!(native_gate_cap(1200, Some(99999)), Some(1200));
+        // No deadline armed: the full cap, exactly as every run before §14.15.
+        assert_eq!(native_gate_cap(7250, None), Some(7250));
+    }
+
+    // [VANTA-WHY] v1-m3.1 (§8.5) — with NOTHING left on the clock there is no run to
+    // make: a suite under a zero-second cap would only manufacture a kill.
+    // `native_gate_cap` therefore returns `None`, which the call site maps to the
+    // SAME deadline exit the attempt top takes (`stop_reason = BUDGET_EXHAUSTED`,
+    // `NeedsReview`) — adding no new outcome. The `Some(0)` (clock due) and `None`
+    // (no clock) cases must not collapse: `None` keeps the full cap.
+    #[test]
+    fn nothing_left_on_the_clock_skips_the_gate_rather_than_running_it_empty() {
+        assert_eq!(native_gate_cap(7250, Some(0)), None);
+        assert_eq!(native_gate_cap(1200, Some(0)), None);
+        // The distinguishing case: no deadline is NOT zero seconds left.
+        assert_eq!(native_gate_cap(1200, None), Some(1200));
+    }
+
+    // [VANTA-WHY] v1-m3.1 F2 — the judge's own native run (`judge+suite`) is the SAME
+    // sized step as the gate's, and unclamped it fails the same way: the attempt top
+    // honours the deadline only once it has passed, so a run taken with the whole
+    // resolved cap can start AT the deadline — the in-session import guard may start
+    // first and has its own cap — and reach the harness's `RUN_TIMEOUT_SECS` on its
+    // own. The source once claimed a `max_call_secs + native_cap` bound for it, and
+    // that is not how the clock works: the margin between the deadline and the kill is
+    // ONE in-flight model call's worth, and this arm's model call comes AFTER the run,
+    // so the margin is already spent by then. The run is therefore clamped like the
+    // gate's two sides. Both halves are pinned here because they are two claims: the
+    // arithmetic, and the call site that takes the rule.
+    #[test]
+    fn the_judge_suite_run_takes_the_gate_s_clamped_cap_and_the_deadline_exit() {
+        // The two clocks, as the harness hands them out: the deadline Vanta is given,
+        // and the backstop it SIGKILLs the row at.
+        let deadline: u64 = 10_200;
+        let run_timeout: u64 = 13_800;
+        // The margin is one model call's backstop — exactly what the judge's own call
+        // (after this run) may spend, so it cannot also cover the suite.
+        assert_eq!(run_timeout - deadline, 3_600);
+        // A slow suite's per-side cap, larger than that margin: this is the case the
+        // clamp exists for.
+        let cap: u64 = 7_200;
+        assert!(cap > run_timeout - deadline);
+        // The import guard's own cap, which may run before the suite in the same attempt.
+        let guard_cap: u64 = 120;
+        assert!(
+            deadline + guard_cap + cap >= run_timeout,
+            "an unclamped run started at the deadline reaches the harness's kill \
+             ({} s >= {} s), and a killed row writes no manifest entry",
+            deadline + guard_cap + cap,
+            run_timeout
+        );
+        // The clamp itself: the full cap while the run has at least that much left...
+        assert_eq!(native_gate_cap(cap, Some(deadline)), Some(cap));
+        // ...the time left when it has less, so the run ends by the deadline...
+        assert_eq!(native_gate_cap(cap, Some(3_000)), Some(3_000));
+        // ...and NO run at all when the clock is out, which is the value the call site
+        // maps to the existing deadline exit (`budget_exhausted`/`NeedsReview`).
+        assert_eq!(native_gate_cap(cap, Some(0)), None);
+        // The rule is worth nothing if the judge's native run is not what takes it, so
+        // the call site is pinned too. `native_gate_cap` is called from two places and
+        // the gate's own line is a different one: this is the judge's.
+        let source = include_str!("driver.rs");
+        assert!(
+            source.contains("let judge_suite_cap = match native_gate_cap(native_cap, remaining) {"),
+            "the judge's native run must take `native_gate_cap`, exactly as the gate \
+             does; this file has no clamped judge-suite call site"
+        );
+    }
+
+    // [VANTA-WHY] Finding B (PR #4 review) — the judge's native suite is a sized
+    // step that can consume the remaining clock, so the judge's model call can be
+    // refused by the deadline. A refusal is "the run ran out of clock", not "the
+    // machine broke", and it must take the SAME exit the Creator path takes
+    // (`stop_reason=budget_exhausted` with `NeedsReview`) — never `InfraFailure`.
+    // Pin the arm (it is evaluated before the server-blaming line) and the deadline
+    // check that runs right after the clamped suite.
+    #[test]
+    fn the_judge_call_honours_the_deadline_as_budget_exhausted_not_infra_failure() {
+        let source = include_str!("driver.rs");
+        let marker = source
+            .find("if message.contains(crate::llm::DEADLINE_EXCEEDED_MARKER) {")
+            .expect("the judge's `JudgeError::Call` arm must recognise the deadline refusal");
+        let blames_server = source
+            .find("infra_failure_error = Some(format!(\"Judge LLM call failed: {message}\"));")
+            .expect("the judge's call arm must still record a real call failure");
+        assert!(
+            marker < blames_server,
+            "the deadline marker must be matched BEFORE the judge call is reported as an \
+             infrastructure failure, or a `budget_exhausted` row reads as a machine fault"
+        );
+        assert!(
+            source.contains("The wall-clock deadline passed while the judge's native suite ran"),
+            "the deadline must be checked right after the judge's native suite, before the call"
+        );
+    }
+
+    // [VANTA-WHY] v1-m3.1 item 1 — every deadline exit is a TERMINAL verdict, so it
+    // must leave a `final.patch` exactly as `MaxAttemptsReached` does
+    // (`final_patched_files = Some(patched_files)`). Before this fix all eight
+    // `break 'attempts GovernorDecision::NeedsReview` sites broke BEFORE the
+    // terminal `match decision` — the one place a plain `NeedsReview` attaches the
+    // patch — so no `final.patch` was written, the runner censored the oracle, the
+    // row read `unobservable`, and the wave gate halted on that ONE row (§8.2). Pin
+    // all eight: each must assign `final_patched_files` between its
+    // `stop_reason = Some(BUDGET_EXHAUSTED)` and its break, so a graded deadline row
+    // can never regress to an ungraded one.
+    #[test]
+    fn every_deadline_exit_attaches_the_last_produced_tree() {
+        let source = include_str!("driver.rs");
+        // Built with `concat!` so this test's OWN source does not contain the
+        // literal it counts (`include_str!` reads the whole file, tests included).
+        let brk = concat!("break 'attempts GovernorDecision::NeedsReview", ";");
+        let budget = concat!("stop_reason = Some(BUDGET_EXHAUSTED)", ";");
+        let attach = concat!("final_patched_files = ", "");
+        let breaks: Vec<usize> = source.match_indices(brk).map(|(i, _)| i).collect();
+        assert_eq!(
+            breaks.len(),
+            8,
+            "this file must carry exactly the eight deadline `NeedsReview` breaks \
+             (attempt top, Creator refusal, Attacker refusal, two clamp skips, \
+             clamp-cut original, judge-suite deadline, judge-call refusal)"
+        );
+        let mut prev = 0usize;
+        for (n, &b) in breaks.iter().enumerate() {
+            let segment = &source[prev..b];
+            assert!(
+                segment.contains(budget),
+                "deadline break #{n} does not follow a budget_exhausted stop_reason"
+            );
+            assert!(
+                segment.contains(attach),
+                "deadline break #{n} skips the terminal patch attach, so the runner \
+                 would censor the oracle and the wave gate would halt on this row"
+            );
+            prev = b + brk.len();
+        }
+    }
+
+    // [VANTA-WHY] v1-m3.1 item 1 — the attached tree is the run's most recent
+    // PRODUCED one, never a fabricated original. The six post-apply deadline exits
+    // (Attacker refusal, both clamp skips, clamp-cut original, both judge deadline
+    // exits) attach this attempt's `patched_files`, the same value
+    // `MaxAttemptsReached` attaches; the two PRE-apply exits (attempt top, Creator
+    // refusal) attach `last_applied_patched_files`, which is `None` until the first
+    // apply. That `None` is what keeps a run which never produced a tree
+    // `unobservable` (it halts, as intended) — a `final_patch_tree` fallback to the
+    // original here would fabricate a gradeable tree for an experiment that did not
+    // run.
+    #[test]
+    fn the_deadline_exit_attaches_the_produced_tree_never_a_fabricated_original() {
+        let source = include_str!("driver.rs");
+        let brk = concat!("break 'attempts GovernorDecision::NeedsReview", ";");
+        // `concat!` again: this literal must not appear verbatim in the test source.
+        let pre_apply = concat!(
+            "final_patched_files = last_applied_patched_files.clone()",
+            ";"
+        );
+        let breaks: Vec<usize> = source.match_indices(brk).map(|(i, _)| i).collect();
+        let mut prev = 0usize;
+        for (n, &b) in breaks.iter().enumerate() {
+            let segment = &source[prev..b];
+            if n < 2 {
+                // The two pre-apply sites, in file order: attempt top, Creator refusal.
+                assert!(
+                    segment.contains(pre_apply),
+                    "deadline break #{n} (pre-apply) must attach \
+                     `last_applied_patched_files`, the run's last produced tree"
+                );
+            } else {
+                assert!(
+                    !segment.contains(pre_apply),
+                    "deadline break #{n} (post-apply) must attach THIS attempt's tree, \
+                     not `last_applied_patched_files`"
+                );
+            }
+            prev = b + brk.len();
+        }
+        assert_eq!(
+            source.matches(pre_apply).count(),
+            2,
+            "exactly the two pre-apply deadline exits read `last_applied_patched_files`"
+        );
+    }
+
+    /// A `NativeSuiteReport` for the gate-clamp tests: the nodeids and run state
+    /// spelled out, `timed_out` set explicitly (the harness's own test helper
+    /// hard-codes `false`, so a killed side cannot be built with it).
+    ///
+    /// [VANTA-WHY] Finding A — `setup_failed` defaults to `false` (an attributable
+    /// report); a test that needs a SETUP/TRANSPORT failure sets the flag on the
+    /// value it builds.
+    fn clamped_report(
+        tests: &[&str],
+        ran: bool,
+        timed_out: bool,
+    ) -> crate::pipeline::harness::NativeSuiteReport {
+        crate::pipeline::harness::NativeSuiteReport {
+            tests: tests
+                .iter()
+                .map(|name| (name.to_string(), TestResult::Passed))
+                .collect(),
+            failure_outputs: HashMap::new(),
+            ran,
+            timed_out,
+            secs: None,
+            exit_code: None,
+            stderr_tail: String::new(),
+            collection: None,
+            setup_failed: false,
+        }
+    }
+
+    /// A `NativeSuiteReport` for the `NativeGateFacts` tests: only the fields the
+    /// fold reads (`secs`, `timed_out`, `setup_failed`) are spelled out, so a test
+    /// can build a completed side, a capped side, and a side that never set up.
+    fn gate_report(
+        secs: Option<f64>,
+        timed_out: bool,
+        setup_failed: bool,
+    ) -> crate::pipeline::harness::NativeSuiteReport {
+        crate::pipeline::harness::NativeSuiteReport {
+            tests: Vec::new(),
+            failure_outputs: HashMap::new(),
+            ran: secs.is_some(),
+            timed_out,
+            secs,
+            exit_code: None,
+            stderr_tail: String::new(),
+            collection: None,
+            setup_failed,
+        }
+    }
+
+    // [VANTA-WHY] F2 (PR #4 review) — a gate whose ORIGINAL side completed while
+    // the PATCHED side never set up still obtained an original-side measurement.
+    // `NativeGateFacts::record` is called BEFORE the `native_setup_failure` guard,
+    // so that measurement reaches the row instead of being discarded by the
+    // `InfraFailure` exit. And because F3 makes the `*_secs` fields the LAST gate's
+    // own values, a side that did not complete in a later gate records `None` — the
+    // earlier measurement is not carried forward.
+    #[test]
+    fn a_completed_side_is_recorded_even_when_the_other_side_never_completed() {
+        let mut facts = NativeGateFacts::default();
+        // Original completed with wall time; patched failed SETUP (no secs, not a
+        // timeout — the `failed_run(None, …)` shape).
+        facts.record(
+            1200,
+            &gate_report(Some(33.0), false, false),
+            &gate_report(None, false, true),
+        );
+        assert_eq!(
+            facts.original_secs,
+            Some(33.0),
+            "the completed side's secs is kept despite the setup-failure exit"
+        );
+        assert_eq!(
+            facts.patched_secs, None,
+            "a side that never completed records no secs"
+        );
+        assert!(
+            !facts.patched_timed_out_last && !facts.patched_timed_out_any,
+            "a setup failure is not a timeout"
+        );
+
+        // A later gate whose ORIGINAL side fails setup and whose PATCHED side
+        // completes: each side takes THIS gate's own value, so the earlier original
+        // measurement is gone and only the patched one is recorded.
+        facts.record(
+            1200,
+            &gate_report(None, false, true),
+            &gate_report(Some(119.0), false, false),
+        );
+        assert_eq!(
+            facts.original_secs, None,
+            "the last gate's original side did not complete, so no secs carries over"
+        );
+        assert_eq!(facts.patched_secs, Some(119.0));
+    }
+
+    // [VANTA-WHY] F2/F3 (PR #4 review) — a side killed in the LAST gate must not
+    // keep its earlier attempt's wall time: the row would then pair the last gate's
+    // kill and effective cap with a previous attempt's measurement. The any-attempt
+    // kill flag still records the earlier completion's opposite, and the last-gate
+    // kill flag is the last gate's.
+    #[test]
+    fn a_side_killed_in_the_last_gate_does_not_keep_an_earlier_attempts_secs() {
+        let mut facts = NativeGateFacts::default();
+        // Attempt 1: both sides complete; the patched side measured 500 s under the
+        // full 1200 s cap, so the row would otherwise carry 500 s forward.
+        facts.record(
+            1200,
+            &gate_report(Some(33.0), false, false),
+            &gate_report(Some(500.0), false, false),
+        );
+        assert_eq!(facts.patched_secs, Some(500.0));
+        assert!(!facts.patched_timed_out_last);
+        assert!(!facts.patched_timed_out_any);
+
+        // Attempt 2 (the LAST gate): the patched side is killed by the clamp to
+        // 240 s — no wall time, timed_out.
+        facts.record(
+            240,
+            &gate_report(Some(31.0), false, false),
+            &gate_report(None, true, false),
+        );
+        assert_eq!(
+            facts.patched_secs, None,
+            "the last gate's patched side produced no secs, so the earlier 500 s is gone"
+        );
+        assert!(
+            facts.patched_timed_out_last,
+            "the LAST gate's patched side hit the cap"
+        );
+        assert!(
+            facts.patched_timed_out_any,
+            "the any-attempt flag records the kill"
+        );
+        assert_eq!(facts.effective_cap_secs, Some(240));
+        assert_eq!(facts.original_secs, Some(31.0));
+    }
+
+    // [VANTA-WHY] F3 (PR #4 review) — the last-gate trio (`*_secs`,
+    // `*_timed_out_last`, `effective_cap_secs`) describes the LAST gate only, so a
+    // reader comparing them never pairs one attempt's seconds with another
+    // attempt's kill; `*_timed_out_any` keeps the wider "any attempt" meaning so a
+    // kill is not lost when a later attempt finishes.
+    #[test]
+    fn the_last_gate_fields_describe_the_last_gate_not_an_earlier_attempt() {
+        let mut facts = NativeGateFacts::default();
+        // Attempt 1: the PATCHED side hits the cap (no secs, timed_out), the
+        // original side completes.
+        facts.record(
+            600,
+            &gate_report(Some(33.0), false, false),
+            &gate_report(None, true, false),
+        );
+        assert!(facts.patched_timed_out_last);
+        assert!(facts.patched_timed_out_any);
+        assert_eq!(facts.effective_cap_secs, Some(600));
+
+        // Attempt 2 (the LAST gate): both sides complete and the patched side now
+        // measures a time.
+        facts.record(
+            1200,
+            &gate_report(Some(31.0), false, false),
+            &gate_report(Some(119.0), false, false),
+        );
+        assert!(
+            !facts.patched_timed_out_last,
+            "the LAST gate did not time out"
+        );
+        assert!(
+            facts.patched_timed_out_any,
+            "but an earlier attempt did, and that is not lost"
+        );
+        assert_eq!(
+            facts.patched_secs,
+            Some(119.0),
+            "the seconds are the LAST gate's, not the capped one's"
+        );
+        assert_eq!(facts.original_secs, Some(31.0));
+        assert_eq!(facts.effective_cap_secs, Some(1200));
+    }
+
+    // [VANTA-WHY] v1-m3.1 (§8.5, case b) — an ORIGINAL side KILLED by the clamp
+    // collected nothing because the CLOCK ran out, not because the base tree could
+    // not be graded. That emptiness is normally an infrastructure fault (§8.1 row 1),
+    // but here it must take the SAME deadline exit the attempt top takes
+    // (`NeedsReview` / `budget_exhausted`), never `InfraFailure` — so a
+    // `budget_exhausted` row is not misreported as a machine fault. The line is drawn
+    // on BOTH conditions: the gate was clamped AND the original side was killed.
+    // Anything else stays `InfraFailure`.
+    #[test]
+    fn an_original_side_killed_by_the_clamp_exits_as_budget_exhausted_not_infra_failure() {
+        // The kill makes the gate vacuous (the original side collected nothing) ...
+        let original = clamped_report(&[], false, true);
+        assert!(
+            crate::pipeline::harness::native_gate_vacuous(88_642, &original),
+            "an original side that collected nothing makes the gate vacuous"
+        );
+        // ... but the emptiness is the clock, so the exit is the deadline exit.
+        assert_eq!(
+            native_vacuous_exit(true, original.timed_out),
+            GovernorDecision::NeedsReview
+        );
+        // A clamp that did NOT kill the side (a real collection error inside the
+        // shortened window) and a run under the full cap both stay InfraFailure.
+        assert_eq!(
+            native_vacuous_exit(true, false),
+            GovernorDecision::InfraFailure
+        );
+        assert_eq!(
+            native_vacuous_exit(false, true),
+            GovernorDecision::InfraFailure
+        );
+        assert_eq!(
+            native_vacuous_exit(false, false),
+            GovernorDecision::InfraFailure
+        );
+    }
+
+    // [VANTA-WHY] v1-m3.1 F3 — `native_vacuous_seen` (run.summary's
+    // `native_vacuous`) documents an INFRASTRUCTURE fault, so it is set ONLY on the
+    // `InfraFailure` exit. A gate made vacuous by the deadline clamp takes the
+    // deadline exit (`budget_exhausted`/`NeedsReview`) and records
+    // `native_vacuous=false` plus `native_gate_clamped=true`. Test both.
+    #[test]
+    fn a_vacuous_gate_sets_the_infra_flag_only_on_the_infrastructure_exit() {
+        // The clamp case: 3000 s left under a 7250 s cap IS a clamp, and an
+        // original side killed by it is a DEADLINE event.
+        let gate_cap = native_gate_cap(7250, Some(3000)).expect("time remains, so the gate runs");
+        let gate_clamped = gate_cap < 7250;
+        assert!(gate_clamped, "3000 s left under a 7250 s cap is a clamp");
+        assert_eq!(
+            native_vacuous_exit(gate_clamped, true),
+            GovernorDecision::NeedsReview
+        );
+        assert!(
+            !native_vacuous_is_infrastructure(gate_clamped, true),
+            "a clamp-caused vacuity must NOT set native_vacuous_seen"
+        );
+
+        // The infrastructure cases: a real collection error inside the shortened
+        // window (clamped but the side was not killed) and a run under the full cap
+        // both set the flag.
+        assert!(native_vacuous_is_infrastructure(gate_clamped, false));
+        assert!(native_vacuous_is_infrastructure(false, false));
+        assert!(native_vacuous_is_infrastructure(false, true));
+
+        // And the flag is the exact complement of the exit the gate takes.
+        for gate_clamped in [false, true] {
+            for original_timed_out in [false, true] {
+                assert_eq!(
+                    native_vacuous_is_infrastructure(gate_clamped, original_timed_out),
+                    native_vacuous_exit(gate_clamped, original_timed_out)
+                        != GovernorDecision::NeedsReview,
+                );
+            }
+        }
+    }
+
+    // [VANTA-WHY] Finding C (PR #4 review) — `native_timeout` (run.summary's
+    // `native_timeout`) must name a kill by the CONFIGURED cap, never a kill by the
+    // deadline clamp. The clamped kill is recorded by `native_gate_clamped` instead,
+    // and the row reads `native_timeout=false, native_vacuous=false,
+    // native_gate_clamped=true` — the exact triple the review asked for.
+    #[test]
+    fn a_clamped_kill_records_the_clamp_not_a_native_timeout() {
+        // The clamp case: 3000 s left under a 7250 s cap IS a clamp, and a side
+        // killed by it was killed by the CLOCK, not the configured cap.
+        let gate_cap = native_gate_cap(7250, Some(3000)).expect("time remains, so the gate runs");
+        let gate_clamped = gate_cap < 7250;
+        assert!(gate_clamped, "3000 s left under a 7250 s cap is a clamp");
+        assert!(
+            !native_timeout_flag(true, gate_clamped, true, false),
+            "a clamped kill of the original side must NOT set native_timeout"
+        );
+        assert!(
+            !native_timeout_flag(true, gate_clamped, false, true),
+            "a clamped kill of the patched side must NOT set native_timeout either"
+        );
+
+        // An UNCLAMPED vacuous gate killed by the configured cap DOES set it, on
+        // EITHER side — the flag's one documented meaning.
+        assert!(native_timeout_flag(true, false, true, false));
+        assert!(native_timeout_flag(true, false, false, true));
+        // A vacuous gate that was not killed (a tree that collected nothing) and a
+        // non-vacuous gate never set it; and `native_timeout=true` keeps implying
+        // `native_vacuous=true` for every combination.
+        assert!(!native_timeout_flag(true, false, false, false));
+        assert!(!native_timeout_flag(false, false, true, true));
+        for native_vacuous in [false, true] {
+            for gate_clamped in [false, true] {
+                for original_timed_out in [false, true] {
+                    for patched_timed_out in [false, true] {
+                        let flag = native_timeout_flag(
+                            native_vacuous,
+                            gate_clamped,
+                            original_timed_out,
+                            patched_timed_out,
+                        );
+                        assert!(
+                            !flag || native_vacuous,
+                            "native_timeout must always imply native_vacuous"
+                        );
+                        assert!(
+                            !flag || !gate_clamped,
+                            "a clamped kill must never set native_timeout"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // [VANTA-WHY] v1-m3.1 (§8.1/§8.5, case a) — a PATCHED side KILLED by the clamp
+    // is NOT §8.1 row 1: the ORIGINAL side ran, so the emptiness is the patch's own
+    // cost. It stays in the attempt loop as a FAILED ATTEMPT (the Governor sees every
+    // original nodeid vanish from the patched report — a native regression), never the
+    // vacuous `InfraFailure` branch. The run then continues to the next attempt top,
+    // which sees the passed deadline and takes the existing `NeedsReview`
+    // (`budget_exhausted`) exit — the same path every other deadline expiry takes.
+    #[test]
+    fn a_patched_side_killed_by_the_clamp_is_a_failed_attempt_not_the_vacuous_exit() {
+        let original = clamped_report(&["t/test_x.py::test_a"], true, false);
+        let patched = clamped_report(&[], false, true);
+        // The guard is keyed on the ORIGINAL side ALONE: the original ran, so the gate
+        // is NOT vacuous and the infra branch is never reached.
+        assert!(
+            !crate::pipeline::harness::native_gate_vacuous(1, &original),
+            "a patched-side kill over a running original is not a vacuous gate"
+        );
+        // The patch's emptiness reaches the Governor as a regression — a failed
+        // attempt — because every original nodeid is absent from the patched report.
+        let regressions =
+            crate::pipeline::harness::native_regressions(&original.tests, &patched.tests);
+        assert_eq!(regressions, vec!["t/test_x.py::test_a".to_string()]);
+    }
+
+    // [VANTA-WHY] Finding A (PR #4 review) — a PATCHED side the harness could not
+    // SET UP or transport measured nothing, so `native_regressions` over it would
+    // list every ORIGINAL test as a regression and fail the attempt on a suite Vanta
+    // never ran. The marker (`NativeSuiteReport::setup_failed`) is read BEFORE the
+    // regression list, and the run ends as `InfraFailure` — in BOTH repair and review
+    // modes, since the guard takes no `GovernorMode`.
+    #[test]
+    fn a_setup_failed_patched_side_is_an_infrastructure_fault_not_a_regression() {
+        let original = clamped_report(&["t/test_x.py::test_a"], true, false);
+        let mut patched = clamped_report(&[], false, false);
+        patched.setup_failed = true;
+        let vacuous = crate::pipeline::harness::native_gate_vacuous(1, &original);
+        assert!(!vacuous, "the original ran, so the gate is not vacuous");
+        // The list the driver would otherwise build blames the patch ...
+        assert_eq!(
+            crate::pipeline::harness::native_regressions(&original.tests, &patched.tests),
+            vec!["t/test_x.py::test_a".to_string()],
+            "an unattributed empty patched report names every original test as a regression"
+        );
+        // ... and this is the marker that stops it.
+        assert!(
+            native_setup_failure(original.setup_failed, patched.setup_failed, vacuous),
+            "a patched side the harness never set up is an infrastructure fault, not a failed attempt"
+        );
+        // An ATTRIBUTABLE empty patched side over a running original is unchanged:
+        // the patch's own cost, a failed attempt (row 3 of §8.1).
+        assert!(!native_setup_failure(false, false, false));
+        // An ORIGINAL side that could not be set up is the fault UNCONDITIONALLY —
+        // even under a clamp, its emptiness is not the clock's doing and must not
+        // take the clamp's `budget_exhausted` exit.
+        assert!(native_setup_failure(true, false, true));
+        assert!(native_setup_failure(true, false, false));
+        // But an original that is vacuous WITHOUT a setup failure keeps its own,
+        // more specific reason: an original vacuity already ends the run as
+        // `InfraFailure` through the vacuity branch.
+        assert!(!native_setup_failure(false, true, true));
+    }
+
+    // [VANTA-WHY] Finding A (PR #4 review) — the guard is worth nothing if it does
+    // not run in the shared attempt loop, and it must run BEFORE the regression list
+    // is built (and before the timeout flag), so a setup failure never counts as a
+    // candidate regression. The judge's own suite takes the same exit. Pin both call
+    // sites.
+    #[test]
+    fn the_setup_failure_guard_runs_before_native_regressions_in_the_shared_loop() {
+        let source = include_str!("driver.rs");
+        let guard = source
+            .find("if native_setup_failure(")
+            .expect("the shared loop must take the setup-failure guard");
+        let regressions = source
+            .find("let mut native_regressions =")
+            .expect("the native gate must build its regression list");
+        assert!(
+            guard < regressions,
+            "the setup-failure guard must run BEFORE `native_regressions`, or a machine \
+             fault is counted as a candidate regression"
+        );
+        assert!(
+            source.contains("if report.setup_failed {"),
+            "the judge's native suite must take the same setup-failure exit"
+        );
+    }
+
+    // [VANTA-WHY] v1-m3.1 (§8.5, case a) — an empty patched report over a large
+    // suite must not blow the next Creator prompt. Every nodeid the original passed
+    // is a regression when the patched side collected NOTHING, so on a suite this
+    // size the unbounded list could not fit any window and the run would end as an
+    // `InfraFailure` instead of retrying. Bounded, the feedback stays tiny, carries
+    // the patched-side stderr tail (the ONLY diagnostic an empty report has, since
+    // absent nodeids carry no failure output), and names the true total.
+    #[test]
+    fn an_empty_patched_report_over_a_large_suite_stays_under_the_prompt_budget_and_carries_the_stderr_tail(
+    ) {
+        // The regression list a caller builds: the whole suite, in report order.
+        let mut regressions: Vec<String> = (0..88_642)
+            .map(|i| format!("pandas/tests/io/test_{:04}.py::test_case_{}", i % 2_000, i))
+            .collect();
+        // Deliberately shuffled, so the test proves the >limit branch SORTS rather
+        // than reprinting whatever order the report parser emitted.
+        regressions.reverse();
+
+        let mut patched = clamped_report(&[], false, false);
+        patched.stderr_tail =
+            "collector: ImportError: cannot import name 'numpy_helper' | native report collected 0 tests"
+                .to_string();
+
+        let fb = build_creator_feedback(&[], false, false, &regressions, &patched, &[], &[], &[]);
+
+        // (1) Under the prompt budget. Priced exactly as the call site prices it —
+        // the file-selection budget, the frame, and the fixed output/overhead
+        // reserves — the whole prompt still fits the configured 262144-token window.
+        let prompt = 163_584 + crate::context::estimate_tokens(fb.len()) + 3_000;
+        assert!(
+            prompt_over_budget_reason(prompt, crate::context::OUTPUT_RESERVE_TOKENS, 262_144)
+                .is_none(),
+            "bounded feedback must fit the window; feedback was {} bytes ({prompt} est. tokens)",
+            fb.len()
+        );
+        // (2) Carries the patched-side stderr tail, the only cause an empty report has.
+        assert!(
+            fb.contains("cannot import name 'numpy_helper'"),
+            "the patched suite's stderr tail must be in the feedback:\n{fb}"
+        );
+        // (3) Bounded to the sample and naming the true total plus the remainder.
+        let shown = fb.matches("\n  - pandas/tests/io/").count();
+        assert_eq!(
+            shown, REGRESSION_FEEDBACK_SAMPLE,
+            "only the bounded sample is named; got {shown}"
+        );
+        assert!(fb.contains("88642 tests regressed"), "{fb}");
+        assert!(fb.contains("more in the evidence artifact"), "{fb}");
+        // The sample is the FIRST 20 nodeids, sorted — not the reversed report order.
+        let mut sorted: Vec<&String> = regressions.iter().collect();
+        sorted.sort();
+        assert!(
+            fb.contains(&format!("  - {}\n", sorted[0])),
+            "the sample must be sorted; expected {} first:\n{fb}",
+            sorted[0]
+        );
+        assert!(
+            !fb.contains(&format!("  - {}\n", regressions[0])),
+            "the unsorted report order must not decide the sample"
+        );
+    }
+
+    // [VANTA-WHY] Finding D (PR #4 review) — in the bounded sample a nodeid the
+    // patched report RECORDED a failure for must be named before the absent ones. A
+    // partially running patched suite can have thousands of absent nodeids that sort
+    // before its one real assertion failure; taking the plain first 20 gives the
+    // Creator neither the failure nor (if it did collect) the collapsed-suite stderr.
+    #[test]
+    fn a_lone_failing_nodeid_sorted_late_is_kept_in_the_bounded_sample() {
+        // 60 regressions — above REGRESSION_FEEDBACK_LIMIT — of which all but one are
+        // simply ABSENT from the patched report.
+        let regressions: Vec<String> = (0..60)
+            .map(|i| format!("pkg/test_{:03}.py::test_{:03}", i, i))
+            .collect();
+        let mut sorted: Vec<&String> = regressions.iter().collect();
+        sorted.sort();
+        let failing: String = sorted.last().expect("60 regressions").to_string();
+        // The one nodeid that actually failed sorts LAST, so the plain first-20 sample
+        // would drop it entirely.
+        assert!(
+            !sorted
+                .iter()
+                .take(REGRESSION_FEEDBACK_SAMPLE)
+                .any(|nodeid| **nodeid == failing),
+            "sanity: the failing nodeid is outside the naive first-20 sample"
+        );
+
+        let mut patched = clamped_report(&[], true, false);
+        patched
+            .failure_outputs
+            .insert(failing.clone(), "AssertionError: boom".to_string());
+
+        let fb = build_creator_feedback(&[], false, false, &regressions, &patched, &[], &[], &[]);
+
+        // Still bounded to the sample size.
+        let shown = fb.matches("\n  - pkg/test_").count();
+        assert_eq!(
+            shown, REGRESSION_FEEDBACK_SAMPLE,
+            "the sample stays bounded; got {shown}"
+        );
+        // The recorded failure is kept, output and all, even though it sorted last.
+        assert!(
+            fb.contains(&format!("  - {failing}\n")),
+            "the lone failing nodeid must survive the bounded sample:\n{fb}"
+        );
+        assert!(
+            fb.contains("    failure: AssertionError: boom\n"),
+            "its failure output must ride along:\n{fb}"
+        );
+        // The remaining slots are filled with the absent nodeids, in sorted order.
+        assert!(
+            fb.contains(&format!("  - {}\n", sorted[0])),
+            "the absent nodeids still fill the rest of the sample:\n{fb}"
+        );
+    }
+
+    // [VANTA-WHY] v1-m3.1 (§8.5) — at or below the limit the feedback is
+    // BYTE-IDENTICAL to the unbounded message the code produced before the bound
+    // existed: every nodeid in the report's own order, with its failure output, and
+    // NO stderr-tail line (the patched side ran, so it is not the empty case). The
+    // bound changes only what a huge list looks like; it must change nothing else.
+    #[test]
+    fn a_regression_list_at_the_limit_is_byte_identical_to_the_unbounded_feedback() {
+        let regressions: Vec<String> = (0..10).map(|i| format!("t/test_{i}.py::test_{i}")).collect();
+        let names: Vec<&str> = regressions.iter().map(String::as_str).collect();
+        let mut patched = clamped_report(&names, true, false);
+        patched.failure_outputs.insert(
+            "t/test_3.py::test_3".to_string(),
+            "AssertionError: boom".to_string(),
+        );
+
+        let fb = build_creator_feedback(&[], false, false, &regressions, &patched, &[], &[], &[]);
+
+        let mut expected = String::from("The previous patch failed verification:\n\n");
+        expected
+            .push_str("- The repository's own tests regressed (run with the ORIGINAL test files):\n");
+        for i in 0..10 {
+            expected.push_str(&format!("  - t/test_{i}.py::test_{i}\n"));
+            if i == 3 {
+                expected.push_str("    failure: AssertionError: boom\n");
+            }
+        }
+        expected.push_str(
+            "\nPlease revise the patch to fix these failures while preserving existing behavior.",
+        );
+        assert_eq!(fb, expected, "the small-list message must be unchanged");
     }
 
     // [VANTA-WHY] M3 item 1 — the grounding ledger separates "the audit ran and

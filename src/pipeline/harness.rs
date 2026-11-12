@@ -282,6 +282,16 @@ pub struct NativeSuiteReport {
     /// the operator to the wrong file. Recorded here so `native_vacuous_reason`
     /// can name it as its own reason (`native_timeout`).
     pub timed_out: bool,
+    /// How long the suite took in-session (wall clock seconds), or `None` when
+    /// the run never produced a wall time.
+    ///
+    /// [VANTA-WHY] v1-m3.1 (§4) — the row needs the PER-SIDE in-session wall time,
+    /// not just the cap, so the §8.1 truth table and the cap it ran under are
+    /// auditable from the artifact. `ExecutionResult.wall_time_ms` is the only
+    /// in-session wall-time source, so the value is taken there and carried on the
+    /// report (which rides the suite cache), not re-derived by a reader afterwards.
+    /// `None` on `not_run` (no backend) and on every hand-built test report.
+    pub secs: Option<f64>,
     /// The test command's exit status, when it ran at all.
     pub exit_code: Option<i32>,
     /// The last few non-empty stderr lines, for a run-failure report.
@@ -301,6 +311,21 @@ pub struct NativeSuiteReport {
     /// `native_suite.summary` can record it for BOTH sides of the gate — a
     /// value with spaces in a summary is already the norm (`judge_reason=`).
     pub collection: Option<CollectionFailure>,
+    /// Did the harness fail to obtain an ATTRIBUTABLE measurement of the tree —
+    /// no exit status observed and the cap never hit?
+    ///
+    /// [VANTA-WHY] Finding A (PR #4 review). A patched side that collected
+    /// nothing is the PATCH's doing ONLY when the suite command actually ran and
+    /// exited (`exit_code` is `Some` — a collection or import error, pytest exit
+    /// 2/4/5) OR it hit the cap (`timed_out`). When NEITHER holds the harness
+    /// never got a verdict out of the command — the backend could not spawn, the
+    /// tree or the exit plugin could not be written, the `execute` call errored,
+    /// or the process died without an exit status — so the emptiness is an
+    /// INFRASTRUCTURE fact. `native_regressions` over it would blame the
+    /// candidate for a suite it never ran. Recorded on the report (it rides the
+    /// suite cache) so the driver can read the marker BEFORE computing
+    /// regressions, instead of inferring it from an absent exit code.
+    pub setup_failed: bool,
 }
 
 /// A report's census of its own collectors, and its FIRST collection failure.
@@ -376,17 +401,22 @@ impl CollectionFailure {
 }
 
 impl NativeSuiteReport {
-    /// The suite never started: the backend could not spawn, or the source tree
-    /// could not be written into the sandbox.
+    /// The suite never started: the backend could not spawn, the source tree or
+    /// the exit plugin could not be written into the sandbox, or the `execute`
+    /// call itself errored. Every one of those is a SETUP/TRANSPORT failure, so
+    /// `setup_failed` is set — see the field's note for why the driver must read
+    /// it before blaming the patch.
     fn not_run() -> Self {
         Self {
             tests: Vec::new(),
             failure_outputs: HashMap::new(),
             ran: false,
             timed_out: false,
+            secs: None,
             exit_code: None,
             stderr_tail: String::new(),
             collection: None,
+            setup_failed: true,
         }
     }
 
@@ -398,15 +428,22 @@ impl NativeSuiteReport {
     /// [VANTA-WHY] M3 item D1 — a TIMEOUT is split out into
     /// :func:`timed_out_run` rather than folded in here: it is the one failed run
     /// whose cause is the harness's own cap, so it gets its own reason.
+    ///
+    /// [VANTA-WHY] Finding A (PR #4 review) — a run with NO exit code at all (the
+    /// process died without a status and the cap did not mark a timeout) produced
+    /// no attributable verdict, so it takes the same `setup_failed` marker as
+    /// :func:`not_run`.
     fn failed_run(exit_code: Option<i32>, stderr_tail: String) -> Self {
         Self {
             tests: Vec::new(),
             failure_outputs: HashMap::new(),
             ran: false,
             timed_out: false,
+            secs: None,
             exit_code,
             stderr_tail,
             collection: None,
+            setup_failed: exit_code.is_none(),
         }
     }
 
@@ -424,9 +461,11 @@ impl NativeSuiteReport {
             failure_outputs: HashMap::new(),
             ran: false,
             timed_out: true,
+            secs: None,
             exit_code,
             stderr_tail,
             collection: None,
+            setup_failed: false,
         }
     }
 
@@ -672,18 +711,30 @@ fn report_is_measured(report: &NativeSuiteReport) -> bool {
 /// Parse a pytest JSON report into per-test outcomes.
 fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuiteReport {
     let tail = stderr_tail(&exec.stderr);
+    // [VANTA-WHY] v1-m3.1 (§4) — the one in-session wall time available, kept on
+    // every outcome (killed, failed, measured) so the row can carry the per-side
+    // seconds the §8.1 rule is read against. `parse_native_report` is the only
+    // place `exec` is in scope, so the helpers above hand back `secs: None` and it
+    // is set here.
+    let secs = Some(exec.wall_time_ms as f64 / 1000.0);
     if exec.timed_out {
         // [VANTA-WHY] M3 item D1 — a killed run is `timed_out_run`, not
         // `failed_run`: its emptiness is the cap's fault, and `native_vacuous_reason`
         // reports it as `native_timeout` with the cap named instead of a bare
         // "collected nothing".
-        return NativeSuiteReport::timed_out_run(exec.exit_code, tail);
+        let mut report = NativeSuiteReport::timed_out_run(exec.exit_code, tail);
+        report.secs = secs;
+        return report;
     }
     let Ok(text) = fs::read_to_string(report_path) else {
-        return NativeSuiteReport::failed_run(exec.exit_code, tail);
+        let mut report = NativeSuiteReport::failed_run(exec.exit_code, tail);
+        report.secs = secs;
+        return report;
     };
     let Ok(report) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return NativeSuiteReport::failed_run(exec.exit_code, tail);
+        let mut report = NativeSuiteReport::failed_run(exec.exit_code, tail);
+        report.secs = secs;
+        return report;
     };
     let mut tests = Vec::new();
     let mut failure_outputs: HashMap<String, String> = HashMap::new();
@@ -692,7 +743,9 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
     // neither shape is a FAILED run: `ran: true` with zero tests is the reading
     // that made a 0.2-pinned bug look like a tree with no tests.
     let Ok(entries) = report_tests(&report) else {
-        return NativeSuiteReport::failed_run(exec.exit_code, tail);
+        let mut report = NativeSuiteReport::failed_run(exec.exit_code, tail);
+        report.secs = secs;
+        return report;
     };
     for t in entries {
         let nodeid = t["nodeid"].as_str().unwrap_or_default().to_string();
@@ -743,6 +796,7 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
         // `native_suite.summary` can name the offending module for BOTH sides of
         // the gate, not only for the side whose note made it into the reason.
         failed.collection = CollectionFailure::of(&report);
+        failed.secs = secs;
         return failed;
     }
     NativeSuiteReport {
@@ -750,9 +804,11 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
         failure_outputs,
         ran: true,
         timed_out: false,
+        secs,
         exit_code: exec.exit_code,
         stderr_tail: tail,
         collection: CollectionFailure::of(&report),
+        setup_failed: false,
     }
 }
 
@@ -941,8 +997,8 @@ pub fn native_suite_collapsed(
     original.ran && !original.tests.is_empty() && patched.tests.len() < original.tests.len()
 }
 
-/// Is this attempt's native gate VACUOUS — did either side measure nothing,
-/// for a bug whose own preparation recorded that it has tests?
+/// Is this attempt's native gate VACUOUS — did the ORIGINAL side measure
+/// nothing, for a bug whose own preparation recorded that it has tests?
 ///
 /// [VANTA-WHY] M3 item W. `native_regressions` over an empty original list is
 /// VACUOUSLY empty, and `native_suite_collapsed` requires a non-empty original,
@@ -951,33 +1007,43 @@ pub fn native_suite_collapsed(
 /// row's own `prepare` recorded for this bug (``pass_to_pass_count`` plus the
 /// native-failure baseline, the same figure `prepare_summary.md` prints); when
 /// it is zero the bug genuinely ships no native tests and the gate is
-/// legitimately silent, so the guard does not fire. When it is positive and the
-/// in-session suite collected nothing, the check COULD NOT BE DONE — an
-/// infrastructure fact, never a pass.
-pub fn native_gate_vacuous(
-    expected_tests: usize,
-    original: &NativeSuiteReport,
-    patched: &NativeSuiteReport,
-) -> bool {
-    expected_tests > 0 && (original.collected_nothing() || patched.collected_nothing())
+/// legitimately silent, so the guard does not fire.
+///
+/// [VANTA-WHY] v1-m3.1 (§8.1) — the guard is keyed on the ORIGINAL side ALONE.
+/// The original side running is what makes the patched side's emptiness
+/// attributable to the PATCH; the original side collecting nothing means the BASE
+/// tree cannot be graded at all, which is an infrastructure fact whatever the
+/// patched side did (a cap kill, or a collection error — "both sides empty" is
+/// the same row). A patched side that collected nothing while the ORIGINAL side
+/// ran is the patch's OWN failure — a collection error, or a cap kill — and it
+/// already reaches the Governor as a rejection on its own: every original test is
+/// then absent from the patched report, so `native_regressions` names it (and
+/// `native_suite_collapsed` fires when the originals were not all passing). It is
+/// deliberately NOT read as vacuous here: that ended the run as `InfraFailure`
+/// and dropped the bug out of the attempt loop (an in-batch session, whose
+/// patch alone broke collection while the original ran its full suite).
+pub fn native_gate_vacuous(expected_tests: usize, original: &NativeSuiteReport) -> bool {
+    expected_tests > 0 && original.collected_nothing()
 }
 
-/// The recorded reason a native gate is vacuous, naming the side and the cause.
+/// The recorded reason a native gate is vacuous, naming the cause.
 ///
 /// [VANTA-WHY] M3 item W. The reader acts on the reason, not the boolean: "the
-/// original side never ran", "the patch side collected nothing" and "neither
-/// side produced a usable report" need different responses, and the exit code
-/// and the stderr tail of the empty side are what tell them apart.
+/// original side never ran", "the original side hit the cap" and "the original
+/// side collected nothing" need different responses, and the exit code and the
+/// stderr tail of the empty side are what tell them apart.
 ///
-/// [VANTA-WHY] M3 item D1 — a side killed by the wall-clock cap gets its OWN
-/// reason, ``native_timeout``, rather than the generic "collected nothing". The
-/// two emptinesses point at opposite fixes: a collection error is the tree's own
-/// import failing (pandas/1's xarray `TypeError`, fixed by the version pin),
-/// while a timeout is the harness's cap being too small for a legitimate suite
-/// (pandas/1's ~487 s native run under a 120 s in-session cap). `cap_secs` is the
-/// cap the run actually used, so the reason states the number the operator must
-/// raise. The guard is unchanged in force: either reason still ends the run as
-/// `InfraFailure`, and neither can ever count as zero regressions.
+/// [VANTA-WHY] M3 item D1 / v1-m3.1 (§8.5) — a side killed by the wall-clock cap
+/// gets its OWN reason, ``native_timeout``, naming the cap. But the "raise the
+/// derived cap" advice D1 put here is gone: it is only reachable when the gate is
+/// vacuous, i.e. when the ORIGINAL side collected nothing (§8.1 row 1), and under
+/// v1-m3.1 the shared cap is ``10 ×`` the bug's own prepare measurement (never
+/// below 1200 s). An original side that cannot finish inside 10× the time prepare
+/// measured for the SAME tree is this run failing to reproduce its own
+/// measurement — an environment fault, not a cap to tune — while a patched side
+/// that cannot is the patch's cost: a failed attempt, never this reason at all.
+/// The guard is otherwise unchanged in force: this reason still ends the run as
+/// `InfraFailure`, and it can never count as zero regressions.
 pub fn native_vacuous_reason(
     expected_tests: usize,
     cap_secs: u64,
@@ -1002,25 +1068,73 @@ pub fn native_vacuous_reason(
         side("original", original),
         side("patched", patched),
     );
-    if original.timed_out || patched.timed_out {
-        let which = match (original.timed_out, patched.timed_out) {
-            (true, true) => "both sides",
-            (true, false) => "the original side",
-            _ => "the patch side",
-        };
+    // [VANTA-WHY] v1-m3.1 F6 — the CAUSE of an original-side vacuity comes from the
+    // ORIGINAL side alone: a kill when `original.timed_out`, otherwise a collection
+    // error. A PATCHED-side timeout is never the cause — the patched side's kill is
+    // the patch's own cost (a failed attempt) — so it is reported SEPARATELY, and
+    // cannot be mistaken for why the gate is vacuous.
+    let patched_note = if patched.timed_out {
+        format!(
+            " Separately: the PATCHED side hit the run's {cap_secs}s wall-clock cap and was killed \
+             (patched timed_out=true) — that is the patch's own cost, not the cause of this vacuity."
+        )
+    } else {
+        String::new()
+    };
+    if original.timed_out {
         return format!(
             "native_timeout=true expected_tests={expected_tests} native_timeout_secs={cap_secs} — \
-             {which} of the in-session native suite hit the run's {cap_secs}s wall-clock cap and was \
-             killed, so the native gate could not run and is NOT evidence of zero regressions. This is \
-             the cap being too small for this bug's suite, not the suite collecting nothing: raise the \
-             derived cap (prepare's measured native time × 3) rather than reading the emptiness as a \
-             tree with no tests. {sides}",
+             the original side of the in-session native suite hit the run's {cap_secs}s wall-clock cap \
+             and was killed, so the native gate could not run and is NOT evidence of zero regressions. \
+             Under v1-m3.1 the cap is 10× the bug's own prepare measurement (never below 1200 s), so a \
+             kill is not a cap to raise: an ORIGINAL side that cannot finish in it is this run failing \
+             to reproduce its own prepare measurement — an environment fault. {sides}{patched_note}",
         );
     }
     format!(
         "native_vacuous=true expected_tests={expected_tests} — the row's own prepare recorded \
-         {expected_tests} native test(s) for this bug, but the in-session suite collected nothing, \
-         so the native gate could not run and is NOT evidence of zero regressions: {sides}",
+         {expected_tests} native test(s) for this bug, but the ORIGINAL side of the in-session suite \
+         collected nothing, so the base tree could not be graded and the native gate could not run; \
+         this is NOT evidence of zero regressions: {sides}{patched_note}",
+    )
+}
+
+/// The reason a native gate ended as an infrastructure fault because a side could
+/// not be SET UP or transported (Finding A, PR #4 review).
+///
+/// [VANTA-WHY] An empty side is patch-attributable ONLY when the suite command ran
+/// and exited (`exit_code` is `Some` — a collection or import error, pytest exit
+/// 2/4/5) or hit the cap (`timed_out`). When neither holds the harness never
+/// measured the tree — the backend could not spawn, the tree or the exit plugin
+/// could not be written, `execute` errored, or the process died without a status —
+/// so `native_regressions` over it would blame the candidate for a suite Vanta
+/// never ran. This reason names both sides' states so the `infra_failure` row
+/// explains itself.
+pub fn native_setup_failure_reason(
+    original: &NativeSuiteReport,
+    patched: &NativeSuiteReport,
+) -> String {
+    let side = |label: &str, report: &NativeSuiteReport| -> String {
+        format!(
+            "{label}={}{} (tests={} exit_code={} stderr={:?})",
+            if report.ran { "ran" } else { "not_run" },
+            if report.timed_out { " timed_out" } else { "" },
+            report.tests.len(),
+            report
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unset".to_string()),
+            report.stderr_tail,
+        )
+    };
+    let which = if original.setup_failed { "original" } else { "patched" };
+    format!(
+        "native_setup_failed=true — the {which} side of the in-session native suite could not be \
+         SET UP or transported (no exit status was observed and the run's cap was not hit), so it \
+         measured nothing about the tree; this is an INFRASTRUCTURE fault, never a native \
+         regression against the candidate: {} {}",
+        side("original", original),
+        side("patched", patched),
     )
 }
 
@@ -2454,6 +2568,42 @@ pub fn test_timeout_secs() -> u64 {
         .unwrap_or(120)
 }
 
+/// The in-session native GATE's cap floor, in seconds — v1-m3.1, the Rust mirror of
+/// `scripts/bugsinpy/suite.py`'s `NATIVE_SESSION_TIMEOUT_FLOOR_SECS`.
+///
+/// [VANTA-WHY] The gate's two sides (original vs patched) run one repo suite under ONE
+/// cap, and that cap must absorb the patch's own cost as well as machine load. M3 item
+/// D1's rule (`max(120, 3 × prepare's measurement)`) did not: a dev probe measured a
+/// one-file `luigi/scheduler.py` patch at ~3.6× the unpatched suite on an idle
+/// machine (119/116 s vs 33/31 s), so the derived 120 s sat below the patched suite's
+/// own cost and the run's load pushed it past the kill. The floor is therefore 1200 s,
+/// and the harness's multiplier above it is 10× (`native_session_timeout_secs`).
+///
+/// [VANTA-WHY] v1-m3.1 follow-up 7 — the floor was 600 s and is now 1200 s: 600 is only
+/// twice that probe's patched side's idle cost, so under the batch's own load a
+/// legitimate patch there can still be killed, which is the failure the floor exists to
+/// prevent.
+///
+/// The Python side derives the cap and passes it as `--native-timeout-secs`; this
+/// constant is what this binary then refuses to go BELOW, so the two sides of the
+/// process boundary cannot disagree about the floor. The multiplier itself has no Rust
+/// mirror: nothing here multiplies a measured native run — the measurement lives in
+/// prepare, on the Python side, and arrives as an already-derived number.
+pub const NATIVE_SESSION_TIMEOUT_FLOOR_SECS: u64 = 1200;
+
+/// The floor [`resolve_native_timeout_secs`](crate::pipeline::driver::resolve_native_timeout_secs)
+/// enforces: the new floor, or the environment's own cap when that is larger.
+///
+/// [VANTA-WHY] M3 item F4's reasoning at the new floor, on the Rust side. A host that
+/// runs `VANTA_TEST_TIMEOUT_SECS=1800` raises `test_timeout_secs()` above 1200, and the
+/// harness builds its `--native-timeout-secs` from THAT number; a bare 1200 floor here
+/// would then refuse the flag the harness sent for a bug whose suite is unmeasured and
+/// end the job `infra_failure` with no `run.summary`. Taking the larger of the two is
+/// what keeps the two readings of one number in agreement.
+pub fn native_session_timeout_floor() -> u64 {
+    NATIVE_SESSION_TIMEOUT_FLOOR_SECS.max(test_timeout_secs())
+}
+
 /// Timeout for PATCHED-side execution. Tests may lower only this cap so the
 /// real timeout path is exercised without making BATE's baseline load-sensitive.
 pub fn patched_test_timeout_secs() -> u64 {
@@ -2613,6 +2763,7 @@ mod tests {
         copy_static_configs, copy_tree_excluding, empty_report_note, interpreter_for,
         is_native_test_path, is_tooling_package, native_collection_summary, native_gate_vacuous,
         native_outcome, native_regressions, native_results_index, native_suite_collapsed,
+        native_setup_failure_reason,
         native_suite_command,
         native_tree_with_original_tests,
         native_vacuous_reason, new_diagnostics, parse_mypy_line, parse_native_report,
@@ -2936,9 +3087,11 @@ mod tests {
             failure_outputs: HashMap::new(),
             ran: true,
             timed_out: false,
+            secs: None,
             exit_code: Some(0),
             stderr_tail: String::new(),
             collection: None,
+            setup_failed: false,
         }
     }
 
@@ -3437,86 +3590,90 @@ mod tests {
             failure_outputs: HashMap::new(),
             ran,
             timed_out: false,
+            secs: None,
             exit_code,
             stderr_tail: String::new(),
             collection: None,
+            setup_failed: false,
         }
     }
 
-    /// The guard: with a POSITIVE expected count, either side measuring nothing
-    /// makes the gate vacuous; with zero the bug genuinely has no native tests
-    /// and the gate is legitimately silent.
+    /// The guard: with a POSITIVE expected count, the ORIGINAL side measuring
+    /// nothing makes the gate vacuous; with zero the bug genuinely has no native
+    /// tests and the gate is legitimately silent.
     ///
     /// [VANTA-WHY] `native_regressions` over an empty original is vacuously empty
     /// and `native_suite_collapsed` requires a non-empty original, so `(0, 0)`
-    /// cleared both holes and read as "0 regressions" (pandas/1 c9289597). This
-    /// is the only thing that tells "no tests to check" apart from "the suite
-    /// could not run".
+    /// cleared both holes and read as "0 regressions" (pandas/1 c9289597). This is
+    /// the only thing that tells "no tests to check" apart from "the suite could
+    /// not run".
+    ///
+    /// [VANTA-WHY] v1-m3.1 (§8.1) — the key is the ORIGINAL side. A PATCHED side
+    /// that collected nothing while the original ran is the patch's own failure,
+    /// which `native_regressions` already turns into a rejection, so
+    /// it is NOT vacuous.
     #[test]
-    fn native_gate_vacuous_fires_only_when_prepare_measured_tests() {
+    fn native_gate_vacuous_fires_only_when_the_original_side_collected_nothing() {
         let full = vacuity_report(&["a", "b"], true, Some(1));
         let empty = vacuity_report(&[], true, Some(5));
         let not_run = vacuity_report(&[], false, None);
 
         assert!(
-            native_gate_vacuous(88642, &full, &empty),
-            "a patch side that collected nothing must not read as 0 regressions"
+            !native_gate_vacuous(88642, &full),
+            "an original that measured is a real gate — a patched side that collected nothing \
+             while it ran is a patch failure (every original test is then a regression), not a \
+             vacuous gate"
         );
         assert!(
-            native_gate_vacuous(88642, &empty, &full),
-            "an original side that collected nothing is just as vacuous"
+            native_gate_vacuous(88642, &empty),
+            "an original side that collected nothing cannot be graded at all"
         );
         assert!(
-            native_gate_vacuous(88642, &not_run, &not_run),
-            "neither side running is the worst case, not a clean gate"
+            native_gate_vacuous(88642, &not_run),
+            "an original that never ran is the worst case, not a clean gate"
         );
         assert!(
-            native_gate_vacuous(88642, &empty, &empty),
-            "0 vs 0 is exactly the false accept the guard exists for"
-        );
-        assert!(
-            !native_gate_vacuous(88642, &full, &full),
-            "both sides measured: this is a real gate, not a vacuous one"
-        );
-        assert!(
-            !native_gate_vacuous(0, &empty, &empty),
+            !native_gate_vacuous(0, &empty),
             "a bug with no native tests must not be forced into infra_failure"
         );
         assert!(
-            !native_gate_vacuous(0, &not_run, &not_run),
+            !native_gate_vacuous(0, &not_run),
             "a hand-run binary records no count and keeps the old reading"
         );
     }
 
-    /// The reason names the failing side and its exit code, so the reader can
-    /// tell "the original never ran" from "the patch collected nothing".
+    /// The reason names BOTH sides and their exit codes, so the reader can tell
+    /// "the original never ran" from "the original collected nothing",
+    /// and it carries WHICH module broke collection.
     ///
-    /// [VANTA-WHY] M3 item W follow-up — the reason also has to carry WHICH
-    /// module broke collection. `empty_report_note` renders the collector census
-    /// into the report's `stderr_tail`, and the reason prints that tail, so the
-    /// module name reaches the operator here (and, tokenised, in
+    /// [VANTA-WHY] M3 item W follow-up — `empty_report_note` renders the collector
+    /// census into the report's `stderr_tail`, and the reason prints that tail, so
+    /// the module name reaches the operator here (and, tokenised, in
     /// `native_suite.summary`) instead of forcing a second sandbox boot.
+    ///
+    /// [VANTA-WHY] v1-m3.1 (§8.5) — the reason is only produced when the ORIGINAL
+    /// side collected nothing (§8.1 row 1), so the EMPTY side is the original here.
     #[test]
-    fn native_vacuous_reason_names_the_side_and_its_exit_code() {
-        let full = vacuity_report(&["a", "b"], true, Some(0));
-        let mut empty = vacuity_report(&[], true, Some(5));
-        empty.stderr_tail = "shuru: booting VM | native report collected 0 tests (report \
+    fn native_vacuous_reason_names_both_sides_and_the_broken_collector() {
+        let patched = vacuity_report(&["a", "b"], true, Some(0));
+        let mut original = vacuity_report(&[], true, Some(5));
+        original.stderr_tail = "shuru: booting VM | native report collected 0 tests (report \
              exitcode=2 summary.collected=88592 collectors=2620 failed_collectors=1 \
              first_failed_collector=pandas/tests/io/test_x.py \
              first_collector_error=ImportError while importing test module)"
             .to_string();
 
-        let reason = native_vacuous_reason(88642, 120, &full, &empty);
+        let reason = native_vacuous_reason(88642, 600, &original, &patched);
 
         assert!(reason.contains("native_vacuous=true"), "{reason}");
         assert!(reason.contains("expected_tests=88642"), "{reason}");
         assert!(
-            reason.contains("original=ran (tests=2 exit_code=0"),
-            "the measuring side must be reported too: {reason}"
+            reason.contains("original=ran (tests=0 exit_code=5"),
+            "the empty side and its exit code must be named: {reason}"
         );
         assert!(
-            reason.contains("patched=ran (tests=0 exit_code=5"),
-            "the empty side and its exit code must be named: {reason}"
+            reason.contains("patched=ran (tests=2 exit_code=0"),
+            "the measuring side must be reported too: {reason}"
         );
         assert!(
             reason.contains("failed_collectors=1")
@@ -3563,19 +3720,21 @@ mod tests {
         );
     }
 
-    /// [VANTA-WHY] M3 item D1 — a vacuous gate caused by a KILLED side reports
-    /// `native_timeout` with the cap named, not `native_vacuous`. The two send the
-    /// operator to opposite places — the cap (a harness fact) vs the tree (an
-    /// import error) — and the guard's force is unchanged either way: a killed
-    /// side is still vacuous and still ends the run as `InfraFailure`.
+    /// [VANTA-WHY] M3 item D1 / v1-m3.1 (§8.5) — a vacuous gate caused by a KILLED
+    /// side reports `native_timeout` with the cap named, not the generic
+    /// `native_vacuous`. The reason names the cap but no longer advises raising it:
+    /// under v1-m3.1 the cap is 10× prepare's own measurement (§8.3), so an
+    /// original side that cannot finish in it is an environment fault, not a cap to
+    /// tune. The guard's force is unchanged: an empty original is still vacuous and
+    /// still ends the run as `InfraFailure`.
     #[test]
     fn native_vacuous_reason_names_a_timeout_as_its_own_reason() {
-        let full = vacuity_report(&["a", "b"], true, Some(1));
         let mut killed = vacuity_report(&[], false, None);
         killed.timed_out = true;
-        killed.stderr_tail = "shuru exec TIMEOUT after 120s".to_string();
+        killed.stderr_tail = "shuru exec TIMEOUT after 600s".to_string();
+        let patched = vacuity_report(&["a", "b"], true, Some(1));
 
-        let reason = native_vacuous_reason(88642, 1461, &full, &killed);
+        let reason = native_vacuous_reason(88642, 600, &killed, &patched);
 
         assert!(reason.contains("native_timeout=true"), "{reason}");
         assert!(
@@ -3583,17 +3742,204 @@ mod tests {
             "a timeout is its own reason, not the generic one: {reason}"
         );
         assert!(
-            reason.contains("native_timeout_secs=1461"),
+            reason.contains("native_timeout_secs=600"),
             "the cap the run used must be named: {reason}"
         );
-        assert!(reason.contains("the patch side"), "{reason}");
+        assert!(reason.contains("the original side"), "{reason}");
         assert!(
-            reason.contains("patched=not_run timed_out (tests=0 exit_code=unset"),
+            !reason.contains("raise the derived cap"),
+            "v1-m3.1's cap is 10× prepare's own measurement, not a value to raise: {reason}"
+        );
+        assert!(
+            reason.contains("original=not_run timed_out (tests=0 exit_code=unset"),
             "the killed side and its state must be reported: {reason}"
         );
         assert!(
-            native_gate_vacuous(88642, &full, &killed),
-            "the guard's force is unchanged: a killed side is still vacuous"
+            native_gate_vacuous(88642, &killed),
+            "the guard's force is unchanged: an empty original is still vacuous"
+        );
+    }
+
+    /// [VANTA-WHY] v1-m3.1 F6 — the CAUSE is taken from the ORIGINAL side ALONE.
+    /// Here the original RAN and failed to collect (a collection error) while the
+    /// PATCHED side was killed by the cap. The old code asked
+    /// `original.timed_out || patched.timed_out`, so a patched-side kill alone
+    /// produced the `native_timeout` reason naming a cap the ORIGINAL side never
+    /// hit — pointing the operator at the wrong file. The cause here is the
+    /// original's collection error (`native_vacuous`), and the patched kill is
+    /// reported SEPARATELY as the patch's own cost.
+    #[test]
+    fn native_vacuous_reason_blames_the_original_side_not_a_patched_timeout() {
+        let mut original = vacuity_report(&[], true, Some(2));
+        original.stderr_tail = "native report collected 0 tests (report exitcode=2 \
+             failed_collectors=1 first_failed_collector=pandas/tests/io/test_x.py)"
+            .to_string();
+        let mut patched = vacuity_report(&[], false, None);
+        patched.timed_out = true;
+        patched.stderr_tail = "shuru exec TIMEOUT after 600s".to_string();
+
+        let reason = native_vacuous_reason(88642, 600, &original, &patched);
+
+        assert!(
+            reason.contains("native_vacuous=true"),
+            "the cause is the original side's collection error: {reason}"
+        );
+        assert!(
+            !reason.contains("native_timeout=true"),
+            "a PATCHED-side kill is not the cause, so the timeout reason must not fire: {reason}"
+        );
+        assert!(
+            reason.contains("failed_collectors=1")
+                && reason.contains("first_failed_collector=pandas/tests/io/test_x.py"),
+            "the cause is the module that broke the ORIGINAL collection: {reason}"
+        );
+        assert!(
+            reason.contains("Separately:") && reason.contains("patched timed_out=true")
+                && reason.contains("not the cause of this vacuity"),
+            "the patched kill must be named separately as the patch's own cost: {reason}"
+        );
+        assert!(
+            native_gate_vacuous(88642, &original),
+            "native_gate_vacuous is unchanged: an empty original is vacuous"
+        );
+    }
+
+    /// v1-m3.1 (§8.1) — the whole truth table, over BOTH sides.
+    ///
+    /// [VANTA-WHY] Two facts decide a row, and both are computed here: the guard
+    /// (`native_gate_vacuous`, keyed on the ORIGINAL side ALONE) and the
+    /// regression list (`native_regressions`, original vs patched). Their pair is
+    /// the row's verdict in the driver:
+    ///
+    /// | original | patched | vacuous | regressions | verdict               |
+    /// |----------|---------|---------|-------------|-----------------------|
+    /// | empty    | empty   | yes     | (none)      | InfraFailure          |
+    /// | empty    | ran     | yes     | (none)      | InfraFailure          |
+    /// | ran      | empty   | no      | every test  | failed attempt        |
+    /// | ran      | ran     | no      | the broken  | the attempt's own     |
+    ///
+    /// Row 3 is the fix: an empty PATCHED side under a measuring original is the
+    /// patch's own failure (the patch broke collection while the original ran its
+    /// full suite), and it reaches the Governor through
+    /// `native_regressions` because no original test survives in an empty patched
+    /// report. Rows 1–2 and 4 are mode-independent: the guard takes no
+    /// `GovernorMode`, so Repair and Review answer them identically. The mode
+    /// enters only on row 3, at `attempt_verdict` (pinned in driver.rs): a repair
+    /// round retries, a review round rejects the candidate.
+    ///
+    /// [VANTA-WHY] Finding A (PR #4 review) — row 3 holds only when the patched
+    /// side's emptiness is ATTRIBUTABLE: the suite command ran and exited
+    /// (`exit_code` is `Some`) or hit the cap (`timed_out`). A third patched state
+    /// therefore exists — `ran=false`, no exit code, not timed out — where the
+    /// harness never measured the tree (spawn/seed/exit-plugin/execute failure).
+    /// `NativeSuiteReport::setup_failed` marks it, and the driver reads the marker
+    /// BEFORE `native_regressions` and ends the run as `InfraFailure` (row 3b below),
+    /// so a machine fault is never recorded as a regression against the candidate.
+    ///
+    /// | original | patched       | vacuous | verdict        |
+    /// |----------|---------------|---------|----------------|
+    /// | ran      | setup-failed  | no      | InfraFailure   |
+    #[test]
+    fn the_reclassification_truth_table_holds_over_both_sides() {
+        let empty = vacuity_report(&[], true, Some(5)); // collected nothing
+        let not_run = vacuity_report(&[], false, None); // produced no report
+        let full = vacuity_report(&["a", "b"], true, Some(0));
+        let one = vacuity_report(&["a"], true, Some(0));
+
+        // The pair the driver computes for one row: (vacuous, regressions).
+        let row = |original: &NativeSuiteReport, patched: &NativeSuiteReport| {
+            (
+                native_gate_vacuous(2, original),
+                native_regressions(&original.tests, &patched.tests),
+            )
+        };
+
+        assert_eq!(
+            row(&empty, &empty),
+            (true, Vec::<String>::new()),
+            "row 1: original empty, patched empty — the base tree cannot be graded, \
+             and there is nothing original left to name as a regression, which is \
+             exactly why the GUARD, not the regression list, has to catch this row"
+        );
+        assert_eq!(
+            row(&not_run, &full),
+            (true, Vec::<String>::new()),
+            "row 2: original empty, patched ran — the same fact about the base tree; \
+             the guard never consults the patched side"
+        );
+        assert_eq!(
+            row(&full, &empty),
+            (false, vec!["a".to_string(), "b".to_string()]),
+            "row 3: original ran, patched empty — NOT an infra failure; every \
+             original test is absent from the patched report, so every one is a \
+             regression and the attempt fails on the patch's own evidence"
+        );
+        assert_eq!(
+            row(&full, &one),
+            (false, vec!["b".to_string()]),
+            "row 4: original ran, patched ran — only the test the patch dropped is \
+             named; `a` is present and passing, so it is not a regression"
+        );
+        assert_eq!(
+            row(&full, &full),
+            (false, Vec::<String>::new()),
+            "row 4, unchanged side: a clean gate"
+        );
+    }
+
+    /// [VANTA-WHY] Finding A (PR #4 review) — the marker that tells an
+    /// ATTRIBUTABLE emptiness (the suite ran and exited, or the cap killed it) from
+    /// a SETUP/TRANSPORT failure, over every constructor.
+    ///
+    /// The rule: an empty side is patch-attributable ONLY when `exit_code` is
+    /// `Some` (a collection or import error, pytest exit 2/4/5) or `timed_out`. A
+    /// `not_run()` (no backend, no tree, no exit plugin, or an `execute` error) and
+    /// a `failed_run` with no exit status both measured nothing about the tree, so
+    /// each is marked; a collection error WITH an exit code and a cap kill are not.
+    #[test]
+    fn only_an_unattributable_empty_run_is_marked_as_a_setup_failure() {
+        assert!(
+            NativeSuiteReport::not_run().setup_failed,
+            "a suite the harness never started (spawn/seed/exit-plugin/execute) is a setup failure"
+        );
+        assert!(
+            NativeSuiteReport::failed_run(None, String::new()).setup_failed,
+            "a run that produced no exit status measured nothing attributable"
+        );
+        assert!(
+            !NativeSuiteReport::failed_run(Some(2), String::new()).setup_failed,
+            "a collection error with an exit code IS attributable to the tree"
+        );
+        assert!(
+            !NativeSuiteReport::failed_run(Some(4), String::new()).setup_failed,
+            "pytest exit 4 (usage error) still carries a status"
+        );
+        assert!(
+            !NativeSuiteReport::timed_out_run(None, String::new()).setup_failed,
+            "a cap kill is the harness's cap, not a setup failure"
+        );
+    }
+
+    /// [VANTA-WHY] Finding A (PR #4 review) — the setup-failure reason names the
+    /// side that could not be set up and the state of BOTH sides, so an
+    /// `infra_failure` row explains itself instead of reading as a regression list.
+    #[test]
+    fn the_setup_failure_reason_names_the_failed_side_and_both_states() {
+        let original = vacuity_report(&["a"], true, Some(0));
+        let mut patched = vacuity_report(&[], false, None);
+        patched.setup_failed = true;
+
+        let reason = native_setup_failure_reason(&original, &patched);
+
+        assert!(reason.contains("native_setup_failed=true"), "{reason}");
+        assert!(reason.contains("the patched side"), "{reason}");
+        assert!(
+            reason.contains("original=ran (tests=1 exit_code=0"),
+            "the measuring side must be named: {reason}"
+        );
+        assert!(
+            reason.contains("patched=not_run (tests=0 exit_code=unset"),
+            "the side that could not be set up must be named with its state: {reason}"
         );
     }
 

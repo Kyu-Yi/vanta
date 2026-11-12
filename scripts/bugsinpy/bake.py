@@ -261,7 +261,7 @@ it found **nothing**: the window widens to the declaring pin's own release date
 date (:func:`pin_cutoff`). It is a distinct phrase rather than the base one because the reader
 has to be able to tell a pin the bug's own date could reach from one it could not — the two
 carry the same ``declared_by``, and only ``pin_rule`` (and the ``widened_by`` key beside it)
-says the second rule was what placed it. Measured on ``fastapi/11``: ``ujson==3.0.0`` declares
+says the second rule was what placed it. Measured on a fastapi bug: ``ujson==3.0.0`` declares
 ``setuptools_scm>=3.4``, nothing at the bug's date satisfies it, and the declarer's own date
 (2020-06-03) admits ``setuptools-scm==4.1.2``.
 """
@@ -6848,7 +6848,7 @@ UNBUILDABLE_AT_BAKE = "sdist-failed-to-build-at-bake"
 [VANTA-WHY] Not the same finding as :data:`UNBUILDABLE`, which is the *preflight's*
 prediction from the reviewed table: this one is observed, and it is only ever observed
 in the failing layer's own build log — ``pip`` writes ``Failed to build h5py scikit
--learn`` and the trace above it names the library. Measured on ``pandas/7``: ``h5py``
+-learn`` and the trace above it names the library. Measured on a pandas bug: ``h5py``
 is a BugsInPy pin whose sdist dies on ``libhdf5.so`` and ``scikit-learn`` is a
 closure-sourced pick whose sdist dies on a missing ``scipy``, and neither is refused by
 any preflight, because both are installable in principle and only fail here. It is
@@ -6868,11 +6868,11 @@ module *ahead of the stdlib one* on ``sys.path``: the layer's interpreter alread
 the real module, so the backport does not add a capability, it shadows the one the
 interpreter has. Measured on ``luigi/7`` and ``luigi/5``, whose full prepare dies at
 pytest start-up with ``TypeError: an integer is required (got type bytes)`` — an old
-``enum`` backport reading bytes the 3.8 stdlib hands it. The two bugs that carry no
-``enum34`` (``luigi/9`` and ``luigi/12``, whose ``hypothesis`` pins are older still) are
+``enum`` backport reading bytes the 3.8 stdlib hands it. Two other bugs that carry no
+``enum34`` (whose ``hypothesis`` pins are older still) are
 **not** the counterfactual an earlier reading of this took them for: both fail an earlier
 gate (``empty FAIL_TO_PASS``) and never run at all, so nothing here measures "without
-``enum34`` this suite runs". ``luigi/8`` carries ``enum34`` too and fails that same
+``enum34`` this suite runs". A third bug carries ``enum34`` too and fails that same
 earlier gate, so it neither adds nor removes evidence for the crash.
 
 The list is closed and named (:data:`STDLIB_BACKPORTS`) rather than a rule over PYPI
@@ -6885,7 +6885,7 @@ would have tried.
 FAILED_BUILD_PREFIX = "Failed to build "
 """How the layer's ``pip`` opens the one line that names what it could not build.
 
-Measured on ``pandas/7``: the merged output of the failed layer holds ``Failed to build
+Measured on a pandas bug: the merged output of the failed layer holds ``Failed to build
 h5py scikit-learn`` — the distribution names, space-separated, on a line of their own
 and nothing else on it. It is R2(ii)'s trigger (:func:`failed_builds`) because it is the
 one line of a four-hundred-line log that says *which* pins failed rather than *why*, and
@@ -6934,7 +6934,7 @@ RETRY_RULE_TRANSIENT = "R4"
 
 [VANTA-WHY] A third failure shape reaches neither R1 nor R2(ii), and it is the one where
 the layer is not at fault at all: the bytes pip received were not the bytes the index
-advertised. Measured on ``pandas/66`` — ``matplotlib==3.1.3``'s sdist arrived with
+advertised. Measured on a pandas bug — ``matplotlib==3.1.3``'s sdist arrived with
 ``a126ab08…`` where the index's link says ``db3121…``, one line under ``ProtocolError
 ('Connection aborted.', RemoteDisconnected('Remote end closed connection without
 response'))``. There is no pin to drop (nothing built wrong) and no ordering to change
@@ -8340,7 +8340,7 @@ def _declarer_pin_cutoff(
     requirements cannot pre-date the release that declares them. ``ujson==3.0.0`` is a
     BugsInPy reference pin installed *as written*, and it landed 2020-06-03 — after
     every fastapi bug it appears in — so its ``setup_requires`` naming
-    ``setuptools_scm>=3.4`` asks for a release that did not exist at ``fastapi/11``'s
+    ``setuptools_scm>=3.4`` asks for a release that did not exist at the bug's
     own date (2019-08-06). Held to the bug's date alone, that declaration is a refusal
     for a pin the reference environment itself carried.
 
@@ -8392,12 +8392,12 @@ def build_requirement_pins(
     nothing — that is the whole point of reading it second. A layer the date rule already
     resolves keeps the release it has, bit for bit, so no already-baked layer can be moved
     by this rule; the fallback only ever turns a refusal into a resolution. Measured on
-    ``fastapi/11``: ``ujson==3.0.0`` (released 2020-06-03) declares
+    one fastapi bug: ``ujson==3.0.0`` (released 2020-06-03) declares
     ``setuptools_scm>=3.4``, nothing at the bug's 2019-08-06 date satisfies it, and the
     declaring release's window admits ``setuptools-scm==4.1.2`` (2020-05-31). The fastapi
-    layers with later commit dates never reach the fallback at all: ``fastapi/1``, ``/2``
-    and ``/3`` pick ``setuptools-scm==3.5.0`` and ``fastapi/5`` and ``/6`` pick ``==3.4.1``
-    from the bug's own date, which is what keeps them byte-identical.
+    layers with later commit dates never reach the fallback at all: some pick
+    ``setuptools-scm==3.5.0`` and others ``==3.4.1`` from the bug's own date, which
+    is what keeps them byte-identical.
 
     A pin the widened window places records the fallback rather than leaving it to
     ``declared_by``: its ``pin_rule`` names the widened window
@@ -9357,7 +9357,7 @@ def declares_pytest_plugin(
       at all. ``False``, and :func:`wheel_entry_points_text` is what says ``""`` rather
       than ``None`` for it. Measured: ``h5py==2.10.0``'s 28 wheels carry none, so with
       one answer for both the pin §8.6's R2 retry was to drop was protected instead and
-      ``pandas/7`` flagged rather than retried.
+      a pandas bug flagged rather than retried.
 
     The first wheel decides it: every wheel of one release carries the same
     ``entry_points.txt``, and reading more than one would download the release twice to
@@ -10471,7 +10471,7 @@ def import_auditor(
 
     [VANTA-WHY] The closure's roots are the failing test files, and only a commit that
     carries one has roots to give. A commit without it is skipped for the closure, not
-    stood in for by its whole tree: ``pandas/66``'s buggy commit lacks the file the fix
+    stood in for by its whole tree: a pandas bug's buggy commit lacks the file the fix
     carries, and reading its whole tree as reachable made a pin its own tests never
     reach look required (§8.6 row 14). The whole-tree fallback is kept for the one case
     *neither* commit carries the failing test file, where there are no roots at all.
@@ -10498,7 +10498,7 @@ def import_auditor(
             graph = module_import_graph(files, read_file=partial(read, commit))
             trees.append((graph, [path for path in test_files if path in graph]))
         # A commit without the failing test file contributes no roots, and must not
-        # stand in for the commit that has them: ``pandas/66``'s buggy commit lacks the
+        # stand in for the commit that has them: a pandas bug's buggy commit lacks the
         # file the fix carries, and counting its whole tree as reachable made a pin its
         # own tests never reach look required (§8.6 row 14). The whole-tree fallback is
         # for the one case the closure question has no roots at all — *neither* commit
@@ -10786,12 +10786,12 @@ def drop_self_pin(
     is a rule about the closure walk, and the walk only reaches a name a *release*
     declares. A bug whose own ``requirements.txt`` pins the project it grades
     (``pandas==1.0.4``) has that name in ``installs`` before the walk runs, so the walk
-    sees it *pinned* and never asks the tree question at all: measured, ``pandas/154``
-    and ``pandas/160`` each declared ``pandas==1.0.4`` as an ordinary layer pin, the walk
+    sees it *pinned* and never asks the tree question at all: measured, two pandas bugs
+    each declared ``pandas==1.0.4`` as an ordinary layer pin, the walk
     therefore recorded no ``tree_satisfied`` entry, and ``statsmodels==0.10.1`` — which
     declares ``pandas`` — stayed in the *resolving* pass beside ``scipy==1.4.1`` and died
     at ``setup.py egg_info`` because its ``kalman_loglike.pyx`` cimports a ``scipy``
-    header ``scipy``'s own build had not installed yet. ``pandas/120`` declares no such
+    header ``scipy``'s own build had not installed yet. A third pandas bug declares no such
     pin, so its ``statsmodels`` declares a name the layer installs nothing for and is
     moved into the ``--no-deps`` pass *after* ``scipy`` — and builds.
 
@@ -11307,7 +11307,7 @@ class BuildPin:
     declaring pin whose own release landed at the widened cutoff, recorded so the JSON says
     the fallback was used *and* what anchored it. Empty for every pin the bug's own date
     already reached, which is what keeps an already-baked layer's record byte-identical.
-    Measured on ``fastapi/11``: one pair, ``("ujson==3.0.0", "2020-06-03")``.
+    Measured on a fastapi bug: one pair, ``("ujson==3.0.0", "2020-06-03")``.
     """
 
     @property
@@ -11930,7 +11930,7 @@ def no_deps_dependents(
     A pin is a dependent when its **own** release's ``requires_dist`` names one of the
     names (:func:`_declares_absent`), read at the version ``installs`` carries — and the
     set is **closed transitively**, because moving a dependent out of the main pass makes
-    *its* name a name the main pass installs nothing for. Measured on ``pandas/7``'s
+    *its* name a name the main pass installs nothing for. Measured on a pandas bug's
     retry: dropping the unbuildable ``h5py==2.10.0`` leaves ``clifford==1.3.1``
     (which declares it) in the moved set, and ``mpl-toolkits-clifford==0.0.3``
     (which declares ``clifford``) has to move with it, or pip resolves the whole chain
@@ -13966,7 +13966,7 @@ def retry_log_path(logs_dir: Path, name: str) -> Path:
     write the first pass's log and nothing else: the retry's own output — the second
     install pass, with the pins it dropped or hoisted — was discarded, so the failure
     report cited the first pass's error and the retry's was unrecoverable (measured on
-    ``pandas/7``, ``luigi/30``, ``luigi/19``). Kept **beside** the first pass's file
+    a pandas bug, ``luigi/30``, ``luigi/19``). Kept **beside** the first pass's file
     rather than over it, because both are the layer's evidence and they are different
     attempts (§8.6 R2(ii), R1). Named through :func:`bake_log_path` so there is one
     naming rule and one writer for both files.
@@ -14378,7 +14378,7 @@ def _failure_report(
     error is the one the retry was answering (its wheels that would not build, its
     ``egg_info`` crash), so citing it says nothing about why the retry failed; a reader
     who saw only it would read the same diagnosis twice for two different attempts, which
-    is exactly what ``pandas/7`` and ``luigi/30`` looked like. ``retries`` and
+    is exactly what a pandas bug and ``luigi/30`` looked like. ``retries`` and
     ``retry_logs`` are the run's record of which layers were retried and where each
     attempt's output went; a layer absent from them behaves exactly as before.
 

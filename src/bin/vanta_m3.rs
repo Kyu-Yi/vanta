@@ -96,15 +96,18 @@ struct CliArgs {
     /// means "not recorded" (a hand-run binary) and leaves the run exactly as it
     /// was; `0` means the bug genuinely ships no native tests.
     native_expected_tests: Option<usize>,
-    /// M3 item D1 — `--native-timeout-secs N`: the wall-clock cap for the
+    /// M3 item D1 / v1-m3.1 — `--native-timeout-secs N`: the wall-clock cap for the
     /// in-session native suite, derived per bug from the row's own prepare
-    /// measurement (`max(120, 3 × measured)`). Absent keeps the historical
-    /// `harness::test_timeout_secs()` (120 s, or `VANTA_TEST_TIMEOUT_SECS`).
+    /// measurement (`max(1200, 10 × measured)`). Absent keeps the session floor of
+    /// 1200 s, or the environment's own `VANTA_TEST_TIMEOUT_SECS` when that is larger
+    /// (`harness::native_session_timeout_floor`).
     ///
-    /// The gate runs the repo's own suite twice in-session. pandas/1's suite
-    /// takes ~487 s through prepare, so the fixed 120 s cap killed BOTH runs and
-    /// the row died as a false "collected nothing" (night3). A per-bug cap is the
-    /// only value both large enough for the bug and still bounded.
+    /// The gate runs the repo's own suite twice in-session — the original tree and the
+    /// patched tree, both under THIS one cap. pandas/1's suite takes ~487 s through
+    /// prepare, so the fixed 120 s cap killed BOTH runs and the row died as a false
+    /// "collected nothing" (an in-batch session); a one-file `luigi/scheduler.py` patch
+    /// cost ~3.6× the unpatched suite (119/116 s vs 33/31 s), above D1's 3×. A per-bug
+    /// cap is the only value both large enough for the bug and still bounded.
     native_timeout_secs: Option<u64>,
     /// Path to a clean original tree (git worktree of the base commit) for
     /// Mode B. If set, BATE runs against this tree instead of the in-memory

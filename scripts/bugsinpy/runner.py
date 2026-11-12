@@ -118,15 +118,29 @@ still fires when the plugin moves on and a stale binary cannot silently measure 
 plugin older than the tree.
 """
 
-# §8.1's worst single run is ~30 min for a vanta repair; 3 h is a backstop, not an
-# estimate. A run that hits it is a failure to report, not a result to grade.
-RUN_TIMEOUT_SECS = 3 * 60 * 60
-# §14.15 — how far short of `RUN_TIMEOUT_SECS` Vanta's own deadline is set. The
-# margin has to cover the longest single LLM call the harness expects (5-10
-# minutes on sanic's 50-65k-token prompts), because the deadline is checked
-# BEFORE each call: the call already in flight when the clock runs out still
-# finishes. Ten minutes is that call, plus the terminal write.
-DEADLINE_MARGIN_SECS = 10 * 60
+# §8.1's worst single run is ~30 min for a vanta repair; the row backstop is
+# deliberately far larger than any estimate. It must clear `VANTA_DEADLINE_SECS` by
+# more than the longest step that can still START after the deadline check is
+# honoured (§14.15) — a model call already in flight, the post-gate In-Session
+# Attacker round and the terminal write — because the run notices the clock only
+# BETWEEN steps. Inside the gap Vanta writes `final_decision` + `run.summary`; past
+# it the harness SIGKILLs mid-call and the row is the `no run.summary` shape, which
+# leaves no manifest entry and re-runs identically on resume. 13800 s is that
+# backstop: the deadline below plus 3600 s.
+RUN_TIMEOUT_SECS = 13800
+# §14.15 — how far short of `RUN_TIMEOUT_SECS` Vanta's own deadline is set. This is
+# the row BACKSTOP, not merely one long call: the deadline is checked BETWEEN steps,
+# so work already in flight when it expires still runs to its end. 3600 s is that
+# backstop; the deadline it leaves (10200 s) is unchanged from every v1-m3 row, so
+# v1-m3 and v1-m3.1 rows share a clock and only the kill margin moved.
+DEADLINE_MARGIN_SECS = 60 * 60
+# The deadline the run is handed, named once so the env value below and the backstop
+# cannot drift apart. 13800 - 3600 = 10200, the value v1-m3 rows ran under.
+VANTA_DEADLINE_SECS = RUN_TIMEOUT_SECS - DEADLINE_MARGIN_SECS
+assert RUN_TIMEOUT_SECS > VANTA_DEADLINE_SECS + 1800, (
+    "the row backstop must clear the deadline by more than the longest "
+    "post-deadline in-attempt step, or a clean `budget_exhausted` write is SIGKILLed"
+)
 PROBE_TIMEOUT_SECS = 120
 ORACLE_TIMEOUT_SECS = 1800
 
@@ -739,13 +753,14 @@ def vanta_env(
     # Always set, including for seed 0: `VANTA_LLM_SEED=0` is a request to pin 0,
     # while an unset variable means "no seed key in the body" (§4.4, D4).
     env["VANTA_LLM_SEED"] = str(seed)
-    # §14.15 — Vanta's own deadline, set short of the timeout this module kills
-    # the process with. The margin is what makes the difference between the two
-    # outcomes: inside it Vanta notices the clock, stops between calls and writes
-    # `final_decision` + `run.summary`; past it the harness SIGKILLs mid-call and
-    # the row is the `no run.summary` shape the overnight batch produced. Ten
-    # minutes is one long sanic call, which is the unit the margin has to cover.
-    env["VANTA_DEADLINE_SECS"] = str(RUN_TIMEOUT_SECS - DEADLINE_MARGIN_SECS)
+    # §14.15 — Vanta's own deadline, set short of the timeout this module kills the
+    # process with. The backstop between them is what makes the difference between
+    # the two outcomes: inside it Vanta notices the clock, stops between steps and
+    # writes `final_decision` + `run.summary`; past it the harness SIGKILLs mid-call
+    # and the row is the `no run.summary` shape the overnight batch produced. Both
+    # numbers are module constants (`VANTA_DEADLINE_SECS`, `RUN_TIMEOUT_SECS`),
+    # asserted against each other at import so the gap cannot shrink silently.
+    env["VANTA_DEADLINE_SECS"] = str(VANTA_DEADLINE_SECS)
     # [VANTA-WHY] M3 items S1–S3 — the ONE suite cache directory, made absolute and
     # handed to every child. The harness process and the binary it spawns must look
     # in the same place or a hit in one is a miss in the other, and the binary's own
@@ -2018,6 +2033,23 @@ def _number(value: Optional[str]) -> Any:
     return int(parsed) if parsed.is_integer() and "." not in value else parsed
 
 
+def _secs(value: Optional[str]) -> Optional[float]:
+    """v1-m3.1 §4 — a per-side native wall time, or ``None`` when unmeasured.
+
+    Same contract as ``_cost`` (§14.29) and for the same reason: the driver prints
+    ``unset`` for a side that produced no wall time, and a reader that must not
+    confuse that with a number maps it to ``None``. Distinct from ``_number``,
+    which keeps a non-numeric token verbatim (a reader of a NATIVE SECONDS field
+    cannot do that, or ``unset`` would land on the row as the string ``"unset"``).
+    """
+    if value is None or value == "unset":
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
 def _cost(value: Optional[str]) -> Optional[float]:
     """§14.29 — a cost is a float or ``None``, never the string ``unset``.
 
@@ -2118,22 +2150,27 @@ def invoke_vanta(
     if prep.prepare_mode == prepare_mod.FULL:
         native_expected = prep.pass_to_pass_count + len(prep.native_failure_baseline)
         argv += ["--native-expected-tests", str(native_expected)]
-    # M3 item D1 — the in-session native suite's wall-clock cap, derived per bug from
-    # prepare's OWN measurement of the same suite. The old cap was the Rust default
-    # (120 s), which pandas/1's ~487 s native run can never fit: the gate then killed
-    # both runs, read as "collected nothing" and ended the row `native_vacuous` — an
-    # `infra_failure` blamed on the tree for what was a fact about the CAP. The rule is
-    # `max(120, 3 × measured)`; `native_secs` is `None` on a row prepared before D1 (or
-    # a measure-only row), which holds the old 120 s. The cap the run actually used is
-    # recorded on the row from `run.summary`.
-    # M3 item F4 — the floor is the run's EFFECTIVE environment's own cap, not the fixed
-    # 120: `driver.rs::resolve_native_timeout_secs` refuses any `--native-timeout-secs`
+    # M3 item D1 / v1-m3.1 — the in-session native suite's wall-clock cap, derived per bug
+    # from prepare's OWN measurement of the same suite. The old cap was the Rust default
+    # (120 s), which pandas/1's ~487 s native run can never fit: the gate then killed both
+    # runs, read as "collected nothing" and ended the row `native_vacuous` — an
+    # `infra_failure` blamed on the tree for what was a fact about the CAP. D1's rule was
+    # `max(120, 3 × measured)`; it is now `max(1200, 10 × measured)`, because a dev
+    # probe measured a legitimate one-file patch at ~3.6× the unpatched suite on an idle
+    # machine, above 3×. BOTH sides of the gate get this ONE value (see
+    # `suite_mod.native_session_timeout_secs`): the original side is content-keyed in the
+    # suite cache and the cap is part of that key, so a per-side cap would re-measure it.
+    # `native_secs` is `None` on a row prepared before D1 (or a measure-only row), which
+    # holds the floor. The cap the run actually used is recorded on the row from
+    # `run.summary` (`native_timeout_secs`, `native_session_cap_secs`).
+    # M3 item F4 — the floor is the run's EFFECTIVE environment's own cap, never below
+    # 1200: `driver.rs::resolve_native_timeout_secs` refuses any `--native-timeout-secs`
     # below `harness::test_timeout_secs()` for the SAME child environment (`env` here,
-    # which already carries item 19's frozen `[env]`). Measuring against the fixed 120
-    # while the operator raised `VANTA_TEST_TIMEOUT_SECS` sent a value the binary
-    # refused before it ran, so the job ended `infra_failure` with no `run.summary`.
-    native_cap = suite_mod.native_timeout_secs(
-        prep.native_secs, floor=suite_mod.native_timeout_floor(env)
+    # which already carries item 19's frozen `[env]`). Measuring against the fixed floor
+    # while the operator raised `VANTA_TEST_TIMEOUT_SECS` sent a value the binary refused
+    # before it ran, so the job ended `infra_failure` with no `run.summary`.
+    native_cap = suite_mod.native_session_timeout_secs(
+        prep.native_secs, floor=suite_mod.native_session_timeout_floor(env)
     )
     argv += ["--native-timeout-secs", str(native_cap)]
     if candidate is not None:
@@ -2848,9 +2885,48 @@ def build_record(
         # whose suite genuinely collected nothing. `native_secs` is `None` on a row
         # prepared before D1 or on a measure-only row; `native_timeout_secs` is then
         # the historical 120 s.
+        #
+        # [VANTA-WHY] Finding C (PR #4 review) — `native_timeout` is the CONFIGURED
+        # cap killing a side, never a DEADLINE-CLAMPED kill: the clamp cut the cap
+        # below `native_timeout_secs`, so the kill is the clock's doing and the row
+        # records it as `native_gate_clamped` instead. The flag still implies
+        # `native_vacuous` (it is set only for a vacuous gate), so every consumer
+        # below is unaffected; only the value on a clamped row changes, from the
+        # older `true` to `false`.
         "native_secs": prep.native_secs,
         "native_timeout_secs": _int(summary.get("native_timeout_secs")),
         "native_timeout": _bool(summary.get("native_timeout")),
+        # [VANTA-WHY] v1-m3.1 §4 and F3 (PR #4 review) — the per-side in-session
+        # wall time, the per-side kill flags and the cap those runs actually ran
+        # under. Read back from `run.summary` so the §8.1 rule (original side empty
+        # ⇒ infra failure; original ran + patched empty ⇒ failed attempt) and the
+        # cap that produced them are both auditable from the row. `unset` → `None`
+        # for a side that produced no wall time; the cap is always present (a
+        # resolved number). The `*_timed_out_last` pair describes the SAME (last)
+        # gate as `*_secs` and the effective cap; `native_original_timed_out` /
+        # `native_patched_timed_out` keep the wider ANY-attempt meaning.
+        "native_original_secs": _secs(summary.get("native_original_secs")),
+        "native_patched_secs": _secs(summary.get("native_patched_secs")),
+        "native_original_timed_out": _bool(summary.get("native_original_timed_out")),
+        "native_patched_timed_out": _bool(summary.get("native_patched_timed_out")),
+        "native_original_timed_out_last": _bool(summary.get("native_original_timed_out_last")),
+        "native_patched_timed_out_last": _bool(summary.get("native_patched_timed_out_last")),
+        "native_session_cap_secs": _int(summary.get("native_session_cap_secs")),
+        # [VANTA-WHY] v1-m3.1 F5 — the cap the run's LAST native gate ACTUALLY ran
+        # under, after the deadline clamp lowered it. `native_session_cap_secs`
+        # above keeps its own meaning (the resolved/configured cap, the rule); this
+        # is what a clamped timeout must be attributed to, so a reader can see a
+        # `native_original_timed_out` beside the shorter limit that produced it.
+        # `None` (the driver prints `unset`) when no gate ran, and for a row older
+        # than the field.
+        "native_gate_effective_cap_secs": _int(summary.get("native_gate_effective_cap_secs")),
+        # [VANTA-WHY] v1-m3.1 F3 — whether the run's LAST native gate ran under a
+        # cap the deadline clamp lowered. Read back from `run.summary` so a
+        # `budget_exhausted`/`NeedsReview` row whose ORIGINAL side was cut by the
+        # clamp (a deadline event, `native_vacuous=false`) is tellable from a real
+        # infrastructure fault (`native_vacuous=true`). `false` for a row older
+        # than the field.
+        "native_gate_clamped": _bool(summary.get("native_gate_clamped")),
         "oracle": oracle.as_dict(),
         "label": label_for(outcome.decision, oracle),
         # Item Q — the reason a label needs one. `unresolved` for a run whose final

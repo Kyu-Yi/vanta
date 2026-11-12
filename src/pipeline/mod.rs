@@ -305,7 +305,7 @@ mod tests {
     }
 
     /// [VANTA-WHY] M3 item 19 (fix 4) — the chain that makes a prompt edit move
-    /// `config_hash`. `config_hash` is the SHA-256 of `configs/v1-m3.toml`, and
+    /// `config_hash`. `config_hash` is the SHA-256 of `configs/v1-m3.1.toml`, and
     /// the `[prompts]` block records this code's own hashes. Edit a template and
     /// this test fails; the only fix is to update `[prompts]`, which changes the
     /// file's bytes and therefore every row's `config_hash`. Without this link the
@@ -313,12 +313,12 @@ mod tests {
     /// gap item 16 fell into.
     #[test]
     fn the_committed_prompts_block_is_the_hash_of_the_templates_this_code_sends() {
-        let raw = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/configs/v1-m3.toml"));
-        let doc: toml::Value = toml::from_str(raw).expect("configs/v1-m3.toml must parse as TOML");
+        let raw = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/configs/v1-m3.1.toml"));
+        let doc: toml::Value = toml::from_str(raw).expect("configs/v1-m3.1.toml must parse as TOML");
         let recorded = doc
             .get("prompts")
             .and_then(|value| value.as_table())
-            .expect("configs/v1-m3.toml must carry a [prompts] table");
+            .expect("configs/v1-m3.1.toml must carry a [prompts] table");
 
         let expected: [(&str, String); 5] = [
             (
@@ -367,7 +367,7 @@ mod tests {
             .collect();
         assert!(
             mismatches.is_empty(),
-            "configs/v1-m3.toml [prompts] must be the hashes this code sends, or `config_hash` \
+            "configs/v1-m3.1.toml [prompts] must be the hashes this code sends, or `config_hash` \
              describes other text; update the file (which moves config_hash) or revert the \
              template edit. Mismatches: {mismatches:#?}"
         );

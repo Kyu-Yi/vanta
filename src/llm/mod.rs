@@ -120,6 +120,24 @@ pub fn deadline_past() -> bool {
         .map_or(false, |at| Instant::now() >= at)
 }
 
+/// How long the run has left before [`deadline_past`] turns true, in whole seconds,
+/// or `None` when no deadline is armed.
+///
+/// [VANTA-WHY] v1-m3.1 (§8.4) — the native gate's per-attempt cap is CLAMPED to the
+/// time the run has left (`min(native_cap, remaining)`), so a slow gate (a 725 s suite:
+/// 7250 s per side) cannot start with less than its cap on the clock and outlive the
+/// deadline on its own. `deadline_past()` answers only the yes/no question; this
+/// answers "how many seconds are left". A deadline that has passed — or is within the
+/// last second — reads as `Some(0)`, which the caller treats as "skip the gate and
+/// take the deadline exit"; an unarmed deadline is `None`, so the caller keeps the
+/// full cap (the behaviour of every run before §14.15).
+pub fn remaining_secs() -> Option<u64> {
+    DEADLINE_AT
+        .lock()
+        .unwrap()
+        .map(|at| at.saturating_duration_since(Instant::now()).as_secs())
+}
+
 // ============================================================================
 // TOKEN ACCOUNTING — what each chat call really cost
 // ============================================================================
@@ -3245,10 +3263,50 @@ mod _streaming_tests {
 // test harness.
 #[cfg(test)]
 mod _deadline_tests {
-    use super::{deadline_past, set_deadline_secs};
+    use std::sync::{Mutex, MutexGuard};
+
+    use super::{deadline_past, remaining_secs, set_deadline_secs};
+
+    /// One lock plus a drop guard for the BOTH tests in this module, which all
+    /// write the process-global `DEADLINE_AT`.
+    ///
+    /// [VANTA-WHY] v1-m3.1 F1 — `DEADLINE_AT` is process-global and every test
+    /// here sets it, so under the default parallel runner one test can arm a
+    /// clock between another's `set_deadline_secs(None)` and its assert. That
+    /// interleaving reads as a spurious failure of code the test never touched,
+    /// and the tests were only safe under `--test-threads=1`. The lock makes them
+    /// exclusive, and the guard disarms the global both on `take` and on `drop`
+    /// (every exit path, a panicking assert included), so no test can inherit a
+    /// clock another left armed.
+    static DEADLINE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct DeadlineTestGuard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl DeadlineTestGuard {
+        /// Take the lock and start disarmed, so a clock left behind by an earlier
+        /// panic cannot reach the test that now holds the lock.
+        fn take() -> Self {
+            let lock = DEADLINE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            set_deadline_secs(None);
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for DeadlineTestGuard {
+        fn drop(&mut self) {
+            set_deadline_secs(None);
+        }
+    }
 
     #[test]
     fn an_unarmed_deadline_never_passes_and_an_armed_one_passes_when_it_is_due() {
+        // Held from the first change through cleanup: the other test can neither
+        // read nor write the global while this one owns it.
+        let _guard = DeadlineTestGuard::take();
         // The default, and the behaviour of every run before §14.15: no clock.
         set_deadline_secs(None);
         assert!(!deadline_past(), "an unarmed deadline must never end a run");
@@ -3267,6 +3325,36 @@ mod _deadline_tests {
         // the state this test must leave behind.
         set_deadline_secs(None);
         assert!(!deadline_past(), "disarming must return the run to 'no clock'");
+    }
+
+    /// [VANTA-WHY] v1-m3.1 (§8.4) — the native gate clamps its cap to the time left,
+    /// so the remaining seconds have to be readable, saturate at zero, and read as
+    /// `None` (not `0`) when no clock is armed — `None` keeps the full cap, while
+    /// `Some(0)` means "no gate, take the deadline exit". The two must not collapse.
+    #[test]
+    fn the_remaining_seconds_are_none_unarmed_zero_when_due_and_bounded_when_armed() {
+        let _guard = DeadlineTestGuard::take();
+        set_deadline_secs(None);
+        assert_eq!(
+            remaining_secs(),
+            None,
+            "no clock armed means no clamp: the caller keeps the full cap"
+        );
+
+        set_deadline_secs(Some(3600));
+        let left = remaining_secs().expect("an armed deadline has a remainder");
+        assert!(
+            (3595..=3600).contains(&left),
+            "an hour out reads as ~3600 s, got {left}"
+        );
+
+        // A deadline set at `now` is already due, and the remainder saturates at 0
+        // rather than underflowing — `Instant - Instant` is not allowed to panic here.
+        set_deadline_secs(Some(0));
+        assert_eq!(remaining_secs(), Some(0), "a due deadline leaves nothing");
+
+        set_deadline_secs(None);
+        assert_eq!(remaining_secs(), None, "disarming must leave no remainder");
     }
 }
 

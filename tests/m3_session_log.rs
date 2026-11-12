@@ -301,7 +301,7 @@ impl StubLlmServer {
     /// As `start`, but a judge call is answered with a scripted verdict body
     /// instead of the default approval (M3 item 7). The answer is served
     /// VERBATIM, so a test can script prose the judge parser cannot read — the
-    /// retry-then-`JudgeFailed` path — as well as a real verdict object.
+    /// retry-then-model-output-invalid path — as well as a real verdict object.
     fn start_with_judge(judge_response_json: &str) -> Self {
         Self::start_scripted_impl(
             None,
@@ -370,8 +370,8 @@ impl StubLlmServer {
             intent_audit_response_json.map(|json| serde_json::from_str(json).unwrap());
         // [VANTA-WHY] M3 item 7 — a STRING, not a parsed `Value`: a judge answer is
         // served verbatim so a test can script prose the judge parser cannot read
-        // (the retry-then-`JudgeFailed` path), which is not valid JSON at all and so
-        // could not round-trip through `serde_json::Value`.
+        // (the retry-then-model-output-invalid path), which is not valid JSON at all
+        // and so could not round-trip through `serde_json::Value`.
         let judge_answer: Option<String> = judge_response_json.map(|json| json.to_string());
 
         let join = thread::spawn(move || {
@@ -7387,17 +7387,21 @@ fn the_judge_suite_arm_shows_the_model_the_failing_tests_and_the_summary() {
 }
 
 /// M3 item 7 — an answer the judge cannot read is retried until the parse budget
-/// is spent (v1-m3.2 item C raised it to four requests), then ends the run as
-/// `JudgeFailed` with its own exit code 4 — never `InfraFailure`, never a
-/// rejection.
+/// is spent (v1-m3.2 item C raised it to four requests), and then the run is
+/// GRADED unreadable: `NeedsReview` with `stop_reason=model_output_invalid` and
+/// the candidate attached (v1-m3.2 item B) — never `InfraFailure`, never a
+/// rejection, no longer `JudgeFailed`.
 ///
 /// [VANTA-WHY] "The machine is broken" and "the model said something we cannot
 /// read as a verdict" are opposite facts: the first is retried as infrastructure
-/// and reported as `infra_failure`, the second is this arm's own outcome and must
-/// not be. The exit code (4) is what lets the harness map it to `judge_failed`
-/// without treating it as an infra fault.
+/// and reported as `infra_failure`, the second is the model's OWN output and gets
+/// the same rule the Creator's and Attacker's unreadable answers get. The
+/// candidate is on disk either way, so the row can be labelled — ending it
+/// `JudgeFailed` with nothing attached is what censored the row to `unobservable`
+/// and halted the wave (§8.2). There was still no verdict, so there must still be
+/// no `run.judge` row claiming one.
 #[test]
-fn an_unreadable_judge_answer_spends_the_parse_budget_then_fails_with_exit_four() {
+fn an_unreadable_judge_answer_is_graded_as_model_output_invalid() {
     let _serial = serial_run();
     let workspace = TempDir::new().unwrap();
     let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
@@ -7422,9 +7426,10 @@ fn an_unreadable_judge_answer_spends_the_parse_budget_then_fails_with_exit_four(
 
     assert_eq!(
         output.status.code(),
-        Some(4),
-        "a readable machine and an unreadable answer is `JudgeFailed` (exit 4), its \
-         own code — never `InfraFailure` (2); stdout:\n{}",
+        Some(3),
+        "a readable machine and an unreadable answer is a MODEL-OUTPUT failure, so \
+         the run ends `NeedsReview` (exit 3) — never `InfraFailure` (2, the machine \
+         broke) and no longer `JudgeFailed`'s 4; stdout:\n{}",
         String::from_utf8_lossy(&output.stdout)
     );
     assert_eq!(
@@ -7442,20 +7447,63 @@ fn an_unreadable_judge_answer_spends_the_parse_budget_then_fails_with_exit_four(
     );
 
     let records = read_session_records(&find_session_log(workspace.path()));
+    let row = records
+        .iter()
+        .find(|record| record.phase == "run.model_output_invalid")
+        .unwrap_or_else(|| {
+            panic!(
+                "the reason the answer could not be read must be on its own row, or \
+                 `NeedsReview` is indistinguishable from an ordinary uncorroborated \
+                 failure; phases: {:?}",
+                records.iter().map(|r| r.phase.as_str()).collect::<Vec<_>>()
+            )
+        });
     assert!(
-        records.iter().any(|record| record.phase == "run.judge_failed"),
-        "the reason the answer could not be read must be on its own row"
+        row.summary.contains("final_decision=NeedsReview")
+            && row.summary.contains("stop_reason=model_output_invalid"),
+        "the row must carry both the verdict and the reason; got {}",
+        row.summary
     );
     assert!(
         !records.iter().any(|record| record.phase == "run.judge"),
         "there was no verdict, so there must be no `run.judge` row claiming one"
     );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.phase == "run.judge_failed"),
+        "an unreadable answer is no longer the judge arm's own outcome, so its old \
+         row is gone: the failure is reported on `run.model_output_invalid` and \
+         nowhere else; phases: {:?}",
+        records.iter().map(|r| r.phase.as_str()).collect::<Vec<_>>()
+    );
     let summary = run_summary(workspace.path());
     assert_eq!(
         summary_value(&summary.summary, "final_decision"),
-        "JudgeFailed",
+        "NeedsReview",
         "an unreadable answer is its own outcome, never folded into a rejection; got {}",
         summary.summary
+    );
+    assert_eq!(
+        summary_value(&summary.summary, "stop_reason"),
+        "model_output_invalid",
+        "run.summary must say why the run stopped itself, not just that it did; got {}",
+        summary.summary
+    );
+
+    // The rule attaches the candidate exactly as the deadline exit does, so the
+    // patch the grader has to look at is on disk: without it the runner censors
+    // the oracle to `unobservable` and the wave gate halts on this one row (§8.2).
+    let debug_dir = workspace
+        .path()
+        .join("vanta_sessions")
+        .join(records[0].session_id.as_str())
+        .join("debug");
+    assert!(
+        debug_dir.join("final.patch").exists(),
+        "a model-output-invalid row must leave the candidate patch on disk for the \
+         grader; missing under {}",
+        debug_dir.display()
     );
 }
 

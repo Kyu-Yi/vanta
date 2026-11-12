@@ -2325,13 +2325,6 @@ pub async fn run(
     // this, a dead LLM call propagated with `?` and the process exited with a
     // stack-style error and NO final decision on disk — the run was unreadable.
     let mut infra_failure_error: Option<String> = None;
-    // [VANTA-WHY] M3 item 7 — the judge's own failure text, carried out of the
-    // loop so a `JudgeFailed` run writes it to the session log. Deliberately NOT
-    // `infra_failure_error`: the machine was fine and the call was made — what
-    // came back could not be read as a verdict after the one retry — so this must
-    // not be reported, retried or counted as infrastructure. The raw answer
-    // itself is already on disk in the forensics file.
-    let mut judge_failed_error: Option<String> = None;
     // [VANTA-WHY] v1-m3.2 item B — the failed model call's own text, carried out
     // of the loop so a run ended by an unreadable answer (`stop_reason =
     // model_output_invalid`) records WHY on its own phase row. Deliberately NOT
@@ -3176,19 +3169,29 @@ pub async fn run(
                     }
                 }
                 Err(JudgeError::Malformed(message)) => {
-                    // [VANTA-WHY] The machine was fine and the call was made; what
-                    // came back could not be read as a verdict after the one retry.
-                    // That is this arm's own outcome — its own exit code (4) and its
-                    // own bucket — and deliberately NOT `InfraFailure`, which would
-                    // report a broken candidate as a broken server (and be retried
-                    // as one). The raw answer is in the forensics file.
+                    // [VANTA-WHY] v1-m3.2 item B (PR #4 review) — an answer the
+                    // judge DID give and the parser could not read after its
+                    // retries is the MODEL's failure, not the machine's, so it takes
+                    // the model-output-invalid rule the Creator and Attacker arms
+                    // take: the candidate is attached exactly as the deadline exit
+                    // above attaches it (`final_patched_files = Some(patched_files)`)
+                    // and the run ends `NeedsReview` with
+                    // `stop_reason=model_output_invalid`, so the row is GRADED and
+                    // the wave gate passes it (§8.2). Before this, `Malformed` — the
+                    // only error an unreadable judge answer ever produces — ended as
+                    // `JudgeFailed` (exit 4) with NOTHING attached, which censored
+                    // the row to `unobservable` and halted the wave; the check in the
+                    // `Call` arm below could not help, because a parse failure never
+                    // reaches it. Every OTHER judge call error stays `InfraFailure`.
+                    stop_reason = Some(MODEL_OUTPUT_INVALID);
+                    model_output_error = Some(message);
                     println!(
-                        "  ✖ JUDGE FAILED — the judge did not return a readable verdict after \
-                         the one retry (the raw answer is in the forensics file); this is a \
-                         recorded judge failure, not an infrastructure fault"
+                        "\n  ⚠ The Judge did not return a readable verdict after its retries \
+                         — ending the run as NeedsReview ({MODEL_OUTPUT_INVALID}), not as an \
+                         infrastructure failure."
                     );
-                    judge_failed_error = Some(message);
-                    GovernorDecision::JudgeFailed
+                    final_patched_files = Some(patched_files);
+                    break 'attempts GovernorDecision::NeedsReview;
                 }
                 Err(JudgeError::Call(message)) => {
                     // [VANTA-WHY] §14.15 / Finding B (PR #4 review) — a call the
@@ -5087,12 +5090,17 @@ pub async fn run(
                 break decision;
             }
             GovernorDecision::JudgeFailed => {
-                // [VANTA-WHY] M3 item 7. The judge answered and its answer could
-                // not be read as a verdict after the one retry: this arm's own
-                // outcome (exit code 4, its own `judge_failed` bucket), never
-                // folded into `NeedsReview`, `Rejected` or `InfraFailure`. No
-                // verdict was reached, so nothing is attached; the raw answer is in
-                // the forensics file.
+                // [VANTA-WHY] M3 item 7, narrowed by v1-m3.2 item B. The token
+                // means "the judge answered and its answer could not be read as a
+                // verdict" — its own exit code (4) and its own `judge_failed`
+                // bucket, never folded into `NeedsReview`, `Rejected` or
+                // `InfraFailure`. No path in this loop returns it any more: an
+                // unreadable judge answer ends `NeedsReview` with
+                // `stop_reason=model_output_invalid` and the candidate attached (the
+                // `Malformed` arm), so this arm is the record of what the token
+                // MEANS for the rows already on disk and for the harness's mapping.
+                // Nothing is attached, because a `JudgeFailed` row carries no
+                // verdict about the candidate.
                 break decision;
             }
             GovernorDecision::PatchApplicationFailed => {
@@ -5359,38 +5367,14 @@ pub async fn run(
         })?;
     }
 
-    // [VANTA-WHY] M3 item 7 — a `JudgeFailed` run records WHY the judge's answer
-    // could not be read after the one retry, exactly as `run.infra_failure` does
-    // for a dead call: the reason is a fact in the log rather than something a
-    // reader infers from `final_decision=JudgeFailed` alone. It is deliberately
-    // its OWN phase, not `run.infra_failure`: the machine was fine and the call
-    // was made, so this must not be read, retried or counted as infrastructure,
-    // and its exit code (4) is the arm's own. The raw answer is in the forensics
-    // file; this carries the parse/truncation diagnosis.
-    if let Some(error) = &judge_failed_error {
-        println!("  ✖ JUDGE FAILED: {error}");
-        let one_line = error
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        session_log.append(SessionRecord {
-            session_id: session_id.clone(),
-            schema_version: Some(SCHEMA_VERSION),
-            patch_attempt_id: attempt_patch_ids.last().cloned(),
-            testing_iteration_id: None,
-            test_id: None,
-            phase: "run.judge_failed".to_string(),
-            summary: format!(
-                "final_decision=JudgeFailed error={}",
-                one_line.chars().take(1000).collect::<String>()
-            ),
-            timestamp: now_iso(),
-            benchmark_instance: None,
-            benchmark_label: None,
-        })?;
-    }
+    // [VANTA-WHY] v1-m3.2 item B (PR #4 review) — there is no `run.judge_failed`
+    // row any more. The one failure that ever wrote it (an unreadable judge
+    // answer, `JudgeError::Malformed`) is now the model-output rule above, so it
+    // is recorded once, on `run.model_output_invalid`, with the parse/truncation
+    // diagnosis in the same `error=` field; a second row would restate that under
+    // a decision the run no longer reaches. The `JudgeFailed` token itself is
+    // unchanged (exit 4, its own `judge_failed` bucket) and still describes every
+    // row written before this.
 
     // [VANTA-WHY] "Fixed at attempt 1" is its own number, not a rate. A repair
     // that passes on the first candidate has no N→N+1 transition, so ECR/EIR
@@ -10325,11 +10309,12 @@ mod tests {
         let breaks: Vec<usize> = source.match_indices(brk).map(|(i, _)| i).collect();
         assert_eq!(
             breaks.len(),
-            10,
+            11,
             "this file must carry exactly the eight deadline `NeedsReview` breaks \
              (attempt top, Creator refusal, Attacker refusal, two clamp skips, \
              clamp-cut original, judge-suite deadline, judge-call refusal) plus the \
-             two v1-m3.2 model-output breaks (judge, Attacker)"
+             three v1-m3.2 model-output breaks (judge Malformed, judge Call, \
+             Attacker)"
         );
         assert_eq!(
             source.match_indices(budget).count(),

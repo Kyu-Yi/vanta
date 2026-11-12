@@ -43,6 +43,20 @@ pub const REVISE_BUDGET_EXHAUSTED: &str = "revise_budget_exhausted";
 /// two are recorded under different names rather than one `stopped=true`.
 pub const BUDGET_EXHAUSTED: &str = "budget_exhausted";
 
+/// The `stop_reason` a run records when a structured model call exhausted its
+/// attempts on the MODEL'S OWN OUTPUT — a schema parse error (`llm::PARSE_FAILURE_PREFIX`)
+/// or an answer the server cut off twice (`llm::TRUNCATED_TWICE_MARKER`) — and the
+/// run therefore ended without deciding anything about the candidate (v1-m3.2).
+///
+/// [VANTA-WHY] This is deliberately NOT `InfraFailure`. The machine was fine and the
+/// call was made; what came back could not be read. Reporting it as infrastructure
+/// blamed the harness for the model's mistake, was retried as one (D), and — the
+/// thing that cost a wave — halted the gate (§8.2) on one unreadable answer. A
+/// transport error (an unreachable server, a 5xx) or a `prompt_over_budget` refusal
+/// is a different claim about the run and keeps `InfraFailure`; only the two markers
+/// above take this one.
+pub const MODEL_OUTPUT_INVALID: &str = "model_output_invalid";
+
 /// One attempt's shared Attacker remediation budget (§14.14).
 ///
 /// [VANTA-WHY] Held by the attempt loop and borrowed by BATE and the

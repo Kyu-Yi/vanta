@@ -29991,6 +29991,89 @@ class TestWaveGate:
             assert runner_mod.wave_gate_failures(rows) == []
         assert labels == {"needs_review_on_good", "needs_review_on_bad"}
 
+    def test_a_graded_model_output_invalid_row_does_not_stop_the_wave(self):
+        """v1-m3.2 item B: an unreadable model answer is graded, not deadly.
+
+        [WHY] An exhausted structured call that failed on the MODEL'S OWN OUTPUT
+        (a schema parse error, or an answer cut off twice) used to end the run as
+        `InfraFailure`, which the wave gate treats as a machine fault and halts on.
+        It is now a `NeedsReview` with `stop_reason=model_output_invalid` and the
+        produced/candidate tree attached, so `label_for` names the row
+        `needs_review_on_good`/`needs_review_on_bad` and §14.6's NeedsReview
+        exemption applies exactly as it does to any other refusal. As with the
+        deadline test beside this one, the gate reads the LABEL, never
+        `stop_reason` — the same row left with no patch stays `unobservable` and is
+        still gated.
+        """
+        labels = set()
+        for good in (True, False):
+            rows = _healthy_wave()
+            for row in rows:
+                if row["candidate"] and row["candidate"]["kind"] == runner_mod.DEV_FIX:
+                    row["verdict"] = "NeedsReview"
+                    row["stop_reason"] = "model_output_invalid"
+                    row["label"] = runner_mod.label_for(
+                        "NeedsReview", oracle_mod.OracleResult(apply_ok=True, patch_good=good)
+                    )
+                    labels.add(row["label"])
+            assert runner_mod.wave_gate_failures(rows) == []
+        assert labels == {"needs_review_on_good", "needs_review_on_bad"}
+
+    def test_a_model_output_invalid_row_with_no_tree_stays_ungraded_and_gated(self):
+        """The other half of item B: no tree was ever produced, so nothing to grade.
+
+        [WHY] The Attacker and the Judge run after the candidate has applied, so
+        their exhaustion always has THIS attempt's tree to attach; a Creator
+        exhaustion on the FIRST attempt has nothing applied yet and ends
+        `MaxAttemptsReached`, not this stop_reason. If a model-output row ever
+        reached the runner with no patch, it is genuinely unobservable — the
+        plumbing, not the candidate — and the wave gate must keep halting on it.
+        """
+        rows = _healthy_wave()
+        rows[0]["verdict"] = "NeedsReview"
+        rows[0]["stop_reason"] = "model_output_invalid"
+        rows[0]["label"] = "unobservable"
+        rows[0]["oracle"]["apply_ok"] = False
+        rows[0]["oracle"]["apply_detail"] = "no final.patch for verdict NeedsReview"
+        problems = runner_mod.wave_gate_failures(rows)
+        assert any(
+            "unobservable" in problem and "no final.patch" in problem for problem in problems
+        )
+
+    def test_a_creator_exhaustion_row_is_graded_unresolved_not_censored(self):
+        """v1-m3.2 item B, the Creator arm: nothing was produced, so nothing halts.
+
+        [WHY] The Creator runs BEFORE any apply, so an exhausted call produced no
+        patch — the driver spends the attempt and asks again (the Rust lint test
+        pins the loop). On the last attempt the run ends `MaxAttemptsReached`, whose
+        terminal arm attaches the run's last produced tree; with nothing ever
+        applied that is the ORIGINAL tree, so `final.patch` is an empty diff. An
+        empty body is not a refusal: `git_apply_patch(drop_test_hunks=True)`
+        short-circuits it to APPLY_APPLIED, so `apply_ok = True` and `label_for`
+        falls through to the `MaxAttemptsReached` arm — `unresolved`. The censor's
+        `unobservable` (which halts the wave, §8.2) stays for a run we could not
+        measure AT ALL; routing the Creator's exhaustion there would hide a whole
+        class of runs from the fix rate.
+        """
+        rows = _healthy_wave()
+        for row in rows:
+            if row["candidate"] and row["candidate"]["kind"] == runner_mod.DEV_FIX:
+                row["verdict"] = "MaxAttemptsReached"
+                row["label"] = runner_mod.label_for(
+                    "MaxAttemptsReached",
+                    oracle_mod.OracleResult(
+                        apply_ok=True,
+                        apply_outcome=suite_mod.APPLY_APPLIED,
+                        patch_good=False,
+                    ),
+                )
+        assert all(
+            row["label"] == "unresolved"
+            for row in rows
+            if row["candidate"] and row["candidate"]["kind"] == runner_mod.DEV_FIX
+        )
+        assert runner_mod.wave_gate_failures(rows) == []
+
     def test_a_budget_exhausted_row_with_no_tree_stays_ungraded_and_gated(self):
         """The other half of item 1: no tree was ever produced, so nothing to grade.
 

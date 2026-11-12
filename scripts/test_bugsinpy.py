@@ -6385,9 +6385,10 @@ class TestNativeSessionTimeoutDerivation:
     def test_the_gate_rule_is_not_the_measurement_rule(self):
         """The two rules are one call apart, and must not be one function.
 
-        A raise meant for the gate must not also raise a replay/oracle column's
-        cap: the same 487 s measurement is 1461 under the measurement rule and
-        4870 under the gate rule.
+        The 10x session rule is what the GATE, the oracle and replay all use; the
+        3x rule remains the MEASUREMENT probe's only (``scripts/probe_xdist.py``).
+        The same 487 s measurement is 4870 under the session rule and 1461 under
+        the measurement probe's rule.
         """
         floor = suite_mod.native_session_timeout_floor({})
         assert suite_mod.native_timeout_secs(487.0, floor=floor) == 1461
@@ -28515,8 +28516,9 @@ class TestInvokeVantaCarriesTheNativeTimeout:
     over the same measurement, because a dev probe measured a legitimate
     one-file patch at ~3.6× its unpatched control on an idle machine: D1's 3× sat
     below the patched side's own cost, so the cap, not the patch, ended the row.
-    ``max(120, 3 × measured)`` remains the MEASUREMENT rule for the callers that run
-    ONE tree (oracle/replay) — it is no longer what reaches this flag.
+    ``max(120, 3 × measured)`` is now the MEASUREMENT probe's rule only
+    (``scripts/probe_xdist.py``); the oracle and replay callers that run ONE tree
+    use the same 10× session rule too, so it is no longer what reaches this flag.
     """
 
     @staticmethod
@@ -32290,7 +32292,8 @@ class TestRunJob:
         beside its kill flag; an unclamped row names the full cap.
         """
         base = _outcome(tmp_path)
-        # Clamped: the resolved cap is 600 s but the gate ran under 240 s.
+        # Clamped: the resolved cap is 1200 s (the session floor for a 33 s suite)
+        # but the gate ran under 240 s.
         monkeypatch.setattr(
             runner_mod,
             "invoke_vanta",
@@ -32298,13 +32301,13 @@ class TestRunJob:
                 tmp_path,
                 summary=dict(
                     base.summary,
-                    native_timeout_secs="600",
+                    native_timeout_secs="1200",
                     native_timeout="true",
                     native_original_secs="33.000",
                     native_patched_secs="119.000",
                     native_original_timed_out="false",
                     native_patched_timed_out="true",
-                    native_session_cap_secs="600",
+                    native_session_cap_secs="1200",
                     native_gate_effective_cap_secs="240",
                     native_gate_clamped="true",
                 ),
@@ -32321,7 +32324,7 @@ class TestRunJob:
         assert isinstance(measured["native_original_secs"], float)
         assert measured["native_original_timed_out"] is False
         assert measured["native_patched_timed_out"] is True
-        assert measured["native_session_cap_secs"] == 600
+        assert measured["native_session_cap_secs"] == 1200
         # The rule (configured cap) and the fact (effective cap) stay apart.
         assert measured["native_gate_effective_cap_secs"] == 240
         assert measured["native_gate_clamped"] is True
@@ -32334,8 +32337,8 @@ class TestRunJob:
                 tmp_path,
                 summary=dict(
                     base.summary,
-                    native_session_cap_secs="600",
-                    native_gate_effective_cap_secs="600",
+                    native_session_cap_secs="1200",
+                    native_gate_effective_cap_secs="1200",
                     native_gate_clamped="false",
                 ),
             ),
@@ -32346,8 +32349,8 @@ class TestRunJob:
             vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
             python_version="3.8.20",
         )
-        assert unclamped["native_session_cap_secs"] == 600
-        assert unclamped["native_gate_effective_cap_secs"] == 600
+        assert unclamped["native_session_cap_secs"] == 1200
+        assert unclamped["native_gate_effective_cap_secs"] == 1200
         assert unclamped["native_gate_clamped"] is False
 
         # A row whose run.summary predates v1-m3.1 records `None`, never a guess.
